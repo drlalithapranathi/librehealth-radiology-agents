@@ -23,18 +23,37 @@ services:
     depends_on: [orthanc]
 
   # --- EHR / RIS (OpenMRS + fhir2). Replace with LibreHealth Radiology distro. ---
+  # RefApp 2.12.2 bundles fhir2 1.2.2 + webservices.rest 2.32.0. The image is amd64-only,
+  # so it runs emulated on Apple Silicon (first boot is slow). Its startup.sh reads DB_*
+  # env (NOT OMRS_CONFIG_*) and does not create the DB user, so mariadb provisions the
+  # openmrs user/database below.
   openmrs:
     image: openmrs/openmrs-reference-application-distro:latest  # TODO: LibreHealth Radiology distro
+    platform: linux/amd64
     ports: ["8080:8080"]
     environment:
-      OMRS_CONFIG_CONNECTION_SERVER: mariadb
-    depends_on: [mariadb]
+      DB_HOST: mariadb
+      DB_DATABASE: openmrs
+      DB_USERNAME: openmrs
+      DB_PASSWORD: openmrs
+      DB_CREATE_TABLES: "true"     # first boot: build the schema
+      DB_AUTO_UPDATE: "true"       # run Liquibase migrations on boot
+    depends_on:
+      mariadb:
+        condition: service_healthy
 
   mariadb:
     image: mariadb:10.11
     environment:
       MARIADB_ROOT_PASSWORD: openmrs
       MARIADB_DATABASE: openmrs
+      MARIADB_USER: openmrs
+      MARIADB_PASSWORD: openmrs
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     volumes: ["mariadb-data:/var/lib/mysql"]
 
   # --- Temporal (durable orchestration engine) ----------------------------------
@@ -43,6 +62,7 @@ services:
     ports: ["7233:7233"]
     environment:
       DB: postgres12
+      DB_PORT: 5432                  # REQUIRED: auto-setup defaults DB_PORT to 3306 (MySQL); Postgres is 5432
       POSTGRES_SEEDS: temporal-postgresql
       POSTGRES_USER: temporal
       POSTGRES_PWD: temporal
