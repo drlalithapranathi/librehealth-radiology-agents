@@ -1,5 +1,19 @@
 # GitLab CI for the LH-Radiology monorepo.
-stages: [validate, test]
+#
+# Layers GitLab's managed security scanning (SAST + Secret Detection) on top of the
+# project's own validate/test jobs. The Security templates define `sast` and
+# `secret_detection`; we only pin their stages below.
+stages:
+  - validate
+  - test
+  - secret-detection
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+variables:
+  SECRET_DETECTION_ENABLED: 'true'
 
 validate-contracts:
   stage: validate
@@ -24,3 +38,9 @@ agent-tests:
       for a in agents/*/; do
         echo "== $a ==" && (cd "$a" && python -m pytest -q) || exit 1
       done
+
+sast:
+  stage: test
+
+secret_detection:
+  stage: secret-detection
