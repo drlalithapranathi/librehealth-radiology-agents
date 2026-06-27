@@ -12,7 +12,8 @@ _STAT_REASONS = {"I21", "I63", "S06", "R57"}  # MI, stroke, intracranial injury,
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
-    assert skill_id == "triage.score", f"unexpected skill {skill_id}"
+    if skill_id != "triage.score":
+        raise ValueError(f"unexpected skill {skill_id}")
     ctx = payload["studyContext"]
     order = ctx.get("order", {})
     modality = ctx["study"].get("modality", "")

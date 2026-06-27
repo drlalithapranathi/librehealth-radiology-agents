@@ -13,7 +13,8 @@ AGENT_VERSION = "0.1.0"
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
-    assert skill_id == "interpretation.runTools", f"unexpected skill {skill_id}"
+    if skill_id != "interpretation.runTools":
+        raise ValueError(f"unexpected skill {skill_id}")
     ctx = payload["studyContext"]
     modality = ctx["study"].get("modality", "")
     desc = ctx["study"].get("studyDescription", "")

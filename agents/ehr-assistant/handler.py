@@ -13,7 +13,8 @@ AGENT_VERSION = "0.1.0"
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
-    assert skill_id == "ehr.assembleContext", f"unexpected skill {skill_id}"
+    if skill_id != "ehr.assembleContext":
+        raise ValueError(f"unexpected skill {skill_id}")
     ctx = payload["studyContext"]
     # TODO(M1): fhir = Fhir2Client(); priors = await fhir.search_imaging_studies(...); etc.
     return {

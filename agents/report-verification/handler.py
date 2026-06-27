@@ -13,7 +13,8 @@ _RULES_DIR = Path(__file__).resolve().parent / "rules"
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
-    assert skill_id == "report.verify", f"unexpected skill {skill_id}"
+    if skill_id != "report.verify":
+        raise ValueError(f"unexpected skill {skill_id}")
     ctx = payload["studyContext"]
     rule_ctx = {
         "report": payload.get("report") or {},

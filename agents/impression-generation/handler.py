@@ -12,7 +12,8 @@ AGENT_VERSION = "0.1.0"
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
-    assert skill_id == "impression.generate", f"unexpected skill {skill_id}"
+    if skill_id != "impression.generate":
+        raise ValueError(f"unexpected skill {skill_id}")
     ctx = payload["studyContext"]
     report = payload.get("report") or {}
     # TODO(M2): call an LLM with findings + priors + AI output to draft a real impression.
