@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:skill:report.verify:output:1.0.0",
+  "title": "report.verify output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workflowId", "verificationStatus", "requiresHumanReview", "issues", "agentVersion", "verifiedAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "workflowId": { "type": "string" },
+    "verificationStatus": { "type": "string", "enum": ["PASS", "WARN", "FAIL"] },
+    "requiresHumanReview": { "type": "boolean" },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ruleId", "severity", "message"],
+        "properties": {
+          "ruleId": { "type": "string" },
+          "severity": { "type": "string", "enum": ["INFO", "WARN", "FAIL"] },
+          "message": { "type": "string" },
+          "location": { "type": "string" }
+        }
+      }
+    },
+    "agentVersion": { "type": "string" },
+    "verifiedAt": { "type": "string", "format": "date-time" }
+  }
+}

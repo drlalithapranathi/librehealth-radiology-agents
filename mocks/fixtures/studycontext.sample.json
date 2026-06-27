@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "wf_demo_0001",
+  "study": {
+    "studyInstanceUID": "1.2.840.113619.2.55.3.123456789",
+    "accessionNumber": "ACC-DEMO-001",
+    "orthancStudyId": "0a1b2c3d-4e5f-6789-abcd-ef0123456789",
+    "modality": "CT",
+    "studyDescription": "CT CHEST W/O CONTRAST",
+    "numberOfInstances": 312
+  },
+  "patient": { "fhirPatientId": "Patient/demo-1", "mrn": "MRN-DEMO-0001" },
+  "order": { "fhirServiceRequestId": "ServiceRequest/demo-1", "priority": "routine", "reasonCode": ["R91.8"] },
+  "assignment": { "radiologistId": null, "assignedAt": null },
+  "meta": {
+    "traceId": "trc_demo000000001",
+    "spanId": "spn_demo0001",
+    "emittedAt": "2026-06-26T12:00:00Z",
+    "source": "mocks.fixtures",
+    "schemaRef": "studycontext@1.0.0"
+  }
+}

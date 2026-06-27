@@ -1,0 +1,17 @@
+{
+  "name": "Report Verification Agent",
+  "description": "Runs declarative clinical/consistency rules (authored by the PI) against a report and impression; gates or flags.",
+  "url": "http://report-verification:8105/",
+  "version": "0.1.0",
+  "capabilities": { "streaming": true, "pushNotifications": true },
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
+  "skills": [
+    {
+      "id": "report.verify",
+      "name": "Verify report",
+      "description": "Returns verificationStatus (PASS|WARN|FAIL), human-review flag and a list of rule issues.",
+      "tags": ["report", "verification", "rules", "safety"]
+    }
+  ]
+}

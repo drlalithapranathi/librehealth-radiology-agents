@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:skill:ehr.assembleContext:output:1.0.0",
+  "title": "ehr.assembleContext output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workflowId", "agentVersion", "assembledAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "workflowId": { "type": "string" },
+    "priorStudies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ref"],
+        "properties": {
+          "ref": { "type": "string" },
+          "modality": { "type": "string" },
+          "date": { "type": "string" },
+          "reportRef": { "type": "string" }
+        }
+      }
+    },
+    "relevantLabs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code"],
+        "properties": {
+          "code": { "type": "string" },
+          "display": { "type": "string" },
+          "value": { "type": ["number", "string"] },
+          "unit": { "type": "string" },
+          "date": { "type": "string" }
+        }
+      }
+    },
+    "activeProblems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code"],
+        "properties": { "code": { "type": "string" }, "display": { "type": "string" } }
+      }
+    },
+    "contrastFlags": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "egfr": { "type": ["number", "null"] },
+        "priorReaction": { "type": "boolean" },
+        "onMetformin": { "type": "boolean" }
+      }
+    },
+    "medicationFlags": { "type": "object", "additionalProperties": true },
+    "allergies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code"],
+        "properties": { "code": { "type": "string" }, "criticality": { "type": "string" } }
+      }
+    },
+    "agentVersion": { "type": "string" },
+    "assembledAt": { "type": "string", "format": "date-time" }
+  }
+}

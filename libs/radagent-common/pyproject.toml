@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radagent-common"
+version = "0.1.0"
+description = "Shared library for LibreHealth Radiology multi-agent system: StudyContext model, A2A factory, fhir2/Orthanc clients, validation, tracing."
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.6",
+  "jsonschema>=4.21",
+  "httpx>=0.27",
+  "pyyaml>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["radagent_common*"]

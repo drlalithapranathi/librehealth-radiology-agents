@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:event:ris-finalized:1.0.0",
+  "title": "ReportFinalizedEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "eventType", "diagnosticReportId", "status", "lastUpdatedCursor"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "eventType": { "const": "ris.report.finalized" },
+    "diagnosticReportId": { "type": "string" },
+    "serviceRequestRef": { "type": "string" },
+    "status": { "type": "string", "enum": ["preliminary", "final", "amended", "corrected"] },
+    "signedBy": { "type": "string" },
+    "signedAt": { "type": "string", "format": "date-time" },
+    "lastUpdatedCursor": { "type": "string", "format": "date-time" }
+  }
+}

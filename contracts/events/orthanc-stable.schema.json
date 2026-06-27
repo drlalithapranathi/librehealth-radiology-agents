@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:event:orthanc-stable:1.0.0",
+  "title": "OrthancStableStudyEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "eventType", "orthancStudyId", "studyInstanceUID", "modality", "occurredAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "eventType": { "const": "orthanc.study.stable" },
+    "orthancStudyId": { "type": "string" },
+    "studyInstanceUID": { "type": "string" },
+    "modality": { "type": "string" },
+    "accessionNumber": { "type": "string" },
+    "occurredAt": { "type": "string", "format": "date-time" }
+  }
+}

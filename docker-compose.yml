@@ -1,0 +1,85 @@
+# Dev stack for the LH-Radiology agent system.
+# NOTE: image tags below are STARTING POINTS — pin/verify each against your environment.
+# Substitute the official LibreHealth Radiology distro image for the OpenMRS service.
+#
+# Bring up infra:   docker compose up -d orthanc ohif openmrs mariadb temporal temporal-postgresql temporal-ui
+# App services (orchestrator + agents) are sketched below; their Dockerfiles land in M1.
+
+services:
+  # --- PACS ---------------------------------------------------------------------
+  orthanc:
+    image: orthancteam/orthanc:latest   # TODO: pin a version; ensure Python plugin enabled
+    ports: ["8042:8042", "4242:4242"]
+    environment:
+      ORTHANC__PYTHON_SCRIPT: /scripts/orthanc_stable_study.py
+      ORCH_WEBHOOK_URL: http://orchestrator:8090/webhooks/orthanc
+    volumes:
+      - ./integrations/orthanc-plugin:/scripts:ro
+
+  # --- Viewer -------------------------------------------------------------------
+  ohif:
+    image: ohif/app:latest              # TODO: pin a version; configure data source to Orthanc DICOMweb
+    ports: ["3000:80"]
+    depends_on: [orthanc]
+
+  # --- EHR / RIS (OpenMRS + fhir2). Replace with LibreHealth Radiology distro. ---
+  openmrs:
+    image: openmrs/openmrs-reference-application-distro:latest  # TODO: LibreHealth Radiology distro
+    ports: ["8080:8080"]
+    environment:
+      OMRS_CONFIG_CONNECTION_SERVER: mariadb
+    depends_on: [mariadb]
+
+  mariadb:
+    image: mariadb:10.11
+    environment:
+      MARIADB_ROOT_PASSWORD: openmrs
+      MARIADB_DATABASE: openmrs
+    volumes: ["mariadb-data:/var/lib/mysql"]
+
+  # --- Temporal (durable orchestration engine) ----------------------------------
+  temporal:
+    image: temporalio/auto-setup:1.24.2   # TODO: pin to your target Temporal version
+    ports: ["7233:7233"]
+    environment:
+      DB: postgres12
+      POSTGRES_SEEDS: temporal-postgresql
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+    depends_on: [temporal-postgresql]
+
+  temporal-postgresql:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    volumes: ["temporal-pg-data:/var/lib/postgresql/data"]
+
+  temporal-ui:
+    image: temporalio/ui:2.30.1           # TODO: pin
+    ports: ["8088:8080"]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on: [temporal]
+
+  # --- Application services (M1: add Dockerfiles, then uncomment) ----------------
+  # orchestrator:
+  #   build: { context: ., dockerfile: orchestrator/Dockerfile }
+  #   command: ["sh", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090"]
+  #   environment:
+  #     TEMPORAL_TARGET: temporal:7233
+  #     FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
+  #     ORTHANC_BASE_URL: http://orthanc:8042
+  #   ports: ["8090:8090"]
+  #   depends_on: [temporal, openmrs, orthanc]
+  #
+  # worklist-triage:        { build: { context: ., dockerfile: agents/worklist-triage/Dockerfile },        ports: ["8101:8101"] }
+  # ehr-assistant:          { build: { context: ., dockerfile: agents/ehr-assistant/Dockerfile },          ports: ["8102:8102"] }
+  # interpretation-assistant:{ build: { context: ., dockerfile: agents/interpretation-assistant/Dockerfile }, ports: ["8103:8103"] }
+  # impression-generation:  { build: { context: ., dockerfile: agents/impression-generation/Dockerfile },  ports: ["8104:8104"] }
+  # report-verification:    { build: { context: ., dockerfile: agents/report-verification/Dockerfile },    ports: ["8105:8105"] }
+  # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`.
+
+volumes:
+  mariadb-data:
+  temporal-pg-data:

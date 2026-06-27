@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:skill:interpretation.runTools:output:1.0.0",
+  "title": "interpretation.runTools output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workflowId", "overallStatus", "agentVersion", "ranAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "workflowId": { "type": "string" },
+    "toolsSelected": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["toolId", "status"],
+        "properties": {
+          "toolId": { "type": "string" },
+          "version": { "type": "string" },
+          "status": { "type": "string", "enum": ["STUBBED", "COMPLETE", "ERROR", "SKIPPED"] }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["toolId", "status"],
+        "properties": {
+          "toolId": { "type": "string" },
+          "label": { "type": "string" },
+          "confidence": { "type": ["number", "null"] },
+          "evidenceRef": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["STUBBED", "COMPLETE", "ERROR"] }
+        }
+      }
+    },
+    "overallStatus": { "type": "string", "enum": ["STUBBED", "COMPLETE", "PARTIAL", "ERROR"] },
+    "agentVersion": { "type": "string" },
+    "ranAt": { "type": "string", "format": "date-time" }
+  }
+}

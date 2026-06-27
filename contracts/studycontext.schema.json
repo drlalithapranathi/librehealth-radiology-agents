@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:studycontext:1.0.0",
+  "title": "StudyContext",
+  "description": "Canonical lean envelope passed to every agent skill. Identifiers + correlation only; no clinical blobs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workflowId", "study", "patient", "order", "meta"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "workflowId": { "type": "string", "description": "Temporal workflow id = correlation id" },
+    "study": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["studyInstanceUID", "orthancStudyId", "modality"],
+      "properties": {
+        "studyInstanceUID": { "type": "string" },
+        "accessionNumber": { "type": "string" },
+        "orthancStudyId": { "type": "string" },
+        "modality": { "type": "string" },
+        "studyDescription": { "type": "string" },
+        "numberOfInstances": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "patient": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fhirPatientId"],
+      "properties": {
+        "fhirPatientId": { "type": "string" },
+        "openmrsPatientUuid": { "type": "string" },
+        "mrn": { "type": "string" }
+      }
+    },
+    "order": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "fhirServiceRequestId": { "type": "string" },
+        "openmrsOrderUuid": { "type": "string" },
+        "priority": { "type": "string", "enum": ["stat", "urgent", "asap", "routine"] },
+        "reasonCode": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Radiologist assignment is OWNED BY LH-Radiology (specialty + case importance + call times). Read-only here.",
+      "properties": {
+        "radiologistId": { "type": ["string", "null"] },
+        "assignedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["traceId", "emittedAt", "source"],
+      "properties": {
+        "traceId": { "type": "string" },
+        "spanId": { "type": "string" },
+        "emittedAt": { "type": "string", "format": "date-time" },
+        "source": { "type": "string" },
+        "schemaRef": { "type": "string" }
+      }
+    }
+  }
+}

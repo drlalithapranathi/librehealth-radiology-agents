@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:skill:triage.score:output:1.0.0",
+  "title": "triage.score output",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "workflowId", "priorityScore", "priorityTier", "agentVersion", "computedAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "workflowId": { "type": "string" },
+    "priorityScore": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "priorityTier": { "type": "string", "enum": ["STAT", "URGENT", "ROUTINE"] },
+    "rationale": { "type": "array", "items": { "type": "string" } },
+    "agentVersion": { "type": "string" },
+    "computedAt": { "type": "string", "format": "date-time" }
+  }
+}

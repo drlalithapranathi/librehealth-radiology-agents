@@ -1,0 +1,19 @@
+{
+  "name": "Worklist Triage Agent",
+  "description": "Assigns a reading-priority tier to a completed study from order context and imaging signals.",
+  "url": "http://worklist-triage:8101/",
+  "version": "0.1.0",
+  "capabilities": { "streaming": true, "pushNotifications": true },
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
+  "skills": [
+    {
+      "id": "triage.score",
+      "name": "Score study priority",
+      "description": "Returns a priority score and tier (STAT|URGENT|ROUTINE) with rationale.",
+      "tags": ["triage", "routing", "priority"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    }
+  ]
+}

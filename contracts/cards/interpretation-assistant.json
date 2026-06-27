@@ -1,0 +1,17 @@
+{
+  "name": "Interpretation Assistant Agent",
+  "description": "Selects and runs AI/CAD tools for a study (stubbed in v1) and surfaces findings with evidence references.",
+  "url": "http://interpretation-assistant:8103/",
+  "version": "0.1.0",
+  "capabilities": { "streaming": true, "pushNotifications": true },
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
+  "skills": [
+    {
+      "id": "interpretation.runTools",
+      "name": "Run interpretation tools",
+      "description": "Selects tools by study type, runs them (STUBBED v1), returns structured findings.",
+      "tags": ["ai", "cad", "interpretation", "registry"]
+    }
+  ]
+}

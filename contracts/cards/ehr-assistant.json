@@ -1,0 +1,17 @@
+{
+  "name": "EHR Assistant Agent",
+  "description": "Assembles decision-relevant priors, labs, problems and safety flags from OpenMRS fhir2.",
+  "url": "http://ehr-assistant:8102/",
+  "version": "0.1.0",
+  "capabilities": { "streaming": true, "pushNotifications": true },
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
+  "skills": [
+    {
+      "id": "ehr.assembleContext",
+      "name": "Assemble clinical context",
+      "description": "Returns a distilled, decision-relevant clinical context packet (references + minimal derived values).",
+      "tags": ["ehr", "fhir", "priors", "context"]
+    }
+  ]
+}

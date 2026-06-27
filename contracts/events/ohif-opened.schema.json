@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:event:ohif-opened:1.0.0",
+  "title": "StudyOpenedEvent",
+  "description": "M2 — emitted by the OHIF extension when a radiologist opens a study.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "eventType", "studyInstanceUID", "openedAt"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "eventType": { "const": "ohif.study.opened" },
+    "studyInstanceUID": { "type": "string" },
+    "radiologistId": { "type": "string" },
+    "openedAt": { "type": "string", "format": "date-time" }
+  }
+}
