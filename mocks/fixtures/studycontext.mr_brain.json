@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "wf_demo_brain_001",
+  "study": {
+    "studyInstanceUID": "1.2.840.113619.2.55.3.222222222",
+    "accessionNumber": "ACC-BRAIN-001",
+    "orthancStudyId": "brain-study-001",
+    "modality": "MR",
+    "studyDescription": "MR BRAIN W/O CONTRAST",
+    "numberOfInstances": 180
+  },
+  "patient": { "fhirPatientId": "Patient/demo-brain", "mrn": "MRN-BRAIN-001" },
+  "order": { "fhirServiceRequestId": "ServiceRequest/demo-brain", "priority": "routine", "reasonCode": ["G35"] },
+  "assignment": { "radiologistId": null, "assignedAt": null },
+  "meta": {
+    "traceId": "trc_brain000000001",
+    "spanId": "spn_brain0001",
+    "emittedAt": "2026-06-27T11:00:00Z",
+    "source": "mocks.fixtures",
+    "schemaRef": "studycontext@1.0.0"
+  }
+}

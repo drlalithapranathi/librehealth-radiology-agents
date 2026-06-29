@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "wf_demo_cxr_001",
+  "study": {
+    "studyInstanceUID": "1.2.840.113619.2.55.3.333333333",
+    "accessionNumber": "ACC-CXR-001",
+    "orthancStudyId": "cxr-study-001",
+    "modality": "CR",
+    "studyDescription": "CHEST AP",
+    "numberOfInstances": 2
+  },
+  "patient": { "fhirPatientId": "Patient/demo-cxr", "mrn": "MRN-CXR-001" },
+  "order": { "fhirServiceRequestId": "ServiceRequest/demo-cxr", "priority": "stat", "reasonCode": ["J93.1"] },
+  "assignment": { "radiologistId": null, "assignedAt": null },
+  "meta": {
+    "traceId": "trc_cxr0000000001",
+    "spanId": "spn_cxr00001",
+    "emittedAt": "2026-06-27T12:00:00Z",
+    "source": "mocks.fixtures",
+    "schemaRef": "studycontext@1.0.0"
+  }
+}
