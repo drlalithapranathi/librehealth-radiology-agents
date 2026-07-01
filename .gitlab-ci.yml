@@ -39,6 +39,16 @@ agent-tests:
         echo "== $a ==" && (cd "$a" && python -m pytest -q) || exit 1
       done
 
+a2a-factory-import:
+  # Issue #2 acceptance #3: the app extras install and radagent_common.a2a imports cleanly
+  # against the pinned a2a-sdk. (agent-tests deliberately runs WITHOUT this extra to keep
+  # proving golden-rule 4 — handlers never import a2a.*.)
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install -e "libs/radagent-common[a2a]"
+    - python -c "import radagent_common.a2a; print('radagent_common.a2a import OK')"
+
 sast:
   stage: test
 
