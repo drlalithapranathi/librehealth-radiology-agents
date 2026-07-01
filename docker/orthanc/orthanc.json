@@ -1,0 +1,19 @@
+{
+  // Minimal Orthanc config for the LH-Radiology dev stack.
+  // The orthancteam/orthanc image merges this (from /etc/orthanc/*.json) with the
+  // built-in Orthanc + plugin defaults (SQLite storage at /var/lib/orthanc/db,
+  // HTTP 8042, DICOM 4242, plugins auto-loaded).
+  "Name": "lh-radiology",
+
+  // Dev only: no HTTP auth so the OHIF viewer (proxied same-origin) can query freely.
+  "AuthenticationEnabled": false,
+  "RemoteAccessAllowed": true,
+
+  // Enable DICOMweb (QIDO-RS / WADO-RS) — this is what OHIF consumes.
+  "DicomWeb": {
+    "Enable": true,
+    "Root": "/dicom-web/",
+    "EnableWado": true,
+    "WadoRoot": "/wado"
+  }
+}
