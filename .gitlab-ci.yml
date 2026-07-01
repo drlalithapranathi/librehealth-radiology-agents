@@ -49,6 +49,16 @@ a2a-factory-import:
     - pip install -e "libs/radagent-common[a2a]"
     - python -c "import radagent_common.a2a; print('radagent_common.a2a import OK')"
 
+a2a-client-it:
+  # Issue #7 acceptance: the real A2A client round-trips a skill call against a LIVE mock
+  # agent (uvicorn serving the factory app). Needs the a2a extra + uvicorn, so it runs in its
+  # own lane rather than in agent-tests.
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install -e "libs/radagent-common[a2a]" uvicorn pytest pytest-asyncio
+    - cd libs/radagent-common && python -m pytest tests/test_client.py -q
+
 sast:
   stage: test
 

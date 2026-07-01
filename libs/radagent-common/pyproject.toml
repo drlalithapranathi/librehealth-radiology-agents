@@ -24,3 +24,6 @@ a2a = ["a2a-sdk[http-server]==1.0.3"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["radagent_common*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
