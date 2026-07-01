@@ -1,46 +1,57 @@
-# Dev stack for the LH-Radiology agent system.
-# NOTE: image tags below are STARTING POINTS — pin/verify each against your environment.
-# Substitute the official LibreHealth Radiology distro image for the OpenMRS service.
+# Dev stack for the LH-Radiology system.
 #
-# Bring up infra:   docker compose up -d orthanc ohif openmrs mariadb temporal temporal-postgresql temporal-ui
-# App services (orchestrator + agents) are sketched below; their Dockerfiles land in M1.
+# EHR/RIS is the OpenMRS 3 (o3) reference-application BACKEND with legacyui + the
+# LibreHealth Radiology module baked in (built from the sibling lh-radiology repo,
+# o3 branch, docker/o3/Dockerfile). The o3 backend image is arm64-native, so it runs
+# natively on Apple Silicon (the old amd64 RefApp distro did not). Radiology UI is the
+# legacy JSP UI served by legacyui at /openmrs/... — there is no SPA/gateway in scope.
+#
+# Bring up the RIS stack:   docker compose up -d mariadb openmrs orthanc ohif
+#   OpenMRS (legacyui):     http://localhost:8080/openmrs/   (admin / Admin123)
+#   Orthanc:                http://localhost:8042/
+#   OHIF viewer:            http://localhost:3000/
+# Temporal services below are for the agent orchestrator (independent of the RIS stack).
 
 services:
-  # --- PACS ---------------------------------------------------------------------
-  orthanc:
-    image: orthancteam/orthanc:latest   # TODO: pin a version; ensure Python plugin enabled
-    ports: ["8042:8042", "4242:4242"]
-    environment:
-      ORTHANC__PYTHON_SCRIPT: /scripts/orthanc_stable_study.py
-      ORCH_WEBHOOK_URL: http://orchestrator:8090/webhooks/orthanc
-    volumes:
-      - ./integrations/orthanc-plugin:/scripts:ro
-
-  # --- Viewer -------------------------------------------------------------------
-  ohif:
-    image: ohif/app:latest              # TODO: pin a version; configure data source to Orthanc DICOMweb
-    ports: ["3000:80"]
-    depends_on: [orthanc]
-
-  # --- EHR / RIS (OpenMRS + fhir2). Replace with LibreHealth Radiology distro. ---
-  # RefApp 2.12.2 bundles fhir2 1.2.2 + webservices.rest 2.32.0. The image is amd64-only,
-  # so it runs emulated on Apple Silicon (first boot is slow). Its startup.sh reads DB_*
-  # env (NOT OMRS_CONFIG_*) and does not create the DB user, so mariadb provisions the
-  # openmrs user/database below.
+  # --- EHR / RIS: OpenMRS 3 backend + legacyui + lh-radiology --------------------
   openmrs:
-    image: openmrs/openmrs-reference-application-distro:latest  # TODO: LibreHealth Radiology distro
-    platform: linux/amd64
+    # o3 reference-application backend with the LibreHealth Radiology module baked in.
+    # HOW OTHER DEVS GET THIS IMAGE: the lh-radiology CI builds docker/o3/Dockerfile and pushes
+    # it to the project's PUBLIC GitLab Container Registry on every o3-branch pipeline, so you
+    # do NOT need the lh-radiology source to run the stack — `docker compose up` pulls it.
+    #   Published image (per branch):
+    #     registry.gitlab.com/librehealth/radiology/lh-radiology/o3:o3   (docker pull, no auth)
+    #   Build from source instead (module developers): clone lh-radiology on the o3 branch as a
+    #   sibling of this repo, then `docker compose build openmrs` (uses the build: block below).
+    image: registry.gitlab.com/librehealth/radiology/lh-radiology/o3:o3
+    pull_policy: missing                  # `up` pulls the published image; build only on `compose build`
+    build:
+      context: ../lh-radiology            # sibling checkout of lh-radiology (o3 branch)
+      dockerfile: docker/o3/Dockerfile
     ports: ["8080:8080"]
     environment:
-      DB_HOST: mariadb
-      DB_DATABASE: openmrs
-      DB_USERNAME: openmrs
-      DB_PASSWORD: openmrs
-      DB_CREATE_TABLES: "true"     # first boot: build the schema
-      DB_AUTO_UPDATE: "true"       # run Liquibase migrations on boot
+      # o3 backend startup.sh reads OMRS_* (see startup-init.sh). Use the mariadb
+      # JDBC driver (bundled in the war) against the mariadb service below.
+      OMRS_DB: mariadb
+      OMRS_DB_HOSTNAME: mariadb
+      OMRS_DB_PORT: "3306"
+      OMRS_DB_NAME: openmrs
+      OMRS_DB_USERNAME: openmrs         # NOTE: OMRS_DB_USERNAME (not OMRS_DB_USER)
+      OMRS_DB_PASSWORD: openmrs
+      OMRS_CREATE_TABLES: "true"        # first boot: build the schema
+      OMRS_AUTO_UPDATE_DATABASE: "true" # run Liquibase migrations on boot
+      OMRS_ADMIN_USER_PASSWORD: Admin123
+      OMRS_MODULE_WEB_ADMIN: "true"
+      # OMRS_SEARCH defaults to 'lucene' -> no Elasticsearch dependency.
     depends_on:
       mariadb:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/openmrs/ws/rest/v1/session"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s     # first boot runs Liquibase + starts every module
 
   mariadb:
     image: mariadb:10.11
@@ -56,7 +67,36 @@ services:
       retries: 12
     volumes: ["mariadb-data:/var/lib/mysql"]
 
-  # --- Temporal (durable orchestration engine) ----------------------------------
+  # --- PACS ---------------------------------------------------------------------
+  # SQLite-backed Orthanc with DICOMweb enabled for OHIF. The agent OnStableStudy
+  # webhook (integrations/orthanc-plugin) is intentionally not wired here; it belongs
+  # to the orchestrator service (commented out below) and can be re-added when it runs.
+  orthanc:
+    image: orthancteam/orthanc:latest   # TODO: pin a version
+    ports: ["8042:8042", "4242:4242"]
+    volumes:
+      - orthanc-db:/var/lib/orthanc/db
+      - ./docker/orthanc/orthanc.json:/etc/orthanc/lh-radiology.json:ro
+    restart: unless-stopped
+
+  # --- Viewer -------------------------------------------------------------------
+  # The stock ohif/app image ships no nginx server block and an empty app-config.js,
+  # so we supply both. nginx serves OHIF and proxies /dicom-web + /wado to Orthanc on
+  # the same origin (no CORS). Browser opens http://localhost:3000/.
+  ohif:
+    # Pinned by digest to the exact OHIF v3.6.5 image validated with this stack. `:latest`
+    # drifts and this build has quirks we work around here: bundles are shipped gzip-only
+    # (need nginx gzip_static -> docker/ohif/default.conf), app-config ships empty (we mount
+    # our own), and a WASM codec chunk references Node's __filename (shimmed in app-config.js).
+    image: ohif/app@sha256:b1ff4afbd30908aaae8c3ed4ad4033ee91028c0e37675acaf3839bf6275754ef  # OHIF v3.6.5
+    ports: ["3000:80"]
+    volumes:
+      - ./docker/ohif/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/ohif/app-config.js:/usr/share/nginx/html/app-config.js:ro
+    depends_on: [orthanc]
+    restart: unless-stopped
+
+  # --- Temporal (durable orchestration engine, for the agent system) ------------
   temporal:
     image: temporalio/auto-setup:1.24.2   # TODO: pin to your target Temporal version
     ports: ["7233:7233"]
@@ -102,4 +142,5 @@ services:
 
 volumes:
   mariadb-data:
+  orthanc-db:
   temporal-pg-data:

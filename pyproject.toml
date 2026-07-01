@@ -8,10 +8,9 @@ version = "0.1.0"
 description = "Multi-agent radiology system on LibreHealth Radiology (A2A agents + Temporal orchestrator)."
 requires-python = ">=3.11"
 dependencies = [
-  "radagent-common",
-  # Pin these in your real venv (a2a-sdk + temporalio both move fast):
-  "a2a-sdk==1.0.*",          # TODO: pin exact patch once verified in CI
-  "temporalio>=1.7,<2",      # TODO: pin exact version
+  # a2a-sdk is pinned once — in radagent-common's `a2a` extra — so it can't drift across files:
+  "radagent-common[a2a]",    # -> a2a-sdk[http-server]==1.0.3
+  "temporalio==1.29.0",      # pinned exact (newest <2; verified requires-python ok for 3.11)
   "fastapi>=0.110",
   "uvicorn>=0.29",
   "httpx>=0.27",
