@@ -59,6 +59,16 @@ a2a-client-it:
     - pip install -e "libs/radagent-common[a2a]" uvicorn pytest pytest-asyncio
     - cd libs/radagent-common && python -m pytest tests/test_client.py -q
 
+ris-poller-tests:
+  # Issue #12: fhir2 finalized-report query + the ingress report->workflow poller. Needs the
+  # orchestrator deps (temporalio + fastapi); ingress imports radagent_common.client, so the
+  # a2a extra comes along too. Run from repo root so `orchestrator` imports as a package.
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install -e "libs/radagent-common[a2a]" "temporalio==1.29.0" fastapi pytest
+    - python -m pytest libs/radagent-common/tests/test_fhir_client.py orchestrator/tests -q
+
 sast:
   stage: test
 
