@@ -125,7 +125,10 @@ services:
   # --- Application services (M1) -------------------------------------------------
   orchestrator:
     build: { context: ., dockerfile: orchestrator/Dockerfile }
-    command: ["sh", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090"]
+    # `wait -n` exits when either the worker or the ingress dies, so `restart` recovers the
+    # container. worker.py retries the Temporal connect while temporal is still booting.
+    command: ["bash", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090 & wait -n"]
+    restart: unless-stopped
     environment:
       TEMPORAL_TARGET: temporal:7233
       FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4

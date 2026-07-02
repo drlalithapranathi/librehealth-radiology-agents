@@ -20,4 +20,6 @@ ENV LHRAD_REPO_ROOT=/app \
     PYTHONUNBUFFERED=1
 EXPOSE 8090
 # One container runs the durable worker AND the ingress API (compose overrides via `command`).
-CMD ["sh", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090"]
+# `wait -n` exits as soon as EITHER process dies so a restart policy can recover the container
+# instead of it looking healthy with a dead worker.
+CMD ["bash", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090 & wait -n"]
