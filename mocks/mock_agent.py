@@ -28,11 +28,16 @@ _CANNED = {
     "report.verify": lambda wf: {"schemaVersion": "1.0.0", "workflowId": wf, "verificationStatus": "PASS",
                                  "requiresHumanReview": False, "issues": [], "agentVersion": "mock",
                                  "verifiedAt": now_iso()},
+    "comms.dispatch": lambda wf: {"schemaVersion": "1.0.0", "workflowId": wf,
+                                  "dispatchStatus": "SENT", "channelResults": [],
+                                  "agentVersion": "mock", "dispatchedAt": now_iso()},
 }
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
     wf = payload.get("studyContext", {}).get("workflowId", "wf_mock")
+    if skill_id not in _CANNED:
+        raise ValueError(f"Unknown skill: {skill_id}")
     return _CANNED[skill_id](wf)
 
 
