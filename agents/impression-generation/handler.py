@@ -14,32 +14,16 @@ AGENT_VERSION = "0.1.0"
 async def handle(skill_id: str, payload: dict) -> dict:
     if skill_id != "impression.generate":
         raise ValueError(f"unexpected skill {skill_id}")
-
     ctx = payload["studyContext"]
     report = payload.get("report") or {}
-    findings_text = report.get("findingsText", "")
-
-    is_critical = any(word in findings_text.lower() for word in
-                      ["dissection", "pneumothorax", "hemorrhage", "occlusion", "rupture"])
-
-    impression = (
-        "Findings are consistent with aortic dissection. Urgent surgical consultation recommended."
-        if is_critical else
-        "No acute cardiopulmonary findings identified. Stable appearance."
-    )
-
-    critical_flags = (
-        [{"label": "aortic dissection", "severity": "critical"}]
-        if is_critical else []
-    )
-
+    # TODO(M2): call an LLM with findings + priors + AI output to draft a real impression.
     return {
         "schemaVersion": "1.0.0",
         "workflowId": ctx["workflowId"],
-        "impressionText": impression,
+        "impressionText": "[stub impression] No acute findings identified.",
         "structuredFindings": [],
-        "recommendations": [{"text": "Urgent surgical consultation"} if is_critical else {"text": "Routine follow-up"}],
-        "criticalFlags": critical_flags,
+        "recommendations": [],
+        "criticalFlags": [],
         "agentVersion": AGENT_VERSION,
         "generatedAt": now_iso(),
     }
