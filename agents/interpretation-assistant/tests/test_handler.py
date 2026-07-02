@@ -1,5 +1,4 @@
 """Contract test + selection tests for interpretation assistant."""
-import pytest
 from handler import handle
 from registry import select_tools
 from radagent_common.validation import validate_skill_output
