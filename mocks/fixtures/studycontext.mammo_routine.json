@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "wf_demo_mammo_001",
+  "study": {
+    "studyInstanceUID": "1.2.840.113619.2.55.3.444444444",
+    "accessionNumber": "ACC-MAMMO-001",
+    "orthancStudyId": "mammo-study-001",
+    "modality": "MG",
+    "studyDescription": "MAMMOGRAM BILATERAL SCREENING",
+    "numberOfInstances": 4
+  },
+  "patient": { "fhirPatientId": "Patient/demo-mammo", "mrn": "MRN-MAMMO-001" },
+  "order": { "fhirServiceRequestId": "ServiceRequest/demo-mammo", "priority": "routine", "reasonCode": ["Z12.31"] },
+  "assignment": { "radiologistId": null, "assignedAt": null },
+  "meta": {
+    "traceId": "trc_mammo000000001",
+    "spanId": "spn_mammo0001",
+    "emittedAt": "2026-06-27T13:00:00Z",
+    "source": "mocks.fixtures",
+    "schemaRef": "studycontext@1.0.0"
+  }
+}

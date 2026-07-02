@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "wf_demo_aorta_001",
+  "study": {
+    "studyInstanceUID": "1.2.840.113619.2.55.3.111111111",
+    "accessionNumber": "ACC-AORTA-001",
+    "orthancStudyId": "aorta-study-001",
+    "modality": "CT",
+    "studyDescription": "CT AORTA W CONTRAST",
+    "numberOfInstances": 280
+  },
+  "patient": { "fhirPatientId": "Patient/demo-aorta", "mrn": "MRN-AORTA-001" },
+  "order": { "fhirServiceRequestId": "ServiceRequest/demo-aorta", "priority": "stat", "reasonCode": ["I71.0"] },
+  "assignment": { "radiologistId": null, "assignedAt": null },
+  "meta": {
+    "traceId": "trc_aorta000000001",
+    "spanId": "spn_aorta0001",
+    "emittedAt": "2026-06-27T10:00:00Z",
+    "source": "mocks.fixtures",
+    "schemaRef": "studycontext@1.0.0"
+  }
+}
