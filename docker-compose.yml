@@ -122,23 +122,24 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
     depends_on: [temporal]
 
-  # --- Application services (M1: add Dockerfiles, then uncomment) ----------------
-  # orchestrator:
-  #   build: { context: ., dockerfile: orchestrator/Dockerfile }
-  #   command: ["sh", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090"]
-  #   environment:
-  #     TEMPORAL_TARGET: temporal:7233
-  #     FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
-  #     ORTHANC_BASE_URL: http://orthanc:8042
-  #   ports: ["8090:8090"]
-  #   depends_on: [temporal, openmrs, orthanc]
-  #
-  # worklist-triage:        { build: { context: ., dockerfile: agents/worklist-triage/Dockerfile },        ports: ["8101:8101"] }
-  # ehr-assistant:          { build: { context: ., dockerfile: agents/ehr-assistant/Dockerfile },          ports: ["8102:8102"] }
-  # interpretation-assistant:{ build: { context: ., dockerfile: agents/interpretation-assistant/Dockerfile }, ports: ["8103:8103"] }
-  # impression-generation:  { build: { context: ., dockerfile: agents/impression-generation/Dockerfile },  ports: ["8104:8104"] }
-  # report-verification:    { build: { context: ., dockerfile: agents/report-verification/Dockerfile },    ports: ["8105:8105"] }
-  # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`.
+  # --- Application services (M1) -------------------------------------------------
+  orchestrator:
+    build: { context: ., dockerfile: orchestrator/Dockerfile }
+    command: ["sh", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090"]
+    environment:
+      TEMPORAL_TARGET: temporal:7233
+      FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
+      ORTHANC_BASE_URL: http://orthanc:8042
+    ports: ["8090:8090"]
+    depends_on: [temporal, openmrs, orthanc]
+
+  worklist-triage:          { build: { context: ., dockerfile: agents/worklist-triage/Dockerfile },          ports: ["8101:8101"] }
+  ehr-assistant:            { build: { context: ., dockerfile: agents/ehr-assistant/Dockerfile },            ports: ["8102:8102"] }
+  interpretation-assistant: { build: { context: ., dockerfile: agents/interpretation-assistant/Dockerfile }, ports: ["8103:8103"] }
+  impression-generation:    { build: { context: ., dockerfile: agents/impression-generation/Dockerfile },    ports: ["8104:8104"] }
+  report-verification:      { build: { context: ., dockerfile: agents/report-verification/Dockerfile },      ports: ["8105:8105"] }
+  # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`
+  # (external image, added when it runs).
 
 volumes:
   mariadb-data:
