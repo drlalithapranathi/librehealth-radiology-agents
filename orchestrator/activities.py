@@ -37,5 +37,6 @@ async def escalate_activity(workflow_id: str, reason: str) -> None:
 
 
 # Convenience for ingress: the RIS poller uses this to find finalized reports.
-async def poll_finalized_reports(since_iso: str) -> list[dict]:
+# Returns (finalized records oldest-first, high-water `_lastUpdated` cursor).
+async def poll_finalized_reports(since_iso: str) -> tuple[list[dict], str | None]:
     return await Fhir2Client().poll_finalized_reports(since_iso)

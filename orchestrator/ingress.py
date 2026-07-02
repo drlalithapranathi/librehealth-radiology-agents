@@ -7,6 +7,7 @@ Owner: Pranathi (lead). Trigger map: ARCHITECTURE.md
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,12 @@ TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
 POLL_INTERVAL_S = int(os.environ.get("RIS_POLL_INTERVAL_S", "30"))
 
 _client: Client | None = None
+_log = logging.getLogger("orchestrator.ingress")
+
+# Report -> workflow join index, populated when a workflow starts. M1: in-memory — the webhook
+# (writer) and the poller (reader) share one ingress process. TODO(#6): make it durable so the
+# mapping survives an ingress restart during the human-gate wait.
+_WORKFLOW_INDEX: dict[str, str] = {}
 
 
 async def _temporal() -> Client:
@@ -59,34 +66,95 @@ def _build_study_context(event: dict) -> dict:
     }
 
 
-async def _ris_poller() -> None:
-    """Poll fhir2 for finalized reports and signal matching workflows."""
-    cursor = now_iso()
-    while True:
-        await asyncio.sleep(POLL_INTERVAL_S)
-        try:
-            reports = await activities.poll_finalized_reports(cursor)
-        except NotImplementedError:
-            continue  # M0: fhir2 client not wired yet
-        except Exception:  # noqa: BLE001 - keep the loop alive
-            continue
-        client = await _temporal()
-        for rep in reports:
-            wf_id = _workflow_id_for_report(rep)
-            if not wf_id:
-                continue
-            handle = client.get_workflow_handle(wf_id)
-            await handle.signal(StudyWorkflow.report_finalized, rep)
-            cursor = rep.get("lastUpdatedCursor", cursor)
+def _index_workflow(ctx: dict) -> None:
+    """Record a study's join keys -> workflowId so its finalized report can find it later.
+
+    At start we may have the accession (from the Orthanc event) and — once #11 resolves the
+    order — the ServiceRequest ref. Index whatever is present.
+
+    NOTE(M1): the accession is currently the ONLY key we get (order is resolved in #11) and a
+    DICOM accession is an order identifier, not guaranteed unique per study — so we WARN rather
+    than silently overwrite on collision. The robust ServiceRequest join lights up with #11.
+    """
+    wf_id = ctx["workflowId"]
+    accession = (ctx.get("study") or {}).get("accessionNumber")
+    service_request = (ctx.get("order") or {}).get("fhirServiceRequestId")
+    keys = [k for k in (accession, service_request) if k]
+    if not keys:
+        _log.warning("study %s has no join key; its finalized report cannot be matched", wf_id)
+    for key in keys:
+        existing = _WORKFLOW_INDEX.get(key)
+        if existing and existing != wf_id:
+            _log.warning("join key %r re-points %s -> %s (accession not unique?)", key, existing, wf_id)
+        _WORKFLOW_INDEX[key] = wf_id
 
 
 def _workflow_id_for_report(report: dict) -> str | None:
-    """Map a finalized DiagnosticReport back to its workflow id.
-
-    TODO(M1): join on serviceRequestRef / accession -> workflowId (persist the mapping
-    when the workflow starts). Returns None until implemented.
-    """
+    """Map a finalized report back to its workflow via the keys recorded at start. Prefer the
+    ServiceRequest ref (robust once #11 lands); fall back to the accession."""
+    for key in (report.get("serviceRequestRef"), report.get("accessionNumber")):
+        if key and key in _WORKFLOW_INDEX:
+            return _WORKFLOW_INDEX[key]
     return None
+
+
+async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]) -> set[str]:
+    """Signal each mapped, not-yet-signalled report to its waiting workflow; return the ids newly
+    signalled. Reports already signalled at the current cursor (`skip_ids`) are deduped. A report
+    with no known workflow, or whose signal fails, is LOGGED and skipped rather than retried
+    (durable retry / dead-letter is #29) — so a silent drop can't happen unobserved."""
+    signalled: set[str] = set()
+    for report in reports:
+        report_id = report.get("diagnosticReportId")
+        if report_id in skip_ids:
+            continue
+        wf_id = _workflow_id_for_report(report)
+        if not wf_id:
+            _log.warning("finalized report %s matched no waiting workflow (dropped)", report_id)
+            continue
+        try:
+            await client.get_workflow_handle(wf_id).signal(StudyWorkflow.report_finalized, report)
+            signalled.add(report_id)
+        except Exception:  # noqa: BLE001 - workflow gone/unreachable
+            _log.warning("failed to signal workflow %s for report %s", wf_id, report_id)
+    return signalled
+
+
+def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], signalled: set[str]) -> tuple[str, set[str]]:
+    """Advance to the high-water mark; keep only the ids AT the new boundary for dedup.
+
+    ge{cursor} re-returns reports at the boundary second, so we remember which of those we already
+    signalled and drop the rest (older ids fall out of the query window). If the high-water didn't
+    move, hold the cursor and keep accumulating dedup ids at this boundary.
+    """
+    if not high_water or high_water == cursor:
+        return cursor, signalled
+    kept = {
+        r["diagnosticReportId"] for r in reports
+        if r.get("lastUpdatedCursor") == high_water and r["diagnosticReportId"] in signalled
+    }
+    return high_water, kept
+
+
+async def _ris_poller() -> None:
+    """Poll fhir2 for finalized reports and signal the matching workflows.
+
+    Advances an inclusive high-water cursor and dedups by report id at the boundary, so no
+    sign-off is dropped at a shared-second timestamp and none is signalled twice.
+    """
+    cursor = now_iso()
+    signalled_at_cursor: set[str] = set()
+    while True:
+        await asyncio.sleep(POLL_INTERVAL_S)
+        try:
+            reports, high_water = await activities.poll_finalized_reports(cursor)
+        except NotImplementedError:
+            continue  # fhir2 client not wired in this environment
+        except Exception:  # noqa: BLE001 - keep the loop alive
+            continue
+        if reports:
+            signalled_at_cursor |= await _process_batch(await _temporal(), reports, signalled_at_cursor)
+        cursor, signalled_at_cursor = _advance_cursor(cursor, high_water, reports, signalled_at_cursor)
 
 
 @asynccontextmanager
@@ -112,6 +180,7 @@ async def orthanc_webhook(event: dict) -> dict:
         raise HTTPException(status_code=422, detail=str(e))
 
     ctx = _build_study_context(event)
+    _index_workflow(ctx)  # remember the join keys so this study's finalized report can find it
     client = await _temporal()
     await client.start_workflow(
         StudyWorkflow.run,
