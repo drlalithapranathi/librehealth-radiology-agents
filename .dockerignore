@@ -1,0 +1,10 @@
+# Keep the build context (repo root) small and let the editable install rebuild cleanly.
+.git
+.gitignore
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/.pytest_cache
+.venv
+venv
+.idea
