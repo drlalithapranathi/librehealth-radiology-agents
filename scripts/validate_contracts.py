@@ -39,8 +39,13 @@ for cf in sorted((CONTRACTS / "cards").glob("*.json")):
         errors.append(f"[card invalid json] {cf.relative_to(ROOT)}: {e}")
 
 # 3. Fixtures validate against their schema (extend as fixtures are added).
+_studycontext_schema = CONTRACTS / "studycontext.schema.json"
 fixture_checks = [
-    (ROOT / "mocks/fixtures/studycontext.sample.json", CONTRACTS / "studycontext.schema.json"),
+    (ROOT / "mocks/fixtures/studycontext.sample.json", _studycontext_schema),
+    (ROOT / "mocks/fixtures/studycontext.ct_aortic_dissection.json", _studycontext_schema),
+    (ROOT / "mocks/fixtures/studycontext.cxr_pneumothorax.json", _studycontext_schema),
+    (ROOT / "mocks/fixtures/studycontext.mammo_routine.json", _studycontext_schema),
+    (ROOT / "mocks/fixtures/studycontext.mr_brain.json", _studycontext_schema),
 ]
 for fixture, schema in fixture_checks:
     if not fixture.exists():
