@@ -1,11 +1,13 @@
-"""A2A factory — the ONLY module that imports `a2a.*`.
+"""A2A server factory — isolates the *server-side* `a2a.*` plumbing. Together with its
+client-side counterpart `client.py`, these are the only two modules that import `a2a.*`;
+agent handlers never do.
 
 Why this exists
 ---------------
 The official `a2a-sdk` is young and churns hard: it went from a pydantic + Starlette API
 (0.2/0.3) to a **protobuf/gRPC-based** rewrite in 1.0. To keep four developers productive
-and the blast radius of an SDK bump to ONE file, all protocol specifics live here. An agent
-author writes:
+and the blast radius of an SDK bump to these two isolated modules, all server-side protocol
+specifics live here. An agent author writes:
 
     async def handle(skill_id: str, payload: dict) -> dict: ...
 
