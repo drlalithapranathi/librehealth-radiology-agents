@@ -1,0 +1,99 @@
+"""Tier-dependent sign-off gate timeout (#23).
+
+Unit-tests the tier -> timeout mapping, and an integration test proving the workflow actually
+uses the tier's timeout: a STAT study reaches the sign-off gate and escalates on timeout.
+Skipped unless temporalio is installed.
+"""
+from __future__ import annotations
+
+import asyncio
+from datetime import timedelta
+
+import pytest
+
+pytest.importorskip("temporalio", reason="temporalio not installed")
+
+from temporalio import activity  # noqa: E402
+from temporalio.testing import WorkflowEnvironment  # noqa: E402
+from temporalio.worker import Worker  # noqa: E402
+
+from orchestrator.state import TASK_QUEUE  # noqa: E402
+from orchestrator.workflow import (  # noqa: E402
+    StudyWorkflow,
+    signoff_timeout_for,
+    SIGNOFF_GATE_TIMEOUT_DEFAULT,
+)
+
+
+# --- unit: the tier -> timeout map ------------------------------------------------
+
+def test_timeout_is_tier_dependent_and_ordered():
+    stat = signoff_timeout_for("STAT")
+    urgent = signoff_timeout_for("URGENT")
+    routine = signoff_timeout_for("ROUTINE")
+    assert (stat, urgent, routine) == (timedelta(hours=1), timedelta(hours=2), timedelta(hours=4))
+    # STAT reads escalate fastest, ROUTINE slowest.
+    assert stat < urgent < routine
+
+
+def test_unknown_or_missing_tier_falls_back_to_default():
+    assert SIGNOFF_GATE_TIMEOUT_DEFAULT == timedelta(hours=4)
+    for tier in (None, "", "WEIRD"):
+        assert signoff_timeout_for(tier) == SIGNOFF_GATE_TIMEOUT_DEFAULT
+
+
+# --- integration: the workflow uses the tier timeout and escalates ----------------
+
+_ESCALATIONS: list = []
+
+
+@activity.defn(name="call_agent_skill_activity")
+async def _mock_call(agent: str, skill_id: str, payload: dict) -> dict:
+    if skill_id == "report.verify":
+        # First read needs human review (-> sign-off gate); after escalation, re-verify PASSes.
+        _mock_call.n += 1  # type: ignore[attr-defined]
+        return {"verificationStatus": "FAIL" if _mock_call.n == 1 else "PASS",  # type: ignore[attr-defined]
+                "requiresHumanReview": _mock_call.n == 1, "issues": []}  # type: ignore[attr-defined]
+    if skill_id == "triage.score":
+        return {"priorityTier": "STAT", "priorityScore": 95}
+    return {"ok": True}
+
+
+@activity.defn(name="publish_priority_activity")
+async def _mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
+    return None
+
+
+@activity.defn(name="escalate_activity")
+async def _mock_escalate(workflow_id: str, reason: str) -> None:
+    _ESCALATIONS.append((workflow_id, reason))
+
+
+STUDY_CONTEXT = {
+    "schemaVersion": "1.0.0", "workflowId": "wf_tier",
+    "study": {"studyInstanceUID": "1.2.3", "orthancStudyId": "abc", "modality": "CT"},
+    "patient": {"fhirPatientId": "Patient/1"}, "order": {},
+    "meta": {"traceId": "t", "emittedAt": "2026-06-26T00:00:00Z", "source": "test"},
+}
+
+
+def test_stat_study_reaches_signoff_gate_and_escalates():
+    async def scenario():
+        _mock_call.n = 0  # type: ignore[attr-defined]
+        _ESCALATIONS.clear()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
+                              activities=[_mock_call, _mock_publish, _mock_escalate]):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT, id="wf-tier-stat", task_queue=TASK_QUEUE
+                )
+                # release the radiologist gate, then let the (STAT = 1h) sign-off gate time out
+                for _ in range(200):
+                    if await handle.query(StudyWorkflow.current_state) == "AWAITING_RADIOLOGIST":
+                        break
+                    await asyncio.sleep(0.02)
+                await handle.signal(StudyWorkflow.report_finalized, {"diagnosticReportId": "DiagnosticReport/1"})
+                result = await handle.result()  # env time-skips the STAT sign-off timeout
+        assert result["finalState"] == "ARCHIVED"
+        assert len(_ESCALATIONS) == 1  # the tier-based sign-off gate timed out and escalated
+    asyncio.run(scenario())

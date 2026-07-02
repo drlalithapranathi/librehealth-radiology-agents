@@ -26,7 +26,18 @@ from .state import (
 # Tunables (could be moved to a config activity later).
 PRE_READ_TIMEOUT = timedelta(minutes=5)
 SKILL_TIMEOUT = timedelta(minutes=10)
-SIGNOFF_GATE_TIMEOUT = timedelta(hours=4)  # M2: tier-dependent (STAT shorter)
+# Sign-off gate timeout, tier-dependent (#23): STAT reads escalate fastest, ROUTINE slowest.
+SIGNOFF_GATE_TIMEOUTS = {
+    "STAT": timedelta(hours=1),
+    "URGENT": timedelta(hours=2),
+    "ROUTINE": timedelta(hours=4),
+}
+SIGNOFF_GATE_TIMEOUT_DEFAULT = timedelta(hours=4)  # unknown/missing tier -> most lenient
+
+
+def signoff_timeout_for(tier: str | None) -> timedelta:
+    """Tier-dependent sign-off gate timeout (#23). Unknown/missing tier -> the lenient default."""
+    return SIGNOFF_GATE_TIMEOUTS.get(tier or "", SIGNOFF_GATE_TIMEOUT_DEFAULT)
 
 
 @workflow.defn
@@ -118,7 +129,7 @@ class StudyWorkflow:
             try:
                 await workflow.wait_condition(
                     lambda: self._signoff_ack is not None,
-                    timeout=SIGNOFF_GATE_TIMEOUT,
+                    timeout=signoff_timeout_for((self._triage or {}).get("priorityTier")),
                 )
             except asyncio.TimeoutError:
                 await workflow.execute_activity(
