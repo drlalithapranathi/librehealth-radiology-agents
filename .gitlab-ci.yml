@@ -15,20 +15,33 @@ include:
 variables:
   SECRET_DETECTION_ENABLED: 'true'
 
+# Run ONE pipeline per change: an MR pipeline for branches with an open MR, and a branch
+# pipeline for the default branch. Prevents duplicate push+MR pipelines and — together with
+# the shared `.default-rules` below — makes the full test stage run in MR pipelines (not just
+# on the default branch), so an MR's green check actually means the suite passed. See #32.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# A job that extends this runs in MR pipelines AND on the default branch. Jobs without rules
+# default to branch/tag pipelines only and are silently skipped in merge_request_event
+# pipelines — which is exactly what let MRs !2/!3 go green while running only validate-contracts.
+.default-rules:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
 validate-contracts:
+  extends: .default-rules
   stage: validate
   image: python:3.11-slim
-  rules:
-    - changes:
-        - "contracts/**/*"
-        - "mocks/fixtures/**/*"
-        - "scripts/validate_contracts.py"
-        - ".gitlab-ci.yml"
   script:
     - pip install jsonschema
     - python scripts/validate_contracts.py
 
 agent-tests:
+  extends: .default-rules
   stage: test
   image: python:3.11-slim
   script:
@@ -43,6 +56,7 @@ a2a-factory-import:
   # Issue #2 acceptance #3: the app extras install and radagent_common.a2a imports cleanly
   # against the pinned a2a-sdk. (agent-tests deliberately runs WITHOUT this extra to keep
   # proving golden-rule 4 — handlers never import a2a.*.)
+  extends: .default-rules
   stage: test
   image: python:3.11-slim
   script:
@@ -53,6 +67,7 @@ a2a-client-it:
   # Issue #7 acceptance: the real A2A client round-trips a skill call against a LIVE mock
   # agent (uvicorn serving the factory app). Needs the a2a extra + uvicorn, so it runs in its
   # own lane rather than in agent-tests.
+  extends: .default-rules
   stage: test
   image: python:3.11-slim
   script:
@@ -63,6 +78,7 @@ ris-poller-tests:
   # Issue #12: fhir2 finalized-report query + the ingress report->workflow poller. Needs the
   # orchestrator deps (temporalio + fastapi); ingress imports radagent_common.client, so the
   # a2a extra comes along too. Run from repo root so `orchestrator` imports as a package.
+  extends: .default-rules
   stage: test
   image: python:3.11-slim
   script:
