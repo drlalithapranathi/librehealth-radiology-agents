@@ -74,6 +74,17 @@ a2a-client-it:
     - pip install -e "libs/radagent-common[a2a]" uvicorn pytest pytest-asyncio
     - cd libs/radagent-common && python -m pytest tests/test_client.py -q
 
+comms-roundtrip-it:
+  # Issue #17 acceptance: an orchestrator dispatch round-trips against the LIVE Communications
+  # agent. Needs the a2a extra + uvicorn (like a2a-client-it), so it runs in its own lane rather
+  # than agent-tests (which deliberately omits the a2a extra to keep proving golden-rule 4).
+  extends: .default-rules
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install -e "libs/radagent-common[a2a]" uvicorn pytest pytest-asyncio
+    - cd agents/communications && python -m pytest tests/test_roundtrip.py -q
+
 ris-poller-tests:
   # Issue #12: fhir2 finalized-report query + the ingress report->workflow poller. Needs the
   # orchestrator deps (temporalio + fastapi); ingress imports radagent_common.client, so the

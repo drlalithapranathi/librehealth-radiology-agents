@@ -1,0 +1,17 @@
+{
+  "name": "Communications Agent",
+  "description": "Dispatches critical-result and report-ready notifications over the configured channels once a study's report is finalized and verified.",
+  "url": "http://communications:8106/",
+  "version": "0.1.0",
+  "capabilities": { "streaming": true, "pushNotifications": true },
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
+  "skills": [
+    {
+      "id": "comms.dispatch",
+      "name": "Dispatch notifications",
+      "description": "Sends result notifications over configured channels; returns dispatchStatus and per-channel results.",
+      "tags": ["communications", "notification", "dispatch"]
+    }
+  ]
+}
