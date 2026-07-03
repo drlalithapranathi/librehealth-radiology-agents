@@ -21,11 +21,14 @@ Pinned target: a2a-sdk[http-server] 1.0.3 (verified in a real venv). In 1.0.x:
   * There is no `A2AStarletteApplication`. Serving is DIY: mount the route lists returned by
     `create_agent_card_routes` / `create_jsonrpc_routes` on a hand-rolled Starlette app.
   * `DefaultRequestHandler` now also requires the `agent_card`.
-  * The text-message helper is `a2a.helpers.new_text_message` (was `a2a.utils.new_agent_text_message`).
-  * Well-known path is `/.well-known/agent-card.json` (create_agent_card_routes' default).
-
-TODO(#8, M1): swap the defensive text-part payload handling below for typed DataPart in/out
-(that issue is blocked by this one and carries the orchestrator->agent->orchestrator round-trip test).
+  * Payloads ride as a typed **DataPart** (`a2a.helpers.new_data_message` / `get_data_parts`),
+    not JSON stuffed in a text part. Caveat: protobuf `Struct` coerces every number to float
+    (an int `50` arrives as `50.0`); our Draft 2020-12 contracts accept that as `integer`. The
+    integer fields are `priorityScore` (triage output) and `numberOfInstances` (in StudyContext,
+    hence every skill's input); both arrive as integral floats and re-coerce to `int` when parsed
+    through the typed `StudyContext` model (`radagent_common.context`).
+  * The well-known card path is pinned explicitly to the SDK's canonical
+    `AGENT_CARD_WELL_KNOWN_PATH` (see `WELL_KNOWN_CARD_PATH`) rather than relying on a default.
 """
 from __future__ import annotations
 
@@ -45,10 +48,16 @@ from a2a.server.request_handlers import DefaultRequestHandler  # type: ignore
 from a2a.server.tasks import InMemoryTaskStore  # type: ignore
 from a2a.server.routes.agent_card_routes import create_agent_card_routes  # type: ignore
 from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes  # type: ignore
-from a2a.helpers import new_text_message  # type: ignore
+from a2a.helpers import new_data_message, get_data_parts  # type: ignore
+from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH  # type: ignore
 from starlette.applications import Starlette  # provided by a2a-sdk[http-server]
 
 SkillHandler = Callable[[str, dict], Awaitable[dict]]
+
+# Well-known Agent Card path, pinned to a2a-sdk 1.0.3's canonical value. Drift is caught by the
+# exact `==1.0.3` SDK pin plus a literal-lock assertion in the tests; client.py resolves cards
+# from the same SDK constant, and build_agent_app serves the card here explicitly.
+WELL_KNOWN_CARD_PATH = AGENT_CARD_WELL_KNOWN_PATH  # "/.well-known/agent-card.json"
 
 
 def load_card(agent_dir_name: str) -> AgentCard:
@@ -63,28 +72,21 @@ def load_card(agent_dir_name: str) -> AgentCard:
 
 
 def _extract_payload(context: RequestContext) -> tuple[str, dict]:
-    """Pull {skillId, payload} out of the incoming message.
+    """Pull {skillId, payload} out of the incoming message's typed DataPart.
 
-    Convention: the orchestrator sends a single part whose text is JSON
-    `{"skillId": "...", "payload": {...}}`. We read text defensively so this keeps
-    working across SDK part-type changes. TODO(#8): prefer typed DataPart.
+    Convention: the orchestrator (radagent_common.client) sends a single data part whose value
+    is `{"skillId": "...", "payload": {...}}`.
     """
-    message = getattr(context, "message", None)
-    raw = None
-    for part in getattr(message, "parts", []) or []:
-        # part may expose .root.text or .text depending on SDK/version; try both.
-        text = getattr(getattr(part, "root", part), "text", None)
-        if text:
-            raw = text
-            break
-    if raw is None:
-        raise ContractError("No JSON payload found on incoming A2A message.")
-    obj = json.loads(raw)
+    parts = getattr(getattr(context, "message", None), "parts", None) or []
+    data = get_data_parts(parts)
+    if not data or not isinstance(data[0], dict):
+        raise ContractError("No dict DataPart payload found on incoming A2A message.")
+    obj = data[0]
     return obj.get("skillId", ""), obj.get("payload", {})
 
 
 class _SkillExecutor(AgentExecutor):
-    """Generic executor: decode -> call handler -> validate output -> emit JSON."""
+    """Generic executor: decode -> call handler -> validate output -> emit DataPart."""
 
     def __init__(self, handler: SkillHandler):
         self._handler = handler
@@ -94,7 +96,7 @@ class _SkillExecutor(AgentExecutor):
         result = await self._handler(skill_id, payload)
         # Enforce the inter-agent contract before it ever leaves this process.
         validate_skill_output(skill_id, result)
-        await event_queue.enqueue_event(new_text_message(json.dumps(result)))
+        await event_queue.enqueue_event(new_data_message(result))
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # No long-running work in v1 stubs. TODO(M1): cooperative cancel for real tools.
@@ -124,7 +126,7 @@ def build_agent_app(agent_dir_name: str, handler: SkillHandler) -> _AgentApp:
         agent_card=card,
     )
     # 1.0.x has no A2AStarletteApplication: assemble the app from route lists ourselves.
-    routes = create_agent_card_routes(agent_card=card) + create_jsonrpc_routes(
-        request_handler=request_handler, rpc_url="/"
-    )
+    routes = create_agent_card_routes(
+        agent_card=card, card_url=WELL_KNOWN_CARD_PATH
+    ) + create_jsonrpc_routes(request_handler=request_handler, rpc_url="/")
     return _AgentApp(Starlette(routes=routes))
