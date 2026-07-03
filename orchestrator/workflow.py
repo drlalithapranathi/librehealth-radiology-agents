@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any, Optional
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 from .state import (
     State,
@@ -132,11 +133,22 @@ class StudyWorkflow:
                     timeout=signoff_timeout_for((self._triage or {}).get("priorityTier")),
                 )
             except asyncio.TimeoutError:
-                await workflow.execute_activity(
-                    ACT_ESCALATE,
-                    args=[wf_id, "sign-off gate timed out awaiting radiologist"],
-                    start_to_close_timeout=PRE_READ_TIMEOUT,
-                )
+                # The orchestrator owns the durable escalation clock (the real comms agent has no
+                # self-firing timer of its own), so on timeout WE page the on-call exactly once via
+                # escalate_activity -> comms.dispatch. Best-effort: bounded retries for a transient
+                # comms blip, but a persistent outage must NOT strand the durable gate -- we log and
+                # let the loop re-escalate on the next tier timeout rather than failing the workflow.
+                try:
+                    await workflow.execute_activity(
+                        ACT_ESCALATE,
+                        args=[wf_id, "sign-off gate timed out awaiting radiologist"],
+                        start_to_close_timeout=SKILL_TIMEOUT,
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception:  # noqa: BLE001 - paging is best-effort; never strand the gate
+                    workflow.logger.warning(
+                        "escalation paging failed for %s; re-escalating on next tier timeout", wf_id
+                    )
                 # Loop re-verifies; in M2 an addendum updates self._report_event first.
 
         # --- COMMUNICATE: hand off to the existing Communications Agent (A2A) -----

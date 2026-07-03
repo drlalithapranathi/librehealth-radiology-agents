@@ -1,7 +1,10 @@
-"""Tier-dependent sign-off gate timeout (#23).
+"""Tier-dependent sign-off gate timeout + on-call paging (#23).
 
-Unit-tests the tier -> timeout mapping, and an integration test proving the workflow actually
-uses the tier's timeout: a STAT study reaches the sign-off gate and escalates on timeout.
+Covers both halves of #23:
+- the tier -> timeout mapping (unit) and that the workflow actually uses the tier's timeout
+  (integration: a STAT study reaches the sign-off gate and escalates on timeout);
+- that escalation does real paging (unit): escalate_activity dispatches comms.dispatch marked
+  critical, which the Communications Agent routes to the on-call pager.
 Skipped unless temporalio is installed.
 """
 from __future__ import annotations
@@ -14,9 +17,10 @@ import pytest
 pytest.importorskip("temporalio", reason="temporalio not installed")
 
 from temporalio import activity  # noqa: E402
-from temporalio.testing import WorkflowEnvironment  # noqa: E402
+from temporalio.testing import WorkflowEnvironment, ActivityEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
+import orchestrator.activities as activities  # noqa: E402
 from orchestrator.state import TASK_QUEUE  # noqa: E402
 from orchestrator.workflow import (  # noqa: E402
     StudyWorkflow,
@@ -97,3 +101,38 @@ def test_stat_study_reaches_signoff_gate_and_escalates():
         assert result["finalState"] == "ARCHIVED"
         assert len(_ESCALATIONS) == 1  # the tier-based sign-off gate timed out and escalated
     asyncio.run(scenario())
+
+
+# --- unit: escalate_activity really pages the on-call via comms.dispatch (#23) -----
+
+def test_escalate_activity_pages_oncall_via_comms(monkeypatch):
+    """The escalate activity dispatches `comms.dispatch` marked critical, which the Communications
+    Agent routes to the on-call pager. We capture the outbound dispatch and assert it carries the
+    workflowId and the critical marker (verificationStatus=FAIL) that trips the pager route
+    (agents/communications/handler._is_critical) -- so an escalation actually reaches a human."""
+    captured: dict = {}
+
+    async def _fake_dispatch(base_url, skill_id, payload):
+        captured.update(base_url=base_url, skill_id=skill_id, payload=payload)
+        return {
+            "schemaVersion": "1.0.0",
+            "workflowId": payload["studyContext"]["workflowId"],
+            "dispatchStatus": "SENT",
+            "channelResults": [{"channel": "ehr-inbox", "status": "SENT"},
+                               {"channel": "oncall-pager", "status": "SENT"}],
+            "agentVersion": "0.1.0",
+            "dispatchedAt": "2026-07-02T00:00:00Z",
+        }
+
+    # escalate_activity resolves call_agent_skill as a module global -> patch it there.
+    monkeypatch.setattr(activities, "call_agent_skill", _fake_dispatch)
+
+    result = asyncio.run(ActivityEnvironment().run(
+        activities.escalate_activity, "wf_esc", "sign-off gate timed out awaiting radiologist"))
+
+    assert captured["skill_id"] == "comms.dispatch"
+    assert captured["payload"]["studyContext"]["workflowId"] == "wf_esc"
+    assert captured["payload"]["verification"]["verificationStatus"] == "FAIL"  # -> pager route
+    assert "communications" in captured["base_url"]
+    assert result["dispatchStatus"] == "SENT"
+    assert any(c["channel"] == "oncall-pager" for c in result["channelResults"])
