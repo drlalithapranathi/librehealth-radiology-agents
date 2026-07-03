@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 from .state import (
     State,
@@ -145,7 +146,10 @@ class StudyWorkflow:
                         start_to_close_timeout=SKILL_TIMEOUT,
                         retry_policy=RetryPolicy(maximum_attempts=3),
                     )
-                except Exception:  # noqa: BLE001 - paging is best-effort; never strand the gate
+                except ActivityError:
+                    # Paging is best-effort: the activity failed after its retries, but a persistent
+                    # comms outage must never strand the durable gate. Log and let the loop
+                    # re-escalate on the next tier timeout rather than failing the workflow.
                     workflow.logger.warning(
                         "escalation paging failed for %s; re-escalating on next tier timeout", wf_id
                     )
