@@ -26,10 +26,18 @@ def _report(rid, cursor, accession=None, service_request=None):
             "accessionNumber": accession, "serviceRequestRef": service_request}
 
 
+@pytest.fixture(autouse=True)
+def _fresh_store():
+    """Each test gets an isolated in-memory durable store (#6 replaced the in-process dict)."""
+    ingress._STORE = ingress.IngressStore(":memory:")
+    yield
+    ingress._STORE.close()
+    ingress._STORE = None
+
+
 # ---- mapping (acceptance box 1) --------------------------------------------------
 
 def test_index_and_lookup_by_accession_and_service_request():
-    ingress._WORKFLOW_INDEX.clear()
     ingress._index_workflow(_ctx("wf_a", accession="ACC-1"))
     ingress._index_workflow(_ctx("wf_b", service_request="ServiceRequest/sr-2"))
 
@@ -39,7 +47,6 @@ def test_index_and_lookup_by_accession_and_service_request():
 
 
 def test_service_request_preferred_over_accession():
-    ingress._WORKFLOW_INDEX.clear()
     ingress._index_workflow(_ctx("wf_sr", service_request="ServiceRequest/sr-9"))
     ingress._index_workflow(_ctx("wf_acc", accession="ACC-9"))
     report = {"serviceRequestRef": "ServiceRequest/sr-9", "accessionNumber": "ACC-9"}
@@ -65,7 +72,6 @@ class _FakeClient:
 
 
 def test_process_batch_signals_correct_workflow_with_report_finalized_signal():
-    ingress._WORKFLOW_INDEX.clear()
     ingress._index_workflow(_ctx("wf_1", accession="ACC-1"))
     reports = [
         _report("DiagnosticReport/r1", "t1", accession="ACC-1"),        # mapped
@@ -80,7 +86,6 @@ def test_process_batch_signals_correct_workflow_with_report_finalized_signal():
 
 
 def test_process_batch_routes_two_reports_to_two_workflows():
-    ingress._WORKFLOW_INDEX.clear()
     ingress._index_workflow(_ctx("wf_a", accession="ACC-A"))
     ingress._index_workflow(_ctx("wf_b", service_request="ServiceRequest/sr-B"))
     reports = [
@@ -93,7 +98,6 @@ def test_process_batch_routes_two_reports_to_two_workflows():
 
 
 def test_process_batch_dedups_already_signalled():
-    ingress._WORKFLOW_INDEX.clear()
     ingress._index_workflow(_ctx("wf_1", accession="ACC-1"))
     reports = [_report("DiagnosticReport/r1", "t1", accession="ACC-1")]
     client = _FakeClient()
@@ -103,7 +107,6 @@ def test_process_batch_dedups_already_signalled():
 
 
 def test_process_batch_signal_failure_is_swallowed():
-    ingress._WORKFLOW_INDEX.clear()
     ingress._index_workflow(_ctx("wf_1", accession="ACC-1"))
 
     class _RaisingHandle:

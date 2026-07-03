@@ -9,3 +9,9 @@ venv/
 dist/
 build/
 .idea/
+
+# Ingress durable state (SQLite) — #6; created at runtime, never committed
+ingress_state.db
+*.db
+*.db-wal
+*.db-shm
