@@ -28,7 +28,7 @@ workflow:
 # default to branch/tag pipelines only and are silently skipped in merge_request_event
 # pipelines — which is exactly what let MRs !2/!3 go green while running only validate-contracts.
 .default-rules:
-  rules:
+  rules: &default-rules
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
@@ -110,12 +110,13 @@ orchestrator-e2e-it:
 
 # The managed SAST/Secret-Detection templates default to branch pipelines only, so with the
 # workflow block above (which suppresses the push pipeline on MR branches) they would run on
-# NO merge request at all. Opt them into MR pipelines so an MR's green check includes the
-# security scans, not just the test stage. See #32.
+# NO merge request at all. Override only their `rules` to opt them into MR pipelines. Do NOT
+# use `extends: .default-rules` here: `extends` replaces the template's own base (`.sast`/
+# `.secret-analyzer`), which drops the analyzer image and breaks `/analyzer run`. See #32.
 sast:
-  extends: .default-rules
   stage: test
+  rules: *default-rules
 
 secret_detection:
-  extends: .default-rules
   stage: secret-detection
+  rules: *default-rules
