@@ -171,8 +171,8 @@ def test_reconcile_evicts_completed_keeps_running(tmp_path):
                               activities=[mock_call_agent, mock_publish, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
 
-                # workflow that runs to completion (ARCHIVED) — signalled directly, so its row is
-                # NOT delivery-evicted; only reconciliation can reclaim it.
+                # workflow that runs to completion (ARCHIVED). Reconciliation is the only eviction
+                # path, so its row is reclaimed by the sweep below, not at delivery time.
                 done = _ctx("wf_done", "ACC-DONE")
                 ingress._index_workflow(done)
                 h1 = await env.client.start_workflow(

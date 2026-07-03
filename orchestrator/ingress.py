@@ -174,11 +174,13 @@ async def _is_open(client: Client, wf_id: str) -> bool:
 
 
 async def _reconcile_index(client: Client) -> int:
-    """Evict index rows whose workflow is no longer open -- the durable, restart-safe form of
-    'evict on workflow completion' (#6). Delivery-eviction reclaims the happy path immediately;
-    this sweep reclaims studies that never delivered a report (cancelled / QC-rejected /
-    terminated), so index growth stays bounded to the set of studies still awaiting sign-off.
-    Runs at poller startup (the GC point after a restart) and periodically. Returns rows pruned."""
+    """Evict index rows whose workflow is no longer open, the durable and restart-safe form of
+    'evict on workflow completion' (#6). Reconciliation is the only eviction path. A delivered
+    report keeps its row while the workflow runs so an addendum can still route, and this sweep
+    reclaims that row once the workflow closes. It also reclaims studies that never delivered a
+    report (cancelled, QC-rejected, or terminated), so index growth stays bounded to the set of
+    studies still awaiting sign-off. Runs at poller startup (the GC point after a restart) and
+    periodically. Returns rows pruned."""
     store = _store()
     pruned = 0
     for wf_id in store.indexed_workflow_ids():
