@@ -108,8 +108,14 @@ orchestrator-e2e-it:
     - pip install -e "libs/radagent-common[a2a]" uvicorn "temporalio==1.29.0" pytest
     - python -m pytest orchestrator/tests/test_e2e_temporal.py -q
 
+# The managed SAST/Secret-Detection templates default to branch pipelines only, so with the
+# workflow block above (which suppresses the push pipeline on MR branches) they would run on
+# NO merge request at all. Opt them into MR pipelines so an MR's green check includes the
+# security scans, not just the test stage. See #32.
 sast:
+  extends: .default-rules
   stage: test
 
 secret_detection:
+  extends: .default-rules
   stage: secret-detection
