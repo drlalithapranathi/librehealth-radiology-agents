@@ -110,11 +110,16 @@ orchestrator-e2e-it:
 
 # The managed SAST/Secret-Detection templates default to branch pipelines only, so with the
 # workflow block above (which suppresses the push pipeline on MR branches) they would run on
-# NO merge request at all. Override only their `rules` to opt them into MR pipelines. Do NOT
-# use `extends: .default-rules` here: `extends` replaces the template's own base (`.sast`/
-# `.secret-analyzer`), which drops the analyzer image and breaks `/analyzer run`. See #32.
+# NO merge request at all. Opt the concrete analyzer jobs into MR pipelines by overriding
+# ONLY their `rules`. Two rules of thumb (learned the hard way, see #32):
+#   - Do NOT use `extends: .default-rules`: `extends` replaces the template's own base, which
+#     drops the analyzer image and breaks `/analyzer run`.
+#   - Do NOT put `rules` on the `sast` job: it is a config-only placeholder whose template
+#     `rules: when: never` must stand, or it runs its `exit 1` script. Target `semgrep-sast`.
 sast:
-  stage: test
+  stage: test        # config-only: sets the analyzer stage; the placeholder never runs itself
+
+semgrep-sast:
   rules: *default-rules
 
 secret_detection:
