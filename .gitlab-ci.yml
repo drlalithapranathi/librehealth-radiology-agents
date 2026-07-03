@@ -96,6 +96,18 @@ ris-poller-tests:
     - pip install -e "libs/radagent-common[a2a]" "temporalio==1.29.0" fastapi pytest
     - python -m pytest libs/radagent-common/tests/test_fhir_client.py orchestrator/tests -q
 
+orchestrator-e2e-it:
+  # Issue #9 / #19: the orchestrator runs FULLY ON MOCKS end-to-end. Boots all six agents as
+  # live A2A servers and drives StudyWorkflow start->ARCHIVED on a real Temporal (test server).
+  # Needs the a2a extra + uvicorn + temporalio, so it runs in its own lane; the poller lane skips
+  # this test (no uvicorn there) via importorskip. This is the "runs fully on mocks in CI" proof.
+  extends: .default-rules
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install -e "libs/radagent-common[a2a]" uvicorn "temporalio==1.29.0" pytest
+    - python -m pytest orchestrator/tests/test_e2e_temporal.py -q
+
 sast:
   stage: test
 
