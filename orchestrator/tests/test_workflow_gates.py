@@ -1,7 +1,7 @@
 """Human-gate durability tests for StudyWorkflow (issue #6).
 
 Uses Temporal's time-skipping test environment to prove the two risk items in #6:
-  * ESCALATION — the sign-off gate times out (SIGNOFF_GATE_TIMEOUT) and fires escalate_activity;
+  * ESCALATION — the sign-off gate times out (the tier timeout; this ROUTINE study = 4h) and fires escalate_activity;
   * RESTART-DURING-WAIT — a workflow blocked at AWAITING_RADIOLOGIST survives a worker restart
     and completes once signalled.
 Plus the happy path: report_finalized releases the radiologist gate and current_state tracks it.
