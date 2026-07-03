@@ -15,6 +15,7 @@ from datetime import timedelta
 from typing import Any, Optional
 
 from temporalio import workflow
+from temporalio.common import RetryPolicy
 
 from .state import (
     State,
@@ -26,7 +27,18 @@ from .state import (
 # Tunables (could be moved to a config activity later).
 PRE_READ_TIMEOUT = timedelta(minutes=5)
 SKILL_TIMEOUT = timedelta(minutes=10)
-SIGNOFF_GATE_TIMEOUT = timedelta(hours=4)  # M2: tier-dependent (STAT shorter)
+# Sign-off gate timeout, tier-dependent (#23): STAT reads escalate fastest, ROUTINE slowest.
+SIGNOFF_GATE_TIMEOUTS = {
+    "STAT": timedelta(hours=1),
+    "URGENT": timedelta(hours=2),
+    "ROUTINE": timedelta(hours=4),
+}
+SIGNOFF_GATE_TIMEOUT_DEFAULT = timedelta(hours=4)  # unknown/missing tier -> most lenient
+
+
+def signoff_timeout_for(tier: str | None) -> timedelta:
+    """Tier-dependent sign-off gate timeout (#23). Unknown/missing tier -> the lenient default."""
+    return SIGNOFF_GATE_TIMEOUTS.get(tier or "", SIGNOFF_GATE_TIMEOUT_DEFAULT)
 
 
 @workflow.defn
@@ -118,14 +130,25 @@ class StudyWorkflow:
             try:
                 await workflow.wait_condition(
                     lambda: self._signoff_ack is not None,
-                    timeout=SIGNOFF_GATE_TIMEOUT,
+                    timeout=signoff_timeout_for((self._triage or {}).get("priorityTier")),
                 )
             except asyncio.TimeoutError:
-                await workflow.execute_activity(
-                    ACT_ESCALATE,
-                    args=[wf_id, "sign-off gate timed out awaiting radiologist"],
-                    start_to_close_timeout=PRE_READ_TIMEOUT,
-                )
+                # The orchestrator owns the durable escalation clock (the real comms agent has no
+                # self-firing timer of its own), so on timeout WE page the on-call exactly once via
+                # escalate_activity -> comms.dispatch. Best-effort: bounded retries for a transient
+                # comms blip, but a persistent outage must NOT strand the durable gate -- we log and
+                # let the loop re-escalate on the next tier timeout rather than failing the workflow.
+                try:
+                    await workflow.execute_activity(
+                        ACT_ESCALATE,
+                        args=[wf_id, "sign-off gate timed out awaiting radiologist"],
+                        start_to_close_timeout=SKILL_TIMEOUT,
+                        retry_policy=RetryPolicy(maximum_attempts=3),
+                    )
+                except Exception:  # noqa: BLE001 - paging is best-effort; never strand the gate
+                    workflow.logger.warning(
+                        "escalation paging failed for %s; re-escalating on next tier timeout", wf_id
+                    )
                 # Loop re-verifies; in M2 an addendum updates self._report_event first.
 
         # --- COMMUNICATE: hand off to the existing Communications Agent (A2A) -----

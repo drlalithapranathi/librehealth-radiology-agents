@@ -28,12 +28,34 @@ async def publish_priority_activity(workflow_id: str, study_instance_uid: str, t
 
 
 @activity.defn(name=state.ACT_ESCALATE)
-async def escalate_activity(workflow_id: str, reason: str) -> None:
-    """Human-gate timer fired without a radiologist action -> escalate.
+async def escalate_activity(workflow_id: str, reason: str) -> dict:
+    """Sign-off human-gate timed out with no radiologist action -> page the on-call (#23).
 
-    TODO(M2): real escalation (page on-call, notify lead). For now, log.
+    The orchestrator owns the durable escalation clock (Temporal), so on timeout it invokes the
+    Communications Agent exactly once via the A2A `comms.dispatch` boundary. We mark the dispatch
+    critical so the agent routes it to the on-call pager channel -- an unsigned, flagged read must
+    reach a human. The page carries IDs only (lean-reference; no PHI in the message).
+
+    TODO(M3): wire the REAL Communications Agent (CritCom). This dispatch targets the in-repo
+    comms.dispatch STUB; CritCom is shaped differently and needs an adapter:
+      1. protocol: A2A `message/send` + `X-API-Key` with a natural-language instruction, not this
+         structured `comms.dispatch` skill;
+      2. identifiers: a real FHIR ref (DiagnosticReport / ServiceRequest / DICOM accession),
+         resolved from the study (#11) -- `workflowId` is meaningless to CritCom;
+      3. context/creds: FHIR endpoint + token as A2A metadata, plus a Gemini/Vertex key;
+      4. reply: parse CritCom's Task/free-text result back into dispatchStatus/channelResults.
+    Note: CritCom's own gate is 'ordering physician didn't ACK a critical result', a DIFFERENT gate
+    from this 'radiologist didn't SIGN' one -- when wiring CritCom, don't double-page.
     """
     activity.logger.warning("ESCALATE wf=%s reason=%s", workflow_id, reason)
+    payload = {
+        "studyContext": {"workflowId": workflow_id},
+        # Mark this dispatch critical so the agent adds the on-call pager channel. This is the only
+        # lever the current comms.dispatch contract offers for "page now"; an explicit urgency
+        # field is a possible contract follow-up (see the M3 CritCom adapter).
+        "verification": {"verificationStatus": "FAIL"},
+    }
+    return await call_agent_skill(state.agent_base_url("communications"), "comms.dispatch", payload)
 
 
 # Convenience for ingress: the RIS poller uses this to find finalized reports.
