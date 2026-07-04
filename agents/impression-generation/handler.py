@@ -1,7 +1,11 @@
 """Impression Generation handler — owner: Chaitra.
 
-Consumes the finalised report and populates structuredFindings/criticalFlags
-deterministically (no LLM call in v1).
+v1 returns a deterministic stub draft (no LLM call). Critical-finding detection
+below is deferred: TODO(M1) fetch the DiagnosticReport via
+radagent_common.fhir_client using report["diagnosticReportId"] and scan its
+`conclusion` field — the `report` payload passed in is the lean
+`ris.report.finalized` event ({diagnosticReportId, status, lastUpdatedCursor,
+...}) and never carries narrative text inline (Golden rule 2).
 
 Input  : { studyContext, report?, ehrContext?, aiFindings? }
 Output : contracts/skills/impression.schema.json
@@ -32,13 +36,13 @@ async def handle(skill_id: str, payload: dict) -> dict:
 
     ctx = payload["studyContext"]
     report = payload.get("report") or {}
-    findings_text = (report.get("findingsText") or "").lower()
+    conclusion = (report.get("conclusion") or "").lower()
 
     # Deterministically detect critical findings
     critical_flags = [
         {"label": label, "severity": "critical"}
         for keyword, label in _CRITICAL_KEYWORDS.items()
-        if keyword in findings_text
+        if keyword in conclusion
     ]
 
     structured_findings = [
