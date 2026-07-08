@@ -67,6 +67,12 @@ Required: `schemaVersion`, `eventType`, `orthancStudyId`, `studyInstanceUID`,
 it). See the schema for full constraints. The ingress rejects
 non-conforming events with **422** — that's the CI gate.
 
+`occurredAt` is Orthanc's study `LastUpdate` timestamp. When a build omits it,
+both paths fall back to the current UTC time in RFC 3339 (e.g.
+`2026-07-08T15:24:17Z`) so the event stays schema-valid. The two
+implementations use the same format, so the ingress cannot tell which path
+fired.
+
 ## Lua deploy notes
 
 - **`SetHttpHeaders` requires Orthanc 1.5.x+**. The Lua wraps that call in
