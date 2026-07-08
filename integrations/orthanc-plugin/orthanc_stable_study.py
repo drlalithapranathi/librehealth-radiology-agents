@@ -8,12 +8,19 @@ Owner: Parvati. Trigger map: ARCHITECTURE.md
 """
 import json
 import os
+from datetime import datetime, timezone
 
 import orthanc  # provided by the Orthanc Python plugin runtime
 import urllib.parse
 import urllib.request
 
 ORCH_WEBHOOK = os.environ.get("ORCH_WEBHOOK_URL", "http://orchestrator:8090/webhooks/orthanc")
+
+
+def _now_iso_utc() -> str:
+    # RFC 3339 UTC "now", matching the Lua fallback's nowIsoUtc(). Fall-through for
+    # occurredAt so the event stays schema-valid when a build omits LastUpdate.
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _post(payload: dict) -> None:
@@ -38,7 +45,7 @@ def OnStableStudy(study_id, tags, metadata):
         "studyInstanceUID": tags.get("StudyInstanceUID", ""),
         "modality": tags.get("ModalitiesInStudy", tags.get("Modality", "")),
         "accessionNumber": tags.get("AccessionNumber", ""),
-        "occurredAt": metadata.get("LastUpdate", ""),
+        "occurredAt": metadata.get("LastUpdate") or _now_iso_utc(),
     }
     try:
         _post(payload)
