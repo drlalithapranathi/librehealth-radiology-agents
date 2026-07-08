@@ -1,0 +1,14 @@
+id: mammo-birads-code-valid
+severity: WARN
+description: >
+  BI-RADS final assessment must be in the 0-6 range. Fires when the parsed
+  assessment is above 6 (a coding/mapping error from asses -> BI-RADS). Seeded
+  from EMBED BI-RADS semantics (docs/embed-mammography-mapping.md, section 5.1).
+  Activates once report-body parsing populates report.body.biradsAssessment
+  (M2); harmless no-op until then, since a missing field never compares true.
+when:
+  field: report.body.biradsAssessment
+  op: gt
+  value: 6
+message: "BI-RADS assessment {field} is out of the valid 0-6 range."
+location: report.body.biradsAssessment
