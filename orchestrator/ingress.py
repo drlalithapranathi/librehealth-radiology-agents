@@ -253,11 +253,41 @@ async def _reconcile_index(client: Client) -> int:
     return pruned
 
 
+# Real-time nudge (#25): the RIS-side hook (OpenMRS module hook or an Atomfeed bridge) POSTs to
+# /webhooks/ris/event and the poller sweeps NOW instead of waiting out the interval. The cursor
+# sweep stays the single source of truth — a nudge carries no data and can be lost, duplicated,
+# or fired spuriously without affecting correctness; interval polling remains the fallback.
+# Lazily created so importing this module has no side effect; tests reset `_WAKE`.
+_WAKE: asyncio.Event | None = None
+
+
+def _wake_event() -> asyncio.Event:
+    global _WAKE
+    if _WAKE is None:
+        _WAKE = asyncio.Event()
+    return _WAKE
+
+
+async def _sleep_or_nudge(seconds: float) -> bool:
+    """Wait for the next sweep: a full interval, or sooner if the RIS event webhook nudges.
+    Returns True when nudged. A nudge that lands DURING a sweep is not lost — the event stays
+    set until consumed here, so bursts coalesce into exactly one immediate re-sweep."""
+    wake = _wake_event()
+    try:
+        await asyncio.wait_for(wake.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        wake.clear()
+
+
 async def _ris_poller() -> None:
     """Poll fhir2 for finalized reports and signal the matching workflows.
 
     Advances an inclusive high-water cursor and dedups by report id at the boundary, so no
-    sign-off is dropped at a shared-second timestamp and none is signalled twice.
+    sign-off is dropped at a shared-second timestamp and none is signalled twice. A RIS event
+    nudge (#25) only shortens the wait before a sweep; it never bypasses the cursor.
     """
     store = _store()
     cursor, signalled_at_cursor = store.load_cursor()
@@ -270,7 +300,7 @@ async def _ris_poller() -> None:
         _log.warning("index reconciliation failed at startup")
     polls = 0
     while True:
-        await asyncio.sleep(POLL_INTERVAL_S)
+        await _sleep_or_nudge(POLL_INTERVAL_S)
         polls += 1
         if polls % RECONCILE_EVERY_POLLS == 0:
             try:
@@ -304,6 +334,17 @@ app = FastAPI(title="LH-Radiology Orchestrator Ingress", lifespan=lifespan)
 @app.get("/healthz")
 async def healthz() -> dict:
     return {"ok": True}
+
+
+@app.post("/webhooks/ris/event", status_code=202)
+async def ris_event() -> dict:
+    """RIS-side change hook (#25): nudge the poller to sweep immediately.
+
+    Deliberately takes NO payload: the fhir2 cursor sweep remains the single source of truth,
+    so this endpoint is PHI-free, idempotent, and safe for the RIS side to fire on any event
+    (or never — interval polling is the unchanged fallback)."""
+    _wake_event().set()
+    return {"nudged": True}
 
 
 @app.post("/webhooks/orthanc")
