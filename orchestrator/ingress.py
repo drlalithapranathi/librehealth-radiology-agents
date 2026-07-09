@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from temporalio.client import Client, WorkflowExecutionStatus
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from radagent_common import validate_against, paths
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id
@@ -253,10 +254,19 @@ async def orthanc_webhook(event: dict) -> dict:
     ctx = _build_study_context(event)
     _index_workflow(ctx)  # remember the join keys so this study's finalized report can find it
     client = await _temporal()
-    await client.start_workflow(
-        StudyWorkflow.run,
-        ctx,
-        id=ctx["workflowId"],
-        task_queue=TASK_QUEUE,
-    )
+    try:
+        await client.start_workflow(
+            StudyWorkflow.run,
+            ctx,
+            id=ctx["workflowId"],
+            task_queue=TASK_QUEUE,
+        )
+    except WorkflowAlreadyStartedError:
+        # Orthanc re-fires OnStableStudy for the same study (a late instance reopens it, so it goes
+        # stable again). The workflow id is deterministic (wf_<orthancStudyId>), so a duplicate event
+        # is normal PACS behaviour, not an error: return 200 with the existing id so the plugin and
+        # its retries (#47) see success instead of a 500. TODO(#11): on a re-fire, re-run the fhir2
+        # resolution + re-index to repair a first pass that left the study Patient/UNRESOLVED.
+        _log.info("duplicate stable-study event for %s; workflow already running", ctx["workflowId"])
+        return {"started": ctx["workflowId"], "duplicate": True}
     return {"started": ctx["workflowId"]}
