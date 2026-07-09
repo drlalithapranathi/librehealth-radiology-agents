@@ -47,6 +47,21 @@ async def mock_escalate(workflow_id: str, reason: str) -> None:
     return None
 
 
+class _FakeFhir:
+    """Stand-in for Fhir2Client in ingress tests (no live fhir2). `result` is returned by
+    resolve_order_by_accession; `error`, if set, is raised (simulates fhir2 down)."""
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls: list[str] = []
+
+    async def resolve_order_by_accession(self, accession: str):
+        self.calls.append(accession)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
 # A schema-valid OrthancStableStudyEvent (contracts/events/orthanc-stable.schema.json).
 EVENT = {
     "schemaVersion": "1.0.0",
@@ -70,6 +85,7 @@ def _reset_ingress_globals():
             pass
         ingress._STORE = None
     ingress._client = None  # don't leak the test env's client into another test
+    ingress._FHIR = None    # ditto the injected fhir2 client
 
 
 async def _await_state(handle, target: str, tries: int = 400) -> None:
@@ -90,6 +106,7 @@ def test_duplicate_stable_event_is_idempotent(tmp_path):
                               activities=[mock_call_agent, mock_publish, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client  # so _temporal() returns the test client, no real connect
+                ingress._FHIR = _FakeFhir(result=None)  # unresolved: keep this test purely about idempotency
 
                 # First event: starts the workflow normally.
                 first = await ingress.orthanc_webhook(dict(EVENT))
@@ -117,6 +134,7 @@ def test_duplicate_after_completion_starts_fresh(tmp_path):
                               activities=[mock_call_agent, mock_publish, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client
+                ingress._FHIR = _FakeFhir(result=None)
 
                 first = await ingress.orthanc_webhook(dict(EVENT))
                 assert first == {"started": WF_ID}

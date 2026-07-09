@@ -98,3 +98,62 @@ def test_finalized_record_tolerates_missing_refs():
     assert rec["serviceRequestRef"] is None
     assert rec["accessionNumber"] is None
     assert rec["lastUpdatedCursor"] is None
+
+
+# --- resolve_order_by_accession (issue #11) --------------------------------
+_SR = {
+    "resourceType": "ServiceRequest", "id": "sr-9",
+    "subject": {"reference": "Patient/pat-9"},
+    "identifier": [{"type": {"coding": [{"code": "ACSN"}]}, "value": "ACC-9"}],
+}
+
+
+def test_resolve_by_accession_returns_patient_and_order_refs():
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append((path, params))
+        return _bundle(_SR)
+
+    client._get = fake_get  # type: ignore[assignment]
+    resolved = asyncio.run(client.resolve_order_by_accession("ACC-9"))
+    # Searches ServiceRequest by its identifier (the accession) -- not by status, which 400s.
+    assert calls[0] == ("ServiceRequest", {"identifier": "ACC-9"})
+    assert resolved == {"fhirPatientId": "Patient/pat-9",
+                        "fhirServiceRequestId": "ServiceRequest/sr-9"}
+
+
+def test_resolve_by_accession_none_on_miss():
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return {"resourceType": "Bundle", "type": "searchset"}
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.resolve_order_by_accession("NOPE")) is None
+
+
+def test_resolve_by_accession_skips_serviceRequest_without_subject():
+    client = Fhir2Client()
+    partial = {"resourceType": "ServiceRequest", "id": "sr-x"}  # no subject -> not resolvable
+
+    async def fake_get(path, params=None):
+        return _bundle(partial)
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.resolve_order_by_accession("ACC-X")) is None
+
+
+def test_resolve_by_accession_empty_accession_makes_no_call():
+    client = Fhir2Client()
+    called = False
+
+    async def fake_get(path, params=None):
+        nonlocal called
+        called = True
+        return _bundle()
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.resolve_order_by_accession("")) is None
+    assert called is False  # empty accession short-circuits, no fhir2 round-trip

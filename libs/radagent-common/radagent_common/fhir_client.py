@@ -32,6 +32,33 @@ class Fhir2Client:
     async def search_observations(self, fhir_patient_id: str, codes: list[str]) -> list[dict]:
         raise NotImplementedError("TODO(M1): GET Observation?patient=...&code=...")
 
+    async def resolve_order_by_accession(self, accession: str) -> Optional[dict]:
+        """Resolve a DICOM accession to its patient + order refs (issue #11).
+
+        Searches ServiceRequest by its accession identifier and returns the lean join refs the
+        ingress needs to replace the `Patient/UNRESOLVED` placeholder:
+            {"fhirPatientId": "Patient/<id>", "fhirServiceRequestId": "ServiceRequest/<id>"}
+        Returns None when nothing matches. Read-only (a search GET); the refs are the only data
+        that leave fhir2 -- no name or clinical content (lean-reference).
+
+        NOTE: matches the accession as a bare FHIR `identifier` value (any system). If the live
+        fhir2 needs the ACSN system pinned (`identifier=<system>|<value>`), narrow it here once the
+        deployed OpenMRS is confirmed.
+        """
+        if not accession:
+            return None
+        bundle = await self._get("ServiceRequest", {"identifier": accession})
+        for entry in bundle.get("entry", []) or []:
+            resource = entry.get("resource") or {}
+            if resource.get("resourceType") != "ServiceRequest":
+                continue
+            patient_ref = (resource.get("subject") or {}).get("reference")
+            sr_id = resource.get("id")
+            if patient_ref and sr_id:
+                return {"fhirPatientId": patient_ref,
+                        "fhirServiceRequestId": f"ServiceRequest/{sr_id}"}
+        return None
+
     async def poll_finalized_reports(self, since_iso: str) -> tuple[list[dict], Optional[str]]:
         """RIS sign-off detection. Returns (finalized records oldest-first, high-water cursor).
 
