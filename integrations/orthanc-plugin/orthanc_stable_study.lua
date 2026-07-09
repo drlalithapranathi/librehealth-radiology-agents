@@ -47,6 +47,21 @@ local function nowIsoUtc()
   return os.date('!%Y-%m-%dT%H:%M:%SZ')
 end
 
+-- Convert an Orthanc LastUpdate timestamp to RFC 3339, or nil if unparseable.
+-- Orthanc reports LastUpdate as DICOM datetime 'YYYYMMDDTHHMMSS' (UTC), which is
+-- NOT the schema's format: date-time (RFC 3339); reshape to 'YYYY-MM-DDTHH:MM:SSZ'.
+-- A value already in RFC 3339 (has the date dashes) is passed through unchanged.
+-- Mirrors the Python plugin's to_rfc3339_utc.
+local function toRfc3339Utc(dt)
+  if type(dt) ~= 'string' or dt == '' then return nil end
+  local y, mo, d, h, mi, s = dt:match('^(%d%d%d%d)(%d%d)(%d%d)T(%d%d)(%d%d)(%d%d)$')
+  if y then
+    return string.format('%s-%s-%sT%s:%s:%sZ', y, mo, d, h, mi, s)
+  end
+  if dt:match('^%d%d%d%d%-%d%d%-%d%d') then return dt end  -- already RFC 3339
+  return nil
+end
+
 -- Build the OrthancStableStudyEvent payload from a study record fetched via
 -- the REST API. Sourcing tags via RestApiGet (rather than the callback's
 -- tags/metadata arguments) is deliberately version-agnostic: how those args
@@ -54,11 +69,15 @@ end
 -- shape is stable.
 local function buildEvent(studyId, study)
   local mainTags      = (study and study.MainDicomTags) or {}
-  local requestedTags = (study and study.RequestedTags) or {}  -- some builds park AccessionNumber here
+  -- ModalitiesInStudy is a computed study tag Orthanc only returns when explicitly
+  -- requested (?requested-tags=), so it lands in RequestedTags, not MainDicomTags.
+  -- Some builds also park AccessionNumber there.
+  local requestedTags = (study and study.RequestedTags) or {}
   local accession     = mainTags.AccessionNumber or requestedTags.AccessionNumber or ''
-  local modality      = mainTags.ModalitiesInStudy or mainTags.Modality or ''
+  local modality      = requestedTags.ModalitiesInStudy or mainTags.ModalitiesInStudy
+                        or mainTags.Modality or ''
   local studyUid      = mainTags.StudyInstanceUID or ''
-  local occurredAt    = (study and study.LastUpdate) or nowIsoUtc()
+  local occurredAt    = toRfc3339Utc(study and study.LastUpdate) or nowIsoUtc()
 
   return {
     schemaVersion    = '1.0.0',
@@ -94,7 +113,9 @@ function OnStableStudy(studyId, tags, metadata)
   end
 
   local ok, study = pcall(function()
-    return ParseJson(RestApiGet('/studies/' .. studyId))
+    -- ?requested-tags=ModalitiesInStudy makes Orthanc compute+return the study
+    -- modality (absent from MainDicomTags by default). Same query as the Python path.
+    return ParseJson(RestApiGet('/studies/' .. studyId .. '?requested-tags=ModalitiesInStudy'))
   end)
   if not ok or type(study) ~= 'table' then
     print('OnStableStudy: failed to read study ' .. tostring(studyId))

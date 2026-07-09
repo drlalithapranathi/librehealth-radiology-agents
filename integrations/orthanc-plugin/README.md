@@ -78,11 +78,14 @@ Required: `schemaVersion`, `eventType`, `orthancStudyId`, `studyInstanceUID`,
 it). See the schema for full constraints. The ingress rejects
 non-conforming events with **422** — that's the CI gate.
 
-`occurredAt` is Orthanc's study `LastUpdate` timestamp. When a build omits it,
-both paths fall back to the current UTC time in RFC 3339 (e.g.
-`2026-07-08T15:24:17Z`) so the event stays schema-valid. The two
-implementations use the same format, so the ingress cannot tell which path
-fired.
+`occurredAt` comes from Orthanc's study `LastUpdate`, which Orthanc reports in
+DICOM datetime form (`YYYYMMDDTHHMMSS`, UTC) rather than RFC 3339, so both paths
+reshape it to `YYYY-MM-DDTHH:MM:SSZ` to satisfy the schema's `format: date-time`.
+When a build omits `LastUpdate`, both fall back to the current UTC time (e.g.
+`2026-07-08T15:24:17Z`). `modality` is sourced from `ModalitiesInStudy`, which
+Orthanc only returns when asked (`?requested-tags=ModalitiesInStudy`). Both
+implementations use the same source and format, so the ingress cannot tell which
+path fired.
 
 ## Lua deploy notes
 

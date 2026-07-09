@@ -6,9 +6,11 @@ The Orthanc Python plugin does NOT expose a discrete ``RegisterOnStableStudyCall
 Lifecycle events go through ``RegisterOnChangeCallback(fn)`` where
 ``fn(changeType, level, resourceId)``, and STABLE_STUDY is one of the change-type
 constants (see the Orthanc SDK's ``OrthancPluginChangeType`` enum). We filter on
-that constant and fetch the study's tags via ``RestApiGet('/studies/{id}')`` —
-the same source of truth the Lua fallback uses, so both paths emit a byte-identical
-payload and the orchestrator ingress cannot tell which mechanism fired.
+that constant and fetch the study's tags via
+``RestApiGet('/studies/{id}?requested-tags=ModalitiesInStudy')`` — the same source
+of truth the Lua fallback uses, so both paths emit a byte-identical payload and the
+orchestrator ingress cannot tell which mechanism fired. ``occurredAt`` is reshaped
+from Orthanc's ``LastUpdate`` (DICOM ``YYYYMMDDTHHMMSS``) into RFC 3339.
 
 Deploy
 ------
@@ -52,6 +54,25 @@ def now_iso_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def to_rfc3339_utc(orthanc_dt) -> str | None:
+    """Convert an Orthanc ``LastUpdate`` timestamp to RFC 3339, or None if it is
+    empty/unparseable. Orthanc reports ``LastUpdate`` in the DICOM datetime shape
+    ``YYYYMMDDTHHMMSS`` (UTC), which is NOT what the schema's ``format: date-time``
+    (RFC 3339) requires, so we reshape it to ``YYYY-MM-DDTHH:MM:SSZ``. A value that
+    is already RFC 3339 (some builds) is passed through unchanged. Mirrors the Lua
+    fallback's ``toRfc3339Utc``."""
+    if not isinstance(orthanc_dt, str) or not orthanc_dt:
+        return None
+    try:
+        return datetime.strptime(orthanc_dt, "%Y%m%dT%H%M%S").strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        try:  # already RFC 3339? keep it as-is
+            datetime.fromisoformat(orthanc_dt.replace("Z", "+00:00"))
+            return orthanc_dt
+        except ValueError:
+            return None
+
+
 def is_http_url(url: str) -> bool:
     """``urllib.request.urlopen`` also dereferences ``file:``/``ftp:`` schemes
     (Bandit B310 / CWE-939). ``ORCH_WEBHOOK`` is operator-configured, but
@@ -69,11 +90,16 @@ def build_event(orthanc_study_id: str, study_record: dict | None) -> dict:
     alone) because that is the single portable shape across every Orthanc build.
     """
     main_tags = (study_record or {}).get("MainDicomTags") or {}
-    requested_tags = (study_record or {}).get("RequestedTags") or {}  # some builds park AccessionNumber here
+    # ModalitiesInStudy is a computed study tag Orthanc only returns when explicitly
+    # requested (?requested-tags=), so it lands in RequestedTags, not MainDicomTags.
+    # Some builds also park AccessionNumber there.
+    requested_tags = (study_record or {}).get("RequestedTags") or {}
     accession = main_tags.get("AccessionNumber") or requested_tags.get("AccessionNumber") or ""
-    modality = main_tags.get("ModalitiesInStudy") or main_tags.get("Modality") or ""
+    modality = (requested_tags.get("ModalitiesInStudy")
+                or main_tags.get("ModalitiesInStudy")
+                or main_tags.get("Modality") or "")
     study_uid = main_tags.get("StudyInstanceUID") or ""
-    occurred_at = (study_record or {}).get("LastUpdate") or now_iso_utc()
+    occurred_at = to_rfc3339_utc((study_record or {}).get("LastUpdate")) or now_iso_utc()
     return {
         "schemaVersion": "1.0.0",
         "eventType": "orthanc.study.stable",
@@ -111,7 +137,11 @@ def on_change(change_type, level, resource_id) -> None:
     if change_type != orthanc.ChangeType.STABLE_STUDY:
         return
     try:
-        study_record = json.loads(orthanc.RestApiGet(f"/studies/{resource_id}"))
+        # ?requested-tags=ModalitiesInStudy makes Orthanc compute+return the study
+        # modality (absent from MainDicomTags by default). Same query as the Lua path.
+        study_record = json.loads(
+            orthanc.RestApiGet(f"/studies/{resource_id}?requested-tags=ModalitiesInStudy")
+        )
     except Exception as e:  # noqa: BLE001 - unreadable study — log and drop
         orthanc.LogError(f"OnChange(STABLE_STUDY): failed to read study {resource_id}: {e}")
         return
