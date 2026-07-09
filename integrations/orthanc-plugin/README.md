@@ -18,7 +18,18 @@ unnecessary).
 
 - File: [`orthanc_stable_study.py`](./orthanc_stable_study.py)
 - Requires the Orthanc Python plugin loaded in Orthanc.
-- `orthanc.json`:
+  The `orthancteam/orthanc` image ships it built-in (v7.1+) and auto-enables it as
+  soon as a `PythonScript` setting is present in the config.
+- Uses `orthanc.RegisterOnChangeCallback` and filters for
+  `orthanc.ChangeType.STABLE_STUDY` — the plugin's Python API does **not** expose
+  a discrete `RegisterOnStableStudyCallback`, that name does not exist. Tags come
+  from `orthanc.RestApiGet('/studies/{id}')` (the same source of truth the Lua
+  fallback uses, so both paths emit a byte-identical payload — verified in
+  `libs/radagent-common/tests/test_orthanc_stable_event.py::test_python_plugin_matches_lua_shape`).
+- **Dev stack (already wired in `docker-compose.yml`)** — nothing to do, `docker
+  compose up orthanc` mounts the script and sets `ORCH_WEBHOOK_URL` on the
+  Orthanc container.
+- **Manual deploy** — bind-mount the plugin file into the container and set:
   ```json
   {
     "PythonScript": "/etc/orthanc/orthanc_stable_study.py",
@@ -87,18 +98,43 @@ fired.
 - **Errors are `print`ed to the Orthanc log** and swallowed. A downstream
   orchestrator outage must never take down the PACS.
 
-## Smoke test (either path)
+## Smoke test (dev stack — Python primary path)
 
-Push a study to Orthanc and confirm the ingress accepts it:
+End-to-end proof that pushing a study fires the webhook and starts a workflow:
 
 ```bash
-# in another terminal, tail the ingress log
+# 1. Bring up the minimum services for the trigger path.
+docker compose up -d temporal-postgresql temporal orthanc orchestrator
+
+# 2. In another terminal, tail the orchestrator ingress log.
 docker compose logs -f orchestrator
 
-# push a sample study
-python -c "import pynetdicom; ..."   # or use storescu / OHIF upload
+# 3. Upload any DICOM instance to Orthanc via its REST API (no DICOM SCU needed).
+#    Substitute your own .dcm; any single instance triggers a new study.
+curl -X POST http://localhost:8042/instances --data-binary @sample.dcm
+
+# 4. Wait StableAge seconds (default 60) — Orthanc marks the study stable, the
+#    plugin fires OnChange(STABLE_STUDY), and POSTs the webhook.
 ```
 
-You should see `POST /webhooks/orthanc 200` and a new workflow started in
-Temporal (`wf_<orthancStudyId>`). A 422 means the emitted event failed schema
-validation — check `docker logs orthanc` for the payload the script sent.
+What you should see in the orchestrator log:
+
+```
+INFO ... "POST /webhooks/orthanc HTTP/1.1" 200 OK
+```
+
+And in Temporal UI at http://localhost:8088, a new workflow with id
+`wf_<orthancStudyId>` in the RUNNING state.
+
+**Diagnosing failures**
+
+- **HTTP 422 from the ingress** — the event failed schema validation. Check
+  `docker compose logs orthanc` for the JSON the plugin sent, compare against
+  `contracts/events/orthanc-stable.schema.json`.
+- **Plugin never fires** — verify Python plugin loaded:
+  `docker compose logs orthanc | grep -i python`. If the log shows
+  `Registering plugin 'python'` but no OnChange calls, either `StableAge` hasn't
+  elapsed yet or no `PythonScript` was found — check the config was mounted.
+- **Plugin fires but no HTTP request** — `ORCH_WEBHOOK_URL` is malformed or
+  points nowhere reachable from the orthanc container. The plugin refuses
+  non-http(s) at runtime and logs `refusing non-HTTP(S) orchestrator webhook URL`.

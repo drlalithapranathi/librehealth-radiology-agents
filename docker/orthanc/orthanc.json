@@ -15,5 +15,12 @@
     "Root": "/dicom-web/",
     "EnableWado": true,
     "WadoRoot": "/wado"
-  }
+  },
+
+  // OnStableStudy -> orchestrator webhook (integrations/orthanc-plugin/orthanc_stable_study.py).
+  // The orthancteam image ships the Python plugin built-in and auto-enables it as soon as
+  // a PythonScript setting is present. The plugin reads ORCH_WEBHOOK_URL from the environment
+  // (set on the orthanc service in docker-compose.yml).
+  "PythonScript": "/etc/orthanc/orthanc_stable_study.py",
+  "PythonVerbose": false
 }

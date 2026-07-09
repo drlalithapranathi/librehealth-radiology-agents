@@ -68,16 +68,27 @@ services:
     volumes: ["mariadb-data:/var/lib/mysql"]
 
   # --- PACS ---------------------------------------------------------------------
-  # SQLite-backed Orthanc with DICOMweb enabled for OHIF. The agent OnStableStudy
-  # webhook (integrations/orthanc-plugin) is intentionally not wired here; it belongs
-  # to the orchestrator service (commented out below) and can be re-added when it runs.
+  # SQLite-backed Orthanc with DICOMweb enabled for OHIF, and the OnStableStudy
+  # Python plugin wired at /etc/orthanc/orthanc_stable_study.py. The orthancteam
+  # image ships the Python plugin (v7.1) built-in and auto-enables it as soon as
+  # a PythonScript setting is present in the config (docker/orthanc/orthanc.json).
   orthanc:
     image: orthancteam/orthanc:latest   # TODO: pin a version
     ports: ["8042:8042", "4242:4242"]
+    environment:
+      # Where the plugin POSTs the OrthancStableStudyEvent. Must be http(s);
+      # the plugin refuses non-http(s) URLs at runtime (Bandit B310 / CWE-939).
+      ORCH_WEBHOOK_URL: http://orchestrator:8090/webhooks/orthanc
     volumes:
       - orthanc-db:/var/lib/orthanc/db
       - ./docker/orthanc/orthanc.json:/etc/orthanc/lh-radiology.json:ro
+      # The plugin file is mounted read-only; edits happen via git + `docker compose restart orthanc`.
+      - ./integrations/orthanc-plugin/orthanc_stable_study.py:/etc/orthanc/orthanc_stable_study.py:ro
     restart: unless-stopped
+    # NOTE on ordering: orthanc does NOT depends_on orchestrator (would cycle with the
+    # orchestrator -> orthanc dependency below). The plugin's `_post` swallows exceptions
+    # and orthanc.LogError()s, so early webhooks that arrive before the orchestrator is
+    # up are logged and dropped. StableAge (60s default) makes an early race unlikely.
 
   # --- Viewer -------------------------------------------------------------------
   # The stock ohif/app image ships no nginx server block and an empty app-config.js,
