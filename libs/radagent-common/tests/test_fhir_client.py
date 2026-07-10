@@ -272,3 +272,235 @@ def test_half_set_credentials_fail_loudly(monkeypatch):
     monkeypatch.delenv("FHIR2_BASIC_PASS", raising=False)
     with pytest.raises(ValueError):
         Fhir2Client()
+# --- EHR read helpers (issue #4) ---------------------------------------------
+
+def test_get_patient_accepts_bare_id_and_reference():
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(path)
+        return {"resourceType": "Patient", "id": "demo-1", "gender": "female"}
+
+    client._get = fake_get  # type: ignore[assignment]
+    asyncio.run(client.get_patient("demo-1"))
+    asyncio.run(client.get_patient("Patient/demo-1"))
+    # Bare id gets normalised to the reference form; a full ref passes through as-is.
+    assert calls == ["Patient/demo-1", "Patient/demo-1"]
+
+
+def test_get_patient_none_on_empty_id():
+    client = Fhir2Client()
+    called = False
+
+    async def fake_get(path, params=None):
+        nonlocal called
+        called = True
+        return {}
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.get_patient("")) is None
+    assert called is False
+
+
+def test_get_patient_none_on_404():
+    import httpx as _httpx
+    client = Fhir2Client()
+
+    async def raise_404(path, params=None):
+        raise _httpx.HTTPStatusError(
+            "not found", request=_httpx.Request("GET", "http://x"),
+            response=_httpx.Response(404))
+
+    client._get = raise_404  # type: ignore[assignment]
+    assert asyncio.run(client.get_patient("Patient/nope")) is None
+
+
+# --- search_imaging_studies --------------------------------------------------
+
+def test_search_imaging_studies_projects_to_lean_priors():
+    client = Fhir2Client()
+    calls = []
+    resource = {
+        "resourceType": "ImagingStudy", "id": "img-1",
+        "started": "2025-04-12T00:00:00Z",
+        "modality": [{"system": "http://dicom.nema.org/resources/ontology/DCM", "code": "CT"}],
+    }
+
+    async def fake_get(path, params=None):
+        calls.append((path, params))
+        return _bundle(resource)
+
+    client._get = fake_get  # type: ignore[assignment]
+    priors = asyncio.run(client.search_imaging_studies("Patient/demo-1"))
+    # patient search param uses the BARE id, not the reference form (some OpenMRS
+    # builds reject 'Patient/demo-1' on `patient=` — see _patient_query).
+    assert calls[0] == ("ImagingStudy", {"patient": "demo-1"})
+    assert priors == [{"ref": "ImagingStudy/img-1", "modality": "CT", "date": "2025-04-12T00:00:00Z"}]
+
+
+def test_search_imaging_studies_follows_bundle_next_link():
+    client = Fhir2Client()
+    r1 = {"resourceType": "ImagingStudy", "id": "img-1"}
+    r2 = {"resourceType": "ImagingStudy", "id": "img-2"}
+    responses = [_bundle(r1, next_url="http://fhir/ImagingStudy?page=2"), _bundle(r2)]
+
+    async def fake_get(path, params=None):
+        return responses.pop(0)
+
+    client._get = fake_get  # type: ignore[assignment]
+    priors = asyncio.run(client.search_imaging_studies("demo-1"))
+    assert [p["ref"] for p in priors] == ["ImagingStudy/img-1", "ImagingStudy/img-2"]
+
+
+def test_search_imaging_studies_tolerates_missing_modality_and_date():
+    """Some scanners omit ImagingStudy.modality or .started; the lean projector must
+    still return a schema-valid item (`ref` is the only `required` field)."""
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle({"resourceType": "ImagingStudy", "id": "img-x"})
+
+    client._get = fake_get  # type: ignore[assignment]
+    priors = asyncio.run(client.search_imaging_studies("demo-1"))
+    assert priors == [{"ref": "ImagingStudy/img-x"}]
+
+
+# --- search_observations -----------------------------------------------------
+
+def test_search_observations_joins_codes_with_comma():
+    """FHIR search: `code=<a>,<b>` = OR. Joining the whole panel into one query
+    turns N LOINC round-trips into 1 (matters when we ask for creatinine + every
+    eGFR variant we care about for contrast decisions)."""
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append((path, params))
+        return _bundle({
+            "resourceType": "Observation", "id": "creat-1",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "2160-0", "display": "Creatinine"}]},
+            "valueQuantity": {"value": 1.1, "unit": "mg/dL"},
+            "effectiveDateTime": "2026-06-20"})
+
+    client._get = fake_get  # type: ignore[assignment]
+    labs = asyncio.run(client.search_observations("demo-1", ["2160-0", "33914-3", "62238-1"]))
+    assert calls[0] == ("Observation", {"patient": "demo-1", "code": "2160-0,33914-3,62238-1"})
+    assert labs == [{"code": "2160-0", "display": "Creatinine",
+                     "value": 1.1, "unit": "mg/dL", "date": "2026-06-20"}]
+
+
+def test_search_observations_empty_codes_skips_the_call():
+    client = Fhir2Client()
+    called = False
+
+    async def fake_get(path, params=None):
+        nonlocal called
+        called = True
+        return _bundle()
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.search_observations("demo-1", [])) == []
+    assert called is False
+
+
+def test_search_observations_handles_valuestring():
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle({"resourceType": "Observation", "id": "o1",
+                        "code": {"coding": [{"code": "X"}]},
+                        "valueString": "positive"})
+
+    client._get = fake_get  # type: ignore[assignment]
+    labs = asyncio.run(client.search_observations("demo-1", ["X"]))
+    assert labs == [{"code": "X", "value": "positive"}]
+
+
+# --- search_conditions -------------------------------------------------------
+
+def test_search_conditions_asks_for_active_and_re_filters_clientside():
+    """Sends `clinical-status=active` (the server SHOULD honor it) AND re-filters
+    client-side (in case it doesn't — matches the poll_finalized_reports approach
+    to OpenMRS's spotty search-param support)."""
+    client = Fhir2Client()
+    calls = []
+    active = {"resourceType": "Condition", "id": "c1",
+              "clinicalStatus": {"coding": [{"code": "active"}]},
+              "code": {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10",
+                                   "code": "C34.1", "display": "Lung neoplasm"}]}}
+    resolved = {"resourceType": "Condition", "id": "c2",
+                "clinicalStatus": {"coding": [{"code": "resolved"}]},
+                "code": {"coding": [{"code": "J18.9"}]}}
+
+    async def fake_get(path, params=None):
+        calls.append((path, params))
+        return _bundle(active, resolved)  # server returned both; we drop the resolved one
+
+    client._get = fake_get  # type: ignore[assignment]
+    problems = asyncio.run(client.search_conditions("demo-1"))
+    assert calls[0] == ("Condition", {"patient": "demo-1", "clinical-status": "active"})
+    assert problems == [{"code": "C34.1", "display": "Lung neoplasm"}]
+
+
+def test_search_conditions_treats_missing_clinicalstatus_as_active():
+    """Some deployments omit clinicalStatus entirely. Better to surface the problem
+    than to hide it — the radiologist can judge relevance from the code."""
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle({"resourceType": "Condition", "id": "c1",
+                        "code": {"coding": [{"code": "I10", "display": "HTN"}]}})
+
+    client._get = fake_get  # type: ignore[assignment]
+    problems = asyncio.run(client.search_conditions("demo-1"))
+    assert problems == [{"code": "I10", "display": "HTN"}]
+
+
+# --- search_allergies --------------------------------------------------------
+
+def test_search_allergies_projects_code_and_criticality():
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle({"resourceType": "AllergyIntolerance", "id": "a1",
+                        "code": {"coding": [{"code": "iodine-contrast"}]},
+                        "criticality": "high"})
+
+    client._get = fake_get  # type: ignore[assignment]
+    allergies = asyncio.run(client.search_allergies("demo-1"))
+    assert allergies == [{"code": "iodine-contrast", "criticality": "high"}]
+
+
+def test_search_allergies_omits_missing_criticality():
+    """Schema requires `code` only; `criticality` is optional — omit it when absent."""
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle({"resourceType": "AllergyIntolerance", "id": "a2",
+                        "code": {"coding": [{"code": "penicillin"}]}})
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.search_allergies("demo-1")) == [{"code": "penicillin"}]
+
+
+# --- search_medications ------------------------------------------------------
+
+def test_search_medications_returns_active_only_from_medicationCC():
+    client = Fhir2Client()
+    calls = []
+    metformin = {"resourceType": "MedicationRequest", "id": "m1", "status": "active",
+                 "medicationCodeableConcept": {
+                     "coding": [{"system": "http://www.nlm.nih.gov/research/umls/rxnorm",
+                                 "code": "6809", "display": "Metformin"}]}}
+    completed = {"resourceType": "MedicationRequest", "id": "m2", "status": "completed",
+                 "medicationCodeableConcept": {"coding": [{"code": "11289"}]}}
+
+    async def fake_get(path, params=None):
+        calls.append((path, params))
+        return _bundle(metformin, completed)
+
+    client._get = fake_get  # type: ignore[assignment]
+    meds = asyncio.run(client.search_medications("demo-1"))
+    assert calls[0] == ("MedicationRequest", {"patient": "demo-1", "status": "active"})
+    assert meds == [{"code": "6809", "display": "Metformin"}]
