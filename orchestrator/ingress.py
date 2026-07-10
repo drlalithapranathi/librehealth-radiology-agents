@@ -16,6 +16,7 @@ from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from radagent_common import validate_against, paths
+from radagent_common.fhir_client import Fhir2Client
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id
 from .state import TASK_QUEUE
 from .workflow import StudyWorkflow
@@ -52,6 +53,18 @@ def _store() -> IngressStore:
     return _STORE
 
 
+# Read-only fhir2 client for accession -> patient/order resolution (#11). Lazily constructed so
+# importing this module has no side effect; tests override `_FHIR` with a fake.
+_FHIR: Fhir2Client | None = None
+
+
+def _fhir() -> Fhir2Client:
+    global _FHIR
+    if _FHIR is None:
+        _FHIR = Fhir2Client()
+    return _FHIR
+
+
 async def _temporal() -> Client:
     global _client
     if _client is None:
@@ -59,13 +72,16 @@ async def _temporal() -> Client:
     return _client
 
 
-def _build_study_context(event: dict) -> dict:
-    """Map an Orthanc event to a (schema-valid) StudyContext.
+async def _build_study_context(event: dict) -> dict:
+    """Map an Orthanc event to a (schema-valid) StudyContext, resolving the patient + order from the
+    accession via fhir2 (#11).
 
-    TODO(M1): resolve patient.fhirPatientId + order via fhir2 from the accession number.
-    For M0 we emit placeholders so the workflow can start end-to-end.
+    Resolution is best-effort: on any fhir2 error or a miss we fall back to the `Patient/UNRESOLVED`
+    placeholder so the workflow always starts -- ingestion must never fail the PACS. A later stable
+    re-fire (see orthanc_webhook) repairs an UNRESOLVED first pass without a restart.
     """
     wf_id = f"wf_{event['orthancStudyId']}"
+    patient, order = await _resolve_patient_order(event.get("accessionNumber"))
     return {
         "schemaVersion": "1.0.0",
         "workflowId": wf_id,
@@ -75,8 +91,8 @@ def _build_study_context(event: dict) -> dict:
             "orthancStudyId": event["orthancStudyId"],
             "modality": event["modality"],
         },
-        "patient": {"fhirPatientId": "Patient/UNRESOLVED"},  # TODO(M1): fhir2 lookup
-        "order": {},
+        "patient": patient,
+        "order": order,
         "meta": {
             "traceId": new_trace_id(),
             "spanId": new_span_id(),
@@ -84,6 +100,21 @@ def _build_study_context(event: dict) -> dict:
             "source": "orchestrator.ingress",
         },
     }
+
+
+async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
+    """(patient, order) blocks for the StudyContext. Resolve real refs from fhir2 by accession; on a
+    miss or ANY fhir2 failure, return the UNRESOLVED placeholder -- never fail ingestion (#11)."""
+    if accession:
+        try:
+            resolved = await _fhir().resolve_order_by_accession(accession)
+        except Exception:  # noqa: BLE001 - fhir2 down/unreachable must not fail the webhook
+            _log.warning("fhir2 resolution failed for accession %s; starting Patient/UNRESOLVED", accession)
+            resolved = None
+        if resolved:
+            return ({"fhirPatientId": resolved["fhirPatientId"]},
+                    {"fhirServiceRequestId": resolved["fhirServiceRequestId"]})
+    return {"fhirPatientId": "Patient/UNRESOLVED"}, {}
 
 
 def _index_workflow(ctx: dict) -> None:
@@ -251,8 +282,11 @@ async def orthanc_webhook(event: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=422, detail=str(e))
 
-    ctx = _build_study_context(event)
-    _index_workflow(ctx)  # remember the join keys so this study's finalized report can find it
+    ctx = await _build_study_context(event)
+    # (Re)index the join keys so this study's finalized report can find it. On a re-fire this also
+    # REPAIRS a first pass that resolved nothing: _build_study_context just re-ran fhir2 resolution,
+    # so if fhir2 is back the ServiceRequest ref is now present and gets indexed here (#11).
+    _index_workflow(ctx)
     client = await _temporal()
     try:
         await client.start_workflow(
@@ -265,8 +299,9 @@ async def orthanc_webhook(event: dict) -> dict:
         # Orthanc re-fires OnStableStudy for the same study (a late instance reopens it, so it goes
         # stable again). The workflow id is deterministic (wf_<orthancStudyId>), so a duplicate event
         # is normal PACS behaviour, not an error: return 200 with the existing id so the plugin and
-        # its retries (#47) see success instead of a 500. TODO(#11): on a re-fire, re-run the fhir2
-        # resolution + re-index to repair a first pass that left the study Patient/UNRESOLVED.
-        _log.info("duplicate stable-study event for %s; workflow already running", ctx["workflowId"])
+        # its retries (#47) see success instead of a 500. The re-index above is the #11 "second
+        # chance" -- an UNRESOLVED first pass gets its ServiceRequest join repaired here (index-side)
+        # with no restart; the already-running workflow keeps its original ctx.
+        _log.info("duplicate stable-study event for %s; re-indexed, workflow already running", ctx["workflowId"])
         return {"started": ctx["workflowId"], "duplicate": True}
     return {"started": ctx["workflowId"]}
