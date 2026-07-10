@@ -16,11 +16,12 @@ from typing import Any, Optional
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 from .state import (
     State,
     ACT_CALL_AGENT,
+    ACT_START_AGENT,
     ACT_PUBLISH_PRIORITY,
     ACT_ESCALATE,
 )
@@ -35,6 +36,14 @@ SIGNOFF_GATE_TIMEOUTS = {
     "ROUTINE": timedelta(hours=4),
 }
 SIGNOFF_GATE_TIMEOUT_DEFAULT = timedelta(hours=4)  # unknown/missing tier -> most lenient
+# Push-mode skill re-runs (#24): the SDK's push sender POSTs each callback exactly once (no
+# retry), so a lost callback times out the wait and we re-run the whole skill — bounded, because
+# each re-run starts a fresh (non-idempotent) agent task. Mirrors the unary path, where Temporal
+# re-runs the activity; there the default policy is unbounded, here duplicates have a cost.
+PUSH_SKILL_ATTEMPTS = 3
+# Backstop bound on buffered push results (duplicate/orphaned taskIds an activity retry can
+# strand): dicts iterate in insertion order, so evicting the oldest entry is replay-deterministic.
+PUSH_RESULT_CAP = 32
 
 
 def signoff_timeout_for(tier: str | None) -> timedelta:
@@ -54,6 +63,9 @@ class StudyWorkflow:
         self._ai: Optional[dict] = None
         self._impression: Optional[dict] = None
         self._verification: Optional[dict] = None
+        # Push-notification results, keyed by A2A taskId (#24). Filled by the skill_completed
+        # signal (ingress relays the agent's callback); consumed by _call_push.
+        self._skill_results: dict[str, dict] = {}
 
     # ---- helpers -----------------------------------------------------------------
     async def _call(self, agent: str, skill_id: str, payload: dict) -> dict:
@@ -62,6 +74,51 @@ class StudyWorkflow:
             args=[agent, skill_id, payload],
             start_to_close_timeout=SKILL_TIMEOUT,
         )
+
+    async def _call_push(self, agent: str, skill_id: str, payload: dict) -> dict:
+        """Push-notification variant of _call (#24): start the skill, release the activity slot,
+        then durably wait for the agent's callback (relayed as a skill_completed signal).
+
+        Every v1 invocation stays on the unary _call — the stubs answer instantly, so there is
+        nothing to wait for. This path exists for M3's long-running tools: switching a skill to
+        push mode is a one-word change (_call -> _call_push) with the same payload and result
+        shape. Failure semantics differ from unary on purpose: the push sender POSTs each
+        callback at most once, so a lost/failed callback re-runs the whole skill (fresh agent
+        task, duplicate side effects) — bounded at PUSH_SKILL_ATTEMPTS, then the workflow fails
+        with ApplicationError (a Temporal failure exception; anything else would fail only the
+        workflow TASK and hot-retry forever, wedging the study).
+        """
+        attempted: list[str] = []
+        try:
+            for _ in range(PUSH_SKILL_ATTEMPTS):
+                task_id = await workflow.execute_activity(
+                    ACT_START_AGENT,
+                    args=[agent, skill_id, payload, workflow.info().workflow_id],
+                    start_to_close_timeout=PRE_READ_TIMEOUT,  # only the ACK is awaited here
+                    # Non-idempotent: every activity retry can mint a duplicate agent task, so
+                    # bound it (same pattern as ACT_ESCALATE) instead of the default unlimited.
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
+                attempted.append(task_id)
+                try:
+                    await workflow.wait_condition(
+                        lambda tid=task_id: tid in self._skill_results, timeout=SKILL_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    continue  # callback lost (sender never retries a POST) -> re-run the skill
+                if not self._skill_results[task_id].get("__failed__"):
+                    return self._skill_results[task_id]
+            raise ApplicationError(
+                f"push skill {skill_id!r} on agent {agent!r} did not succeed in "
+                f"{PUSH_SKILL_ATTEMPTS} attempts (tasks: {attempted})",
+                type="PushSkillError",
+            )
+        finally:
+            # Reclaim every buffered outcome this call produced (late duplicates for these ids
+            # are dropped by the first-write-wins handler until the pop, then re-buffered but
+            # capped by PUSH_RESULT_CAP).
+            for tid in attempted:
+                self._skill_results.pop(tid, None)
 
     def _base_payload(self, ctx: dict, **derived: Any) -> dict:
         """Skill input = StudyContext + the derived slice this skill depends on."""
@@ -185,6 +242,24 @@ class StudyWorkflow:
     @workflow.signal
     def signoff_acknowledged(self, ack: dict) -> None:
         self._signoff_ack = ack
+
+    @workflow.signal
+    def skill_completed(self, event: dict) -> None:
+        """A push-mode skill finished (#24): ingress relays the agent's callback here.
+        event = {"taskId": ..., "result": {...}} — or {"taskId": ..., "failed": true}.
+        First write wins per taskId: both signals of a duplicated terminal can land in ONE
+        workflow activation (i.e. before the waiter wakes), and a late synthesized failure
+        must not overwrite a good result. Size-capped: orphaned taskIds (e.g. from an
+        activity retry's duplicate task) are never awaited, so evict oldest-first."""
+        task_id = event.get("taskId")
+        if not task_id or task_id in self._skill_results:
+            return
+        while len(self._skill_results) >= PUSH_RESULT_CAP:
+            self._skill_results.pop(next(iter(self._skill_results)))
+        if event.get("failed"):
+            self._skill_results[task_id] = {"__failed__": True}
+        else:
+            self._skill_results[task_id] = event.get("result") or {}
 
     @workflow.query
     def current_state(self) -> str:

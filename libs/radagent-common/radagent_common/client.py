@@ -17,13 +17,26 @@ Pinned target: a2a-sdk 1.0.3 (the protobuf/gRPC rewrite). Things that bite here:
     `task` reply, so we read data parts from both.
 """
 from __future__ import annotations
-from typing import Any
+from typing import Any, Optional
 import httpx
+
+from google.protobuf import json_format
 
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
 from a2a.helpers import new_data_message, get_data_parts
-from a2a.types import AgentInterface, Message, SendMessageRequest, StreamResponse
+from a2a.types import (
+    AgentInterface,
+    Message,
+    SendMessageConfiguration,
+    SendMessageRequest,
+    StreamResponse,
+    TaskPushNotificationConfig,
+    TaskState,
+)
 from a2a.utils.constants import TransportProtocol, AGENT_CARD_WELL_KNOWN_PATH as WELL_KNOWN_CARD_PATH
+
+# The header BasePushNotificationSender adds to every callback POST when a token was configured.
+PUSH_TOKEN_HEADER = "X-A2A-Notification-Token"
 
 
 async def call_agent_skill(base_url: str, skill_id: str, payload: dict[str, Any], timeout: float = 30.0) -> dict:
@@ -60,6 +73,81 @@ def _response_data_parts(response: StreamResponse) -> list[dict]:
     if response.HasField("task"):
         return [d for artifact in response.task.artifacts for d in get_data_parts(artifact.parts)]
     return []
+
+
+async def start_agent_skill(base_url: str, skill_id: str, payload: dict[str, Any],
+                            callback_url: str, callback_token: str = "",
+                            timeout: float = 30.0) -> str:
+    """Fire a skill with a push-notification callback and return the A2A taskId (#24).
+
+    The agent replies with a Task instead of a Message; its terminal result arrives later as a
+    POST to `callback_url` (parse it with `parse_push_callback`), authenticated by
+    `callback_token` in the X-A2A-Notification-Token header. Correlate on the returned taskId.
+    With v1's instant stubs the callback lands almost immediately; the API is shaped for M3's
+    long-running tools, where this returns as soon as the agent ACKs the work.
+    """
+    send_url = base_url.rstrip("/") + "/"
+    hx = httpx.AsyncClient(timeout=timeout)
+    try:
+        card = await A2ACardResolver(hx, base_url, agent_card_path=WELL_KNOWN_CARD_PATH).get_agent_card()
+        card.supported_interfaces.append(
+            AgentInterface(url=send_url, protocol_binding=TransportProtocol.JSONRPC)
+        )
+        client = ClientFactory(ClientConfig(httpx_client=hx, streaming=False)).create(card)
+        request = SendMessageRequest(
+            message=skill_message(skill_id, payload),
+            configuration=SendMessageConfiguration(
+                task_push_notification_config=TaskPushNotificationConfig(
+                    url=callback_url, token=callback_token,
+                ),
+                return_immediately=True,
+            ),
+        )
+        async for response in client.send_message(request):
+            if response.HasField("task"):
+                return response.task.id
+    finally:
+        await hx.aclose()
+    raise ValueError(f"No task reply from {base_url} for skill {skill_id!r} (push send)")
+
+
+_TERMINAL_TASK_STATES = frozenset({
+    "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED",
+})
+
+
+def parse_push_callback(body: dict) -> Optional[dict]:
+    """Classify one push-notification POST body (the SDK's StreamResponse JSON, camelCase).
+
+    The sender POSTs the task lifecycle as SEPARATE events — verified against the live 1.0.3
+    flow: an initial `task` snapshot (SUBMITTED), a WORKING `statusUpdate`, the skill result as
+    an `artifactUpdate`, then the terminal `statusUpdate`. So the result and the terminal state
+    never share one POST, and the receiver buffers artifact parts until the terminal event.
+
+    Returns:
+      {"taskId", "kind": "artifact", "parts": [...]}            the result data rides here
+      {"taskId", "kind": "terminal", "state", "parts": [...]}   COMPLETED/FAILED/... (parts only
+                                                                in the task-snapshot form)
+      None                                                      non-terminal noise — ack + ignore
+    """
+    response = json_format.ParseDict(body, StreamResponse(), ignore_unknown_fields=True)
+    if response.HasField("artifact_update"):
+        event = response.artifact_update
+        return {"taskId": event.task_id, "kind": "artifact",
+                "parts": get_data_parts(event.artifact.parts)}
+    if response.HasField("status_update"):
+        event = response.status_update
+        state = TaskState.Name(event.status.state)
+        if state in _TERMINAL_TASK_STATES:
+            return {"taskId": event.task_id, "kind": "terminal", "state": state, "parts": []}
+        return None
+    if response.HasField("task"):
+        state = TaskState.Name(response.task.status.state)
+        if state in _TERMINAL_TASK_STATES:  # some senders emit a final full snapshot
+            parts = [d for artifact in response.task.artifacts for d in get_data_parts(artifact.parts)]
+            return {"taskId": response.task.id, "kind": "terminal", "state": state, "parts": parts}
+        return None
+    return None
 
 
 def skill_message(skill_id: str, payload: dict[str, Any]) -> Message:

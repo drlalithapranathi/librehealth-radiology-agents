@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import Any
 from temporalio import activity
 
-from radagent_common.client import call_agent_skill
+import os
+from urllib.parse import quote
+
+from radagent_common.client import call_agent_skill, start_agent_skill
 from radagent_common.fhir_client import Fhir2Client
 from . import state
 
@@ -13,6 +16,26 @@ async def call_agent_skill_activity(agent: str, skill_id: str, payload: dict[str
     """Invoke an A2A agent skill and return its (contract-validated) JSON output."""
     base_url = state.agent_base_url(agent)
     return await call_agent_skill(base_url, skill_id, payload)
+
+
+@activity.defn(name=state.ACT_START_AGENT)
+async def start_agent_skill_activity(agent: str, skill_id: str, payload: dict[str, Any],
+                                     workflow_id: str) -> str:
+    """Start a skill in push-notification mode and return its A2A taskId (#24).
+
+    The agent POSTs the result to this ingress (/callbacks/a2a/<workflowId>), which relays it to
+    the workflow as a `skill_completed` signal — the workflow correlates on the returned taskId.
+    The shared A2A_CALLBACK_TOKEN (env) authenticates the callback; the callback URL carries the
+    workflowId (so ingress needs no task->workflow index) and the skillId (so ingress can
+    re-validate the delivered result against its contract before relaying it)."""
+    base_url = state.agent_base_url(agent)
+    callback_url = (f"{state.callback_base_url()}/callbacks/a2a/{workflow_id}"
+                    f"?skill={quote(skill_id)}")
+    return await start_agent_skill(
+        base_url, skill_id, payload,
+        callback_url=callback_url,
+        callback_token=os.environ.get("A2A_CALLBACK_TOKEN", ""),
+    )
 
 
 @activity.defn(name=state.ACT_PUBLISH_PRIORITY)
