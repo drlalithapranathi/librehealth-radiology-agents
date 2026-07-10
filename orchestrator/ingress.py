@@ -121,12 +121,12 @@ async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
 def _index_workflow(ctx: dict) -> None:
     """Record a study's join keys -> workflowId so its finalized report can find it later.
 
-    At start we may have the accession (from the Orthanc event) and — once #11 resolves the
-    order — the ServiceRequest ref. Index whatever is present.
+    Ingest resolves the order from the accession (#11), so when fhir2 answers we hold both the
+    accession (from the Orthanc event) and the ServiceRequest ref. Index whatever is present.
 
-    NOTE(M1): the accession is currently the ONLY key we get (order is resolved in #11) and a
-    DICOM accession is an order identifier, not guaranteed unique per study — so we WARN rather
-    than silently overwrite on collision. The robust ServiceRequest join lights up with #11.
+    The ServiceRequest ref is the robust join. The accession is only the fallback for a study that
+    resolved nothing (fhir2 down), and a DICOM accession is an order identifier not guaranteed
+    unique per study, so on an accession collision we WARN rather than silently overwrite.
     """
     wf_id = ctx["workflowId"]
     accession = (ctx.get("study") or {}).get("accessionNumber")
@@ -144,7 +144,7 @@ def _index_workflow(ctx: dict) -> None:
 
 def _workflow_id_for_report(report: dict) -> str | None:
     """Map a finalized report back to its workflow via the keys recorded at start. Prefer the
-    ServiceRequest ref (robust once #11 lands); fall back to the accession."""
+    ServiceRequest ref (the robust join from #11); fall back to the accession."""
     store = _store()
     for key in (report.get("serviceRequestRef"), report.get("accessionNumber")):
         if key:
