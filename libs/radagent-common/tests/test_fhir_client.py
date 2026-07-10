@@ -157,3 +157,63 @@ def test_resolve_by_accession_empty_accession_makes_no_call():
     client._get = fake_get  # type: ignore[assignment]
     assert asyncio.run(client.resolve_order_by_accession("")) is None
     assert called is False  # empty accession short-circuits, no fhir2 round-trip
+
+
+# --- get_report_conclusion (issue #16) -------------------------------------
+def test_get_report_conclusion_reads_the_typed_ref():
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(path)
+        return {"resourceType": "DiagnosticReport", "id": "rep-1",
+                "conclusion": "Large left pneumothorax."}
+
+    client._get = fake_get  # type: ignore[assignment]
+    text = asyncio.run(client.get_report_conclusion("DiagnosticReport/rep-1"))
+    # A prefixed ref is fetched as-is; a bare id would be prefixed with DiagnosticReport/.
+    assert calls == ["DiagnosticReport/rep-1"]
+    assert text == "Large left pneumothorax."
+
+
+def test_get_report_conclusion_prefixes_a_bare_id():
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(path)
+        return {"resourceType": "DiagnosticReport", "id": "rep-1", "conclusion": "x"}
+
+    client._get = fake_get  # type: ignore[assignment]
+    asyncio.run(client.get_report_conclusion("rep-1"))
+    assert calls == ["DiagnosticReport/rep-1"]
+
+
+def test_get_report_conclusion_none_when_absent_or_blank():
+    client = Fhir2Client()
+
+    async def no_conclusion(path, params=None):
+        return {"resourceType": "DiagnosticReport", "id": "rep-1"}  # no conclusion field
+
+    client._get = no_conclusion  # type: ignore[assignment]
+    assert asyncio.run(client.get_report_conclusion("DiagnosticReport/rep-1")) is None
+
+    async def blank_conclusion(path, params=None):
+        return {"resourceType": "DiagnosticReport", "conclusion": "   "}
+
+    client._get = blank_conclusion  # type: ignore[assignment]
+    assert asyncio.run(client.get_report_conclusion("DiagnosticReport/rep-1")) is None
+
+
+def test_get_report_conclusion_empty_id_makes_no_call():
+    client = Fhir2Client()
+    called = False
+
+    async def fake_get(path, params=None):
+        nonlocal called
+        called = True
+        return {}
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.get_report_conclusion("")) is None
+    assert called is False  # empty id short-circuits, no fhir2 round-trip

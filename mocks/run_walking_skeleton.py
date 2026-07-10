@@ -32,6 +32,14 @@ def load_handler(agent_dir: str):
     return mod.handle
 
 
+class _DemoFhir:
+    """Stands in for Fhir2Client so the in-process skeleton exercises Impression's real
+    report-content fetch (#16) without a live fhir2. The finalized event is lean (no narrative),
+    so the handler fetches the DiagnosticReport `conclusion` from source -- here, this stub."""
+    async def get_report_conclusion(self, diagnostic_report_id: str) -> str:
+        return "CT chest: large left tension pneumothorax."
+
+
 async def main() -> int:
     ctx = json.loads((ROOT / "mocks/fixtures/studycontext.sample.json").read_text())
     wf = ctx["workflowId"]
@@ -41,6 +49,7 @@ async def main() -> int:
     ehr = load_handler("ehr-assistant")
     interp = load_handler("interpretation-assistant")
     impression = load_handler("impression-generation")
+    impression.__globals__["_FHIR"] = _DemoFhir()  # inject the fhir2 the handler fetches from (#16)
     verify = load_handler("report-verification")
 
     # 1) Pre-read fan-out (triage ‖ ehr ‖ interpretation)
