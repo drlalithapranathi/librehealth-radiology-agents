@@ -21,3 +21,12 @@ async def test_output_conforms_to_contract():
     out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT})
     validate_skill_output("impression.generate", out)  # raises ContractError on violation
     assert out["workflowId"] == "wf_test"
+
+
+async def test_critical_keyword_sets_flags_and_conforms_to_contract():
+    report = {"conclusion": "Findings show a large pneumothorax requiring urgent attention."}
+    out = await handle(
+        "impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report}
+    )
+    validate_skill_output("impression.generate", out)  # raises ContractError on violation
+    assert out["criticalFlags"] == [{"label": "pneumothorax", "severity": "critical"}]
