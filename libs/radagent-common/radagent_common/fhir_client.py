@@ -132,7 +132,7 @@ def finalized_report_record(report: dict) -> dict:
 
 
 def _based_on_service_request(report: dict) -> Optional[str]:
-    """The order the report was based on (the robust join once #11 resolves it at ingest)."""
+    """The order the report was based on (the robust join #11 resolves at ingest)."""
     for based_on in report.get("basedOn", []) or []:
         reference = based_on.get("reference", "") if isinstance(based_on, dict) else ""
         if "ServiceRequest/" in reference:
