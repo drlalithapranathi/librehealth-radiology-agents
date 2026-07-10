@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from radagent_common import validate_against, paths
 from radagent_common.fhir_client import Fhir2Client
@@ -153,17 +154,18 @@ def _workflow_id_for_report(report: dict) -> str | None:
     return None
 
 
-async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]) -> set[str]:
-    """Signal each mapped, not-yet-signalled report to its waiting workflow; return the ids newly
-    signalled. Reports already signalled at the current cursor (`skip_ids`) are deduped. A report
-    with no known workflow is LOGGED and skipped.
+async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]) -> tuple[set[str], list[dict]]:
+    """Signal each mapped, not-yet-signalled report to its waiting workflow; return (ids newly
+    signalled, mapped reports whose signal FAILED). Reports already signalled at the current
+    cursor (`skip_ids`) are deduped. A report with no known workflow is LOGGED and skipped.
 
-    KNOWN GAP (#29, durable retry / dead-letter): a *mapped* report whose signal raises is logged
-    but not retried here. A boundary failure is safe (the inclusive ge-cursor re-returns it next
-    poll), but if a LATER report in the same batch succeeds and advances the cursor past a failed
-    earlier one, that report falls below the ge-window and its sign-off is lost. #6 makes the
-    cursor durable (so downtime reports are no longer skipped) but does not close this retry gap."""
+    A failed report is returned rather than dropped so `_advance_cursor` can hold the cursor at
+    it (#29): the inclusive ge-window then re-returns it next poll — a retry for free. The retry
+    naturally stops when the workflow is truly gone: reconciliation evicts its index row, the
+    report re-enters as unmapped, and the cursor moves on. Durable dead-letter capture of those
+    final drops stays with the rest of #29."""
     signalled: set[str] = set()
+    failed: list[dict] = []
     for report in reports:
         report_id = report.get("diagnosticReportId")
         if report_id in skip_ids:
@@ -176,32 +178,59 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
             await client.get_workflow_handle(wf_id).signal(StudyWorkflow.report_finalized, report)
             signalled.add(report_id)  # mapping is reclaimed on completion by _reconcile_index
         except Exception:  # noqa: BLE001 - workflow gone/unreachable
-            _log.warning("failed to signal workflow %s for report %s", wf_id, report_id)
-    return signalled
+            failed.append(report)
+            _log.warning("failed to signal workflow %s for report %s; will retry next poll", wf_id, report_id)
+    return signalled, failed
 
 
-def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], signalled: set[str]) -> tuple[str, set[str]]:
-    """Advance to the high-water mark; keep only the ids AT the new boundary for dedup.
+def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], signalled: set[str],
+                    failed: list[dict] | None = None) -> tuple[str, set[str]]:
+    """Advance to the high-water mark — but never past a mapped report whose signal failed (#29).
 
     ge{cursor} re-returns reports at the boundary second, so we remember which of those we already
     signalled and drop the rest (older ids fall out of the query window). If the high-water didn't
     move, hold the cursor and keep accumulating dedup ids at this boundary.
+
+    Holding at the earliest failure keeps that report inside the ge-window so the next poll
+    retries it; before, a later success in the same batch advanced the cursor past it and the
+    sign-off was silently lost. While held back, the dedup set keeps EVERY already-signalled id
+    at-or-after the cursor (not just the boundary), so the wider re-scan does not re-signal.
+    (End-to-end delivery is still at-least-once — e.g. a crash after signal but before
+    save_cursor replays the batch — which is safe because report_finalized is an idempotent
+    overwrite; keep it that way.)
     """
-    if not high_water or high_water == cursor:
+    floor = None
+    if failed:
+        stamps = [r.get("lastUpdatedCursor") for r in failed]
+        # A failure we cannot place in time pins the cursor entirely (rare: report with no meta).
+        # Clamp at the current cursor: it advances or holds, never retreats.
+        floor = cursor if None in stamps else max(min(stamps), cursor)
+    target = high_water
+    if floor is not None and (target is None or floor < target):
+        target = floor
+    if not target or target == cursor:
         return cursor, signalled
     kept = {
         r["diagnosticReportId"] for r in reports
-        if r.get("lastUpdatedCursor") == high_water and r["diagnosticReportId"] in signalled
+        if (r.get("lastUpdatedCursor") or "") >= target and r["diagnosticReportId"] in signalled
     }
-    return high_water, kept
+    return target, kept
 
 
 async def _is_open(client: Client, wf_id: str) -> bool:
-    """Whether a workflow is still running. A missing/gone workflow is treated as closed."""
+    """Whether a workflow is still running. Only an AFFIRMATIVE answer counts as closed: a
+    NOT_FOUND (workflow truly gone) or a successful describe showing a non-RUNNING status.
+    UNREACHABLE IS NOT CLOSED (#29): during a Temporal outage — the very condition that makes
+    signals fail and the poller hold its cursor — a reconcile sweep would otherwise evict every
+    index row, turning each held retry into a permanent sign-off loss and stranding every other
+    in-flight study. On a transport error we assume open, keep the row, and let a later sweep
+    decide."""
     try:
         desc = await client.get_workflow_handle(wf_id).describe()
-    except Exception:  # noqa: BLE001 - not found / unreachable-as-closed -> safe to reclaim
-        return False
+    except RPCError as e:
+        return e.status != RPCStatusCode.NOT_FOUND  # gone -> closed; anything else -> assume open
+    except Exception:  # noqa: BLE001 - unexpected transport failure: same stance, assume open
+        return True
     return desc.status == WorkflowExecutionStatus.RUNNING
 
 
@@ -254,9 +283,11 @@ async def _ris_poller() -> None:
             continue  # fhir2 client not wired in this environment
         except Exception:  # noqa: BLE001 - keep the loop alive
             continue
+        failed: list[dict] = []
         if reports:
-            signalled_at_cursor |= await _process_batch(await _temporal(), reports, signalled_at_cursor)
-        cursor, signalled_at_cursor = _advance_cursor(cursor, high_water, reports, signalled_at_cursor)
+            newly, failed = await _process_batch(await _temporal(), reports, signalled_at_cursor)
+            signalled_at_cursor |= newly
+        cursor, signalled_at_cursor = _advance_cursor(cursor, high_water, reports, signalled_at_cursor, failed)
         store.save_cursor(cursor, signalled_at_cursor)  # durable: a restart mid-wait resumes here
 
 

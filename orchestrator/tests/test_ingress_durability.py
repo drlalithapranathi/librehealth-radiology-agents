@@ -143,7 +143,7 @@ def test_gate_releases_after_ingress_restart(tmp_path):
                           "accessionNumber": STUDY_CONTEXT["study"]["accessionNumber"]}
                 # the mapping survived the restart — the whole point:
                 assert ingress._workflow_id_for_report(report) == STUDY_CONTEXT["workflowId"]
-                newly = await ingress._process_batch(env.client, [report], set())
+                newly, _failed = await ingress._process_batch(env.client, [report], set())
                 assert newly == {"DiagnosticReport/r1"}
                 result = await handle.result()  # gate released -> runs to ARCHIVED
                 # once COMPLETED, reconciliation reclaims the study's index row (evict on completion)
@@ -204,7 +204,8 @@ def test_wiped_index_would_strand_the_report(tmp_path):
         ingress._STORE = ingress.IngressStore(str(tmp_path / "empty.db"))
         report = {"diagnosticReportId": "DiagnosticReport/r1", "accessionNumber": "ACC-6"}
         assert ingress._workflow_id_for_report(report) is None  # nothing to signal
-        newly = await ingress._process_batch(None, [report], set())  # client never used on a miss
-        assert newly == set()  # dropped -> the workflow would wait forever
+        newly, failed = await ingress._process_batch(None, [report], set())  # client never used on a miss
+        assert newly == set()   # dropped -> the workflow would wait forever
+        assert failed == []     # a miss is a drop, not a retry: the cursor must not stall on it
 
     asyncio.run(scenario())
