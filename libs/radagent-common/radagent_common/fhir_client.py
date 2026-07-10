@@ -59,6 +59,22 @@ class Fhir2Client:
                         "fhirServiceRequestId": f"ServiceRequest/{sr_id}"}
         return None
 
+    async def get_report_conclusion(self, diagnostic_report_id: str) -> Optional[str]:
+        """Fetch a finalized report's narrative conclusion by id (issue #16).
+
+        The `ris.report.finalized` event is lean (IDs + refs only, no narrative -- Golden rule 2),
+        so Impression Generation reads the report CONTENT from source: GET DiagnosticReport/<id>
+        and return its `conclusion` (the radiologist's summary the impression structures from).
+        Returns None when the id is empty, the report is missing, or it carries no conclusion.
+        Read-only. The conclusion is the one clinical field the impression is entitled to consume.
+        """
+        if not diagnostic_report_id:
+            return None
+        ref = diagnostic_report_id if "/" in diagnostic_report_id else f"DiagnosticReport/{diagnostic_report_id}"
+        resource = await self._get(ref)
+        conclusion = resource.get("conclusion")
+        return conclusion if isinstance(conclusion, str) and conclusion.strip() else None
+
     async def poll_finalized_reports(self, since_iso: str) -> tuple[list[dict], Optional[str]]:
         """RIS sign-off detection. Returns (finalized records oldest-first, high-water cursor).
 
