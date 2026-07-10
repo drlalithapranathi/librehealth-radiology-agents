@@ -217,3 +217,58 @@ def test_get_report_conclusion_empty_id_makes_no_call():
     client._get = fake_get  # type: ignore[assignment]
     assert asyncio.run(client.get_report_conclusion("")) is None
     assert called is False  # empty id short-circuits, no fhir2 round-trip
+
+
+# ---- basic auth from env (issue #53) ----------------------------------------------
+
+def test_auth_from_env_and_passed_to_httpx(monkeypatch):
+    monkeypatch.setenv("FHIR2_BASIC_USER", "poller")
+    monkeypatch.setenv("FHIR2_BASIC_PASS", "s3cret")
+    client = Fhir2Client()
+    assert client._auth == ("poller", "s3cret")
+
+    # The credential must reach the HTTP layer: live fhir2 401s every unauthenticated read,
+    # and callers swallow fhir2 errors, so a dropped credential fails silently (#53).
+    captured = {}
+
+    class _FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"resourceType": "Bundle"}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None):
+            return _FakeResponse()
+
+    import radagent_common.fhir_client as fhir_client_module
+    monkeypatch.setattr(fhir_client_module.httpx, "AsyncClient", _FakeClient)
+    asyncio.run(client._get("DiagnosticReport"))
+    assert captured["auth"] == ("poller", "s3cret")
+
+
+def test_no_env_stays_unauthenticated(monkeypatch):
+    monkeypatch.delenv("FHIR2_BASIC_USER", raising=False)
+    monkeypatch.delenv("FHIR2_BASIC_PASS", raising=False)
+    assert Fhir2Client()._auth is None  # mocks and unit tests keep working with no env set
+
+
+def test_half_set_credentials_fail_loudly(monkeypatch):
+    """A partial pair silently downgrading to unauthenticated would recreate the silent-401
+    disease #53 exists to cure — reject it at construction instead."""
+    import pytest
+
+    monkeypatch.setenv("FHIR2_BASIC_USER", "poller")
+    monkeypatch.delenv("FHIR2_BASIC_PASS", raising=False)
+    with pytest.raises(ValueError):
+        Fhir2Client()

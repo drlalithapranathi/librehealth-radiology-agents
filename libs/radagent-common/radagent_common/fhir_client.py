@@ -9,15 +9,31 @@ import os
 import httpx
 
 
+def _basic_auth_from_env() -> Optional[tuple[str, str]]:
+    """(user, pass) for live fhir2, or None to stay unauthenticated (mocks, unit tests).
+
+    Live fhir2 401s every unauthenticated read — and callers deliberately swallow fhir2 errors
+    to protect ingestion, so a missing credential shows up as silence, not a crash (#53). A
+    half-set pair is therefore rejected loudly here rather than silently downgraded. The values
+    themselves must never be logged.
+    """
+    user = os.environ.get("FHIR2_BASIC_USER")
+    password = os.environ.get("FHIR2_BASIC_PASS")
+    if bool(user) != bool(password):
+        raise ValueError("FHIR2_BASIC_USER and FHIR2_BASIC_PASS must be set together")
+    return (user, password) if user else None
+
+
 class Fhir2Client:
     def __init__(self, base_url: Optional[str] = None, timeout: float = 15.0):
         self.base_url = (base_url or os.environ.get("FHIR2_BASE_URL", "http://openmrs:8080/openmrs/ws/fhir2/R4")).rstrip("/")
         self._timeout = timeout
+        self._auth = _basic_auth_from_env()
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
         # `path` may be a relative resource ("DiagnosticReport") or an absolute Bundle next-page URL.
         url = path if path.startswith("http") else f"{self.base_url}/{path.lstrip('/')}"
-        async with httpx.AsyncClient(timeout=self._timeout) as c:
+        async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
             r = await c.get(url, params=params)
             r.raise_for_status()
             return r.json()
