@@ -7,6 +7,15 @@ content (issue #16): the `report` payload is the lean `ris.report.finalized` eve
 critical findings. The fetch is best-effort: if fhir2 is unreachable the draft degrades to "no
 acute findings" rather than failing the post-sign safety-net.
 
+Pre-sign (#26): before a report exists, `report` is omitted/empty, so the only signal available
+is `aiFindings` (contracts/skills/interpretation.schema.json). Each COMPLETE finding's `label`
+is folded into the same critical-keyword scan as the report conclusion — STUBBED/ERROR findings
+carry no real label in v1 (real tools land in M3) and are excluded so a stub never fabricates a
+flag. Post-sign, both signals are scanned together, so an aiFindings hit still surfaces even if
+the conclusion text misses it. This keeps the handler's own I/O timing-agnostic; wiring the
+orchestrator to actually call this skill pre-sign and write the draft back into the RIS is
+orchestrator/shared-lib work tracked separately on #26 (out of scope here).
+
 Input  : { studyContext, report?, ehrContext?, aiFindings? }
 Output : contracts/skills/impression.schema.json
 
@@ -66,20 +75,35 @@ async def _report_conclusion(report: dict) -> str:
         return ""
 
 
+def _complete_finding_labels(ai_findings: dict) -> str:
+    """Space-joined labels of COMPLETE findings (#26). STUBBED/ERROR findings carry no real
+    label in v1 (real tools land M3), so they're excluded to avoid fabricating a flag."""
+    return " ".join(
+        finding.get("label") or ""
+        for finding in ai_findings.get("findings", [])
+        if finding.get("status") == "COMPLETE"
+    )
+
+
 async def handle(skill_id: str, payload: dict) -> dict:
     if skill_id != "impression.generate":
         raise ValueError(f"unexpected skill {skill_id}")
 
     ctx = payload["studyContext"]
     report = payload.get("report") or {}
+    ai_findings = payload.get("aiFindings") or {}
     conclusion = (await _report_conclusion(report)).lower()
+    finding_labels = _complete_finding_labels(ai_findings).lower()
 
-    # Deterministically detect critical findings. Word-boundary match so "mass" does not fire on
-    # "massive" (negation like "no pneumothorax" is a known limit; the M2 LLM draft handles it).
+    # Deterministically detect critical findings from whichever signal is available (pre-sign:
+    # aiFindings only; post-sign: report conclusion, plus aiFindings if also passed forward).
+    # Word-boundary match so "mass" does not fire on "massive" (negation like "no pneumothorax"
+    # is a known limit; the M2 LLM draft handles it).
+    scan_text = f"{conclusion} {finding_labels}"
     critical_flags = [
         {"label": label, "severity": "critical"}
         for keyword, label in _CRITICAL_KEYWORDS.items()
-        if re.search(rf"\b{re.escape(keyword)}\b", conclusion)
+        if re.search(rf"\b{re.escape(keyword)}\b", scan_text)
     ]
 
     structured_findings = [
