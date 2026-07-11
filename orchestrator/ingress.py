@@ -29,6 +29,11 @@ POLL_INTERVAL_S = int(os.environ.get("RIS_POLL_INTERVAL_S", "30"))
 # Reconcile the index against Temporal every N polls (plus once at startup) to evict rows for
 # workflows that completed/terminated without ever delivering a report.
 RECONCILE_EVERY_POLLS = int(os.environ.get("INGRESS_RECONCILE_EVERY_POLLS", "120"))
+# A failing fhir2 poll is warned on the first failure, then every Nth, so a persistent outage
+# (fhir2 down, credentials rejected — #53) stays visible without flooding the log every poll.
+# Clamped to >= 1: a 0 would make the throttle modulo raise inside the poller's own exception
+# handler, permanently killing the loop the throttle exists to keep observable.
+FAILED_POLLS_PER_WARNING = max(1, int(os.environ.get("INGRESS_FAILED_POLLS_PER_WARNING", "10")))
 
 _client: Client | None = None
 _log = logging.getLogger("orchestrator.ingress")
@@ -269,6 +274,7 @@ async def _ris_poller() -> None:
     except Exception:  # noqa: BLE001 - reconciliation is best-effort; never block delivery
         _log.warning("index reconciliation failed at startup")
     polls = 0
+    consecutive_failures = 0
     while True:
         await asyncio.sleep(POLL_INTERVAL_S)
         polls += 1
@@ -282,7 +288,17 @@ async def _ris_poller() -> None:
         except NotImplementedError:
             continue  # fhir2 client not wired in this environment
         except Exception:  # noqa: BLE001 - keep the loop alive
+            # Swallowing keeps the loop alive, but a fhir2 that is down (or rejecting our
+            # credentials, #53) must not be silent: every failed poll is a window in which a
+            # radiologist sign-off goes undetected. Warn on the first failure, then throttle.
+            consecutive_failures += 1
+            if consecutive_failures == 1 or consecutive_failures % FAILED_POLLS_PER_WARNING == 0:
+                _log.warning("fhir2 poll failed (%d consecutive); sign-off detection is stalled",
+                             consecutive_failures, exc_info=True)
             continue
+        if consecutive_failures:
+            _log.warning("fhir2 poll recovered after %d consecutive failure(s)", consecutive_failures)
+            consecutive_failures = 0
         failed: list[dict] = []
         if reports:
             newly, failed = await _process_batch(await _temporal(), reports, signalled_at_cursor)
@@ -293,6 +309,10 @@ async def _ris_poller() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast on an invalid FHIR2_BASIC_* pair (#53). Every live consumer constructs the
+    # client inside a swallow-and-continue path, where the constructor's ValueError would
+    # masquerade as an fhir2 outage forever — startup is the only place it can be loud.
+    Fhir2Client()
     poller = asyncio.create_task(_ris_poller())
     yield
     poller.cancel()

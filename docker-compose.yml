@@ -143,6 +143,10 @@ services:
     environment:
       TEMPORAL_TARGET: temporal:7233
       FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
+      # Live fhir2 401s unauthenticated reads and the callers swallow fhir2 errors by design,
+      # so missing credentials fail SILENTLY (#53). Dev-stack values = the o3 admin account.
+      FHIR2_BASIC_USER: admin
+      FHIR2_BASIC_PASS: Admin123
       ORTHANC_BASE_URL: http://orthanc:8042
     ports: ["8090:8090"]
     depends_on: [temporal, openmrs, orthanc]
@@ -150,7 +154,15 @@ services:
   worklist-triage:          { build: { context: ., dockerfile: agents/worklist-triage/Dockerfile },          ports: ["8101:8101"] }
   ehr-assistant:            { build: { context: ., dockerfile: agents/ehr-assistant/Dockerfile },            ports: ["8102:8102"] }
   interpretation-assistant: { build: { context: ., dockerfile: agents/interpretation-assistant/Dockerfile }, ports: ["8103:8103"] }
-  impression-generation:    { build: { context: ., dockerfile: agents/impression-generation/Dockerfile },    ports: ["8104:8104"] }
+  # impression-generation reads report conclusions from live fhir2 (#16), so it needs the same
+  # credentials as the orchestrator (#53) — without them every fetch 401s and silently degrades
+  # to "no critical detection".
+  impression-generation:
+    build: { context: ., dockerfile: agents/impression-generation/Dockerfile }
+    ports: ["8104:8104"]
+    environment:
+      FHIR2_BASIC_USER: admin
+      FHIR2_BASIC_PASS: Admin123
   report-verification:      { build: { context: ., dockerfile: agents/report-verification/Dockerfile },      ports: ["8105:8105"] }
   # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`
   # (external image, added when it runs).
