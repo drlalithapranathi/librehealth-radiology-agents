@@ -81,3 +81,41 @@ async def test_word_boundary_avoids_substring_false_positive():
     report = {"conclusion": "Massive pleural effusion identified."}
     out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
     assert out["criticalFlags"] == []
+
+
+async def test_presign_ai_findings_set_flags_when_no_report_yet():
+    # Pre-sign (#26): no report exists yet, so aiFindings is the only signal available.
+    ai_findings = {
+        "toolsSelected": [{"toolId": "t1", "status": "COMPLETE"}],
+        "findings": [{"toolId": "t1", "label": "pulmonary embolism", "status": "COMPLETE"}],
+    }
+    out = await handle(
+        "impression.generate", {"studyContext": SAMPLE_CONTEXT, "aiFindings": ai_findings}
+    )
+    validate_skill_output("impression.generate", out)
+    assert out["criticalFlags"] == [{"label": "pulmonary embolism", "severity": "critical"}]
+
+
+async def test_presign_ignores_non_complete_findings():
+    # A STUBBED/ERROR finding carries no real label in v1 and must not fabricate a flag.
+    ai_findings = {
+        "findings": [
+            {"toolId": "t1", "label": "mass lesion", "status": "STUBBED"},
+            {"toolId": "t2", "label": "fracture", "status": "ERROR"},
+        ],
+    }
+    out = await handle(
+        "impression.generate", {"studyContext": SAMPLE_CONTEXT, "aiFindings": ai_findings}
+    )
+    assert out["criticalFlags"] == []
+
+
+async def test_postsign_merges_report_and_ai_findings_signals():
+    # Both signals passed forward post-sign: an aiFindings-only hit still surfaces.
+    report = {"conclusion": "No acute intracranial process."}
+    ai_findings = {"findings": [{"toolId": "t1", "label": "fracture", "status": "COMPLETE"}]}
+    out = await handle(
+        "impression.generate",
+        {"studyContext": SAMPLE_CONTEXT, "report": report, "aiFindings": ai_findings},
+    )
+    assert out["criticalFlags"] == [{"label": "fracture", "severity": "critical"}]
