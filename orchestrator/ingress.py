@@ -166,9 +166,11 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
 
     A failed report is returned rather than dropped so `_advance_cursor` can hold the cursor at
     it (#29): the inclusive ge-window then re-returns it next poll — a retry for free. The retry
-    naturally stops when the workflow is truly gone: reconciliation evicts its index row, the
-    report re-enters as unmapped, and the cursor moves on. Durable dead-letter capture of those
-    final drops stays with the rest of #29."""
+    naturally stops when the workflow is truly gone: reconciliation evicts its index row and the
+    report re-enters as unmapped. Failed attempts are tracked durably so that final unmapped
+    re-entry is recognized as OURS and captured as a dead letter (#29) — a permanently dropped
+    sign-off a human must see — instead of blending into the routine "never ours" fhir2 noise."""
+    store = _store()
     signalled: set[str] = set()
     failed: list[dict] = []
     for report in reports:
@@ -177,13 +179,26 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
             continue
         wf_id = _workflow_id_for_report(report)
         if not wf_id:
-            _log.warning("finalized report %s matched no waiting workflow (dropped)", report_id)
+            was_failing = store.failed_signal_for(report_id) if report_id else None
+            if was_failing:
+                store.add_dead_letter(
+                    report_id, was_failing["workflowId"], was_failing["attempts"],
+                    "workflow evicted while its sign-off signal was still failing", now_iso())
+                store.clear_failed_signal(report_id)
+                _log.error("DEAD LETTER: sign-off %s for workflow %s dropped after %d failed "
+                           "attempt(s); see /admin/dead-letters", report_id,
+                           was_failing["workflowId"], was_failing["attempts"])
+            else:
+                _log.warning("finalized report %s matched no waiting workflow (dropped)", report_id)
             continue
         try:
             await client.get_workflow_handle(wf_id).signal(StudyWorkflow.report_finalized, report)
             signalled.add(report_id)  # mapping is reclaimed on completion by _reconcile_index
+            store.clear_failed_signal(report_id)  # delivered: retire any failure record
         except Exception:  # noqa: BLE001 - workflow gone/unreachable
             failed.append(report)
+            if report_id:  # a report with no id can't be tracked; the held cursor still retries it
+                store.record_failed_signal(report_id, wf_id, now_iso())
             _log.warning("failed to signal workflow %s for report %s; will retry next poll", wf_id, report_id)
     return signalled, failed
 
@@ -365,6 +380,16 @@ async def ris_event() -> dict:
     (or never — interval polling is the unchanged fallback)."""
     _wake_event().set()
     return {"nudged": True}
+
+
+@app.get("/admin/dead-letters")
+async def dead_letters() -> dict:
+    """Sign-offs the poller permanently gave up on (#29): the report was delivered by the RIS
+    and mapped to a workflow, every signal attempt failed, and the workflow closed before one
+    landed. Rows carry IDs only (lean-reference, no PHI). Empty is the healthy state; anything
+    here needs a human to reconcile the study in the RIS against the orchestrator's history."""
+    letters = _store().dead_letters()
+    return {"count": len(letters), "deadLetters": letters}
 
 
 @app.post("/webhooks/orthanc")

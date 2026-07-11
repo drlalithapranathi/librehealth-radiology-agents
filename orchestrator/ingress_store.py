@@ -33,6 +33,20 @@ CREATE TABLE IF NOT EXISTS poller_state (
     cursor        TEXT,
     signalled_ids TEXT NOT NULL DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS failed_signals (
+    report_id    TEXT PRIMARY KEY,
+    workflow_id  TEXT NOT NULL,
+    first_seen   TEXT NOT NULL,
+    last_attempt TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS dead_letters (
+    report_id   TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    attempts    INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    dropped_at  TEXT NOT NULL
+);
 """
 
 
@@ -101,6 +115,57 @@ class IngressStore:
             (cursor, json.dumps(sorted(signalled_ids))),
         )
         self._db.commit()
+
+    # ---- failed-signal tracking + dead letters (#29) ------------------------------
+    # A signed report the poller could not deliver is retried for free by the held cursor.
+    # The retry ends when reconciliation evicts the target workflow's index rows; at that point
+    # the report re-enters as unmapped and would be silently dropped. Tracking failures durably
+    # lets the poller tell "was ours, workflow gone" apart from "never ours" — the former is a
+    # dead letter a human must see, the latter is routine fhir2 noise. IDs only, never PHI.
+
+    def record_failed_signal(self, report_id: str, workflow_id: str, at_iso: str) -> None:
+        """Upsert one failed delivery attempt for a mapped report (attempts increment)."""
+        self._db.execute(
+            "INSERT INTO failed_signals (report_id, workflow_id, first_seen, last_attempt) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(report_id) DO UPDATE SET workflow_id = excluded.workflow_id, "
+            "last_attempt = excluded.last_attempt, attempts = attempts + 1",
+            (report_id, workflow_id, at_iso, at_iso),
+        )
+        self._db.commit()
+
+    def clear_failed_signal(self, report_id: str) -> None:
+        """A later attempt delivered the report: the failure record has served its purpose."""
+        self._db.execute("DELETE FROM failed_signals WHERE report_id = ?", (report_id,))
+        self._db.commit()
+
+    def failed_signal_for(self, report_id: str) -> Optional[dict]:
+        row = self._db.execute(
+            "SELECT report_id, workflow_id, first_seen, last_attempt, attempts "
+            "FROM failed_signals WHERE report_id = ?", (report_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return {"reportId": row[0], "workflowId": row[1], "firstSeen": row[2],
+                "lastAttempt": row[3], "attempts": row[4]}
+
+    def add_dead_letter(self, report_id: str, workflow_id: str, attempts: int,
+                        reason: str, at_iso: str) -> None:
+        """Record a permanently dropped sign-off. Idempotent on report_id (a re-scan at the same
+        cursor boundary must not duplicate the row)."""
+        self._db.execute(
+            "INSERT INTO dead_letters (report_id, workflow_id, attempts, reason, dropped_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(report_id) DO NOTHING",
+            (report_id, workflow_id, attempts, reason, at_iso),
+        )
+        self._db.commit()
+
+    def dead_letters(self) -> list[dict]:
+        rows = self._db.execute(
+            "SELECT report_id, workflow_id, attempts, reason, dropped_at "
+            "FROM dead_letters ORDER BY dropped_at").fetchall()
+        return [{"reportId": r[0], "workflowId": r[1], "attempts": r[2],
+                 "reason": r[3], "droppedAt": r[4]} for r in rows]
 
     def close(self) -> None:
         self._db.close()
