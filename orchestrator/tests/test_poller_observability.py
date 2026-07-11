@@ -39,16 +39,20 @@ def _no_temporal(monkeypatch):
 
 
 def _run_poller_for(iterations, monkeypatch):
-    """Run _ris_poller with a no-op sleep that cancels the loop after `iterations` polls."""
+    """Run _ris_poller with a no-op wait that cancels the loop after `iterations` polls.
+
+    The loop's per-iteration wait is `_sleep_or_nudge` (the RIS event nudge, #25), not a bare
+    `asyncio.sleep`, so the drive hook patches that — patching `asyncio.sleep` would no longer
+    intercept the loop and the poller would block on the real 30s wait forever."""
     calls = 0
 
-    async def counting_sleep(_seconds):
+    async def counting_wait(_seconds):
         nonlocal calls
         calls += 1
         if calls > iterations:
             raise asyncio.CancelledError
 
-    monkeypatch.setattr(ingress.asyncio, "sleep", counting_sleep)
+    monkeypatch.setattr(ingress, "_sleep_or_nudge", counting_wait)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(ingress._ris_poller())
 
