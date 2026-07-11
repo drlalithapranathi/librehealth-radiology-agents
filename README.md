@@ -1,5 +1,7 @@
 # LH-Radiology Multi-Agent System
 
+New contributor? See [CONTRIBUTING.md](./CONTRIBUTING.md) for setup and workflow
+
 Five A2A agents + a Temporal orchestrator that drive a radiology study from PACS arrival
 through result communication, on **LibreHealth Radiology** (OpenMRS) as EHR/RIS, **fhir2** as
 the FHIR R4 data API, **Orthanc** PACS, and **OHIF** viewer.
