@@ -172,6 +172,21 @@ services:
       FHIR2_BASIC_USER: admin
       FHIR2_BASIC_PASS: Admin123
   report-verification:      { build: { context: ., dockerfile: agents/report-verification/Dockerfile },      ports: ["8105:8105"] }
+  # Worklist API (issue #20): serves OHIF a sorted reading worklist by joining Orthanc completed
+  # studies + orchestrator triage priority + LH-Radiology assignment (read-only). Priority arrives
+  # via POST /priority from orchestrator/activities.publish_priority_activity (wiring lives in
+  # Pranathi's file - separate follow-up). SQLite priority store is volume-mounted for durability
+  # across restart, mirroring the ingress_store pattern in orchestrator/.
+  worklist-api:
+    build: { context: ., dockerfile: integrations/worklist-api/Dockerfile }
+    ports: ["8107:8107"]
+    environment:
+      ORTHANC_BASE_URL: http://orthanc:8042
+      WORKLIST_STORE_PATH: /var/lib/lhrad/worklist.sqlite
+    volumes:
+      - worklist-api-db:/var/lib/lhrad
+    depends_on: [orthanc]
+    restart: unless-stopped
   # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`
   # (external image, added when it runs).
 
@@ -179,3 +194,4 @@ volumes:
   mariadb-data:
   orthanc-db:
   temporal-pg-data:
+  worklist-api-db:
