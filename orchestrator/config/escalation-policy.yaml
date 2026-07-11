@@ -1,0 +1,69 @@
+# Sign-off escalation matrix (#29) -- validated in CI against
+# contracts/escalation-policy.schema.json (scripts/validate_contracts.py).
+#
+# Config/policy only: roles, channels, timings. Never PHI. The orchestrator owns the durable
+# clock (Temporal); when a rung fires it maps this rung onto a comms.dispatch, and the RIS on-call
+# schedule / Communications Agent resolves targetRole to a real recipient.
+#
+# afterMinutes is measured from when a finalized report enters AWAITING_SIGNOFF. Level 1 of each
+# tier preserves the sign-off timeout previously hardcoded in orchestrator/workflow.py
+# (STAT 60m, URGENT 120m, ROUTINE 240m), so wiring this in is behaviour-preserving at rung 1 and
+# only adds the higher rungs.
+schemaVersion: "1.0.0"
+defaultTier: ROUTINE
+
+tiers:
+  STAT:
+    levels:
+      - level: 1
+        afterMinutes: 60          # was SIGNOFF_GATE_TIMEOUTS["STAT"]
+        targetRole: reading-radiologist
+        channels: [in-app, pager]
+        urgency: critical
+      - level: 2
+        afterMinutes: 90
+        targetRole: on-call-radiologist
+        channels: [pager, sms]
+        urgency: critical
+      - level: 3
+        afterMinutes: 120
+        targetRole: department-lead
+        channels: [pager, phone]
+        urgency: critical
+        repeat: true
+        repeatEveryMinutes: 30
+
+  URGENT:
+    levels:
+      - level: 1
+        afterMinutes: 120         # was SIGNOFF_GATE_TIMEOUTS["URGENT"]
+        targetRole: reading-radiologist
+        channels: [in-app, email]
+        urgency: urgent
+      - level: 2
+        afterMinutes: 180
+        targetRole: on-call-radiologist
+        channels: [pager, sms]
+        urgency: urgent
+      - level: 3
+        afterMinutes: 240
+        targetRole: department-lead
+        channels: [pager]
+        urgency: critical
+        repeat: true
+        repeatEveryMinutes: 60
+
+  ROUTINE:
+    levels:
+      - level: 1
+        afterMinutes: 240         # was SIGNOFF_GATE_TIMEOUTS["ROUTINE"] and the lenient default
+        targetRole: reading-radiologist
+        channels: [in-app, email]
+        urgency: routine
+      - level: 2
+        afterMinutes: 480
+        targetRole: on-call-radiologist
+        channels: [email, sms]
+        urgency: urgent
+        repeat: true
+        repeatEveryMinutes: 120
