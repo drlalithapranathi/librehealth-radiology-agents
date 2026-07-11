@@ -38,15 +38,113 @@ class Fhir2Client:
             r.raise_for_status()
             return r.json()
 
-    # --- read helpers used by EHR Assistant / orchestrator (TODO(M1): implement real queries) ---
-    async def get_patient(self, fhir_patient_id: str) -> dict:
-        raise NotImplementedError("TODO(M1): GET Patient/{id}")
+    # --- read helpers used by EHR Assistant / orchestrator ------------------
+
+    async def get_patient(self, fhir_patient_id: str) -> Optional[dict]:
+        """GET Patient/{id} — accepts either the bare id ('demo-1') or the reference
+        form ('Patient/demo-1'). Returns None if the patient is not found (404).
+
+        Kept for other agents' use; the EHR Assistant itself does not consume patient
+        demographics (its output surfaces refs + codes, not name / DOB — lean-reference)."""
+        if not fhir_patient_id:
+            return None
+        ref = fhir_patient_id if "/" in fhir_patient_id else f"Patient/{fhir_patient_id}"
+        try:
+            return await self._get(ref)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
 
     async def search_imaging_studies(self, fhir_patient_id: str) -> list[dict]:
-        raise NotImplementedError("TODO(M1): GET ImagingStudy?patient=...")
+        """GET ImagingStudy?patient=... — prior imaging for context.
+
+        Returns a lean list ({ref, modality, date}) matching the priorStudies items in
+        `contracts/skills/ehr.schema.json`. `reportRef` is deliberately NOT populated;
+        linking each ImagingStudy to its DiagnosticReport needs a `_revinclude` spike
+        against the live OpenMRS fhir2 (M2). Follows Bundle `next` links.
+        """
+        return [_lean_imaging_study(r) for r in await self._collect(
+            "ImagingStudy", {"patient": _patient_query(fhir_patient_id)})]
 
     async def search_observations(self, fhir_patient_id: str, codes: list[str]) -> list[dict]:
-        raise NotImplementedError("TODO(M1): GET Observation?patient=...&code=...")
+        """GET Observation?patient=...&code=<loinc-csv> — latest observations for the
+        requested LOINCs. Codes are joined with `,` per FHIR search syntax so a single
+        request covers the whole panel (creatinine + every eGFR LOINC variant we care
+        about for contrast decisions).
+
+        Returns lean records ({code, display, value, unit, date}) matching the
+        relevantLabs items in `contracts/skills/ehr.schema.json`. Empty `codes` -> [].
+        """
+        if not codes:
+            return []
+        return [_lean_observation(r) for r in await self._collect(
+            "Observation",
+            {"patient": _patient_query(fhir_patient_id), "code": ",".join(codes)})]
+
+    async def search_conditions(self, fhir_patient_id: str) -> list[dict]:
+        """GET Condition?patient=...&clinical-status=active — problem list.
+
+        Returns lean records ({code, display}) matching the activeProblems items in
+        the schema. Client-side filters out non-active clinical statuses in case the
+        server ignores the `clinical-status` search parameter (OpenMRS fhir2 has
+        historically had gaps — see `poll_finalized_reports` for the status/400 case)."""
+        entries = await self._collect(
+            "Condition",
+            {"patient": _patient_query(fhir_patient_id), "clinical-status": "active"})
+        return [_lean_condition(r) for r in entries if _condition_is_active(r)]
+
+    async def search_allergies(self, fhir_patient_id: str) -> list[dict]:
+        """GET AllergyIntolerance?patient=... — allergies + criticality.
+
+        Returns lean records ({code, criticality}) matching the allergies items in
+        the schema. `code` is the primary coding value (RxNorm / SNOMED / other) — the
+        first coded system found is used, freeing downstream from parsing FHIR
+        CodeableConcept structure."""
+        return [_lean_allergy(r) for r in await self._collect(
+            "AllergyIntolerance", {"patient": _patient_query(fhir_patient_id)})]
+
+    async def search_medications(self, fhir_patient_id: str) -> list[dict]:
+        """GET MedicationRequest?patient=... — current medications.
+
+        Returns lean records ({code, display}) — one per active med — used by the
+        EHR Assistant to derive medicationFlags (onMetformin / onAnticoagulant / etc.)
+        via RxNorm code match with a case-insensitive text fallback. The `status` search
+        param is deliberately NOT sent: live fhir2 returns 500 on
+        `MedicationRequest?status=...` (a server NPE, verified against the o3 fhir2 build),
+        which the caller would swallow into an empty slice, silently disabling every med
+        flag. Activeness is filtered client-side via `_medication_is_active` instead — the
+        same status-param-avoidance `resolve_order_by_accession` uses."""
+        entries = await self._collect(
+            "MedicationRequest",
+            {"patient": _patient_query(fhir_patient_id)})
+        return [_lean_medication(r) for r in entries if _medication_is_active(r)]
+
+    async def _collect(self, path: str, params: dict[str, Any]) -> list[dict]:
+        """Follow Bundle `next` links and yield every resource entry — the common
+        paging idiom shared by every search_* method above. Matches the paging
+        behavior of `poll_finalized_reports` so all searches degrade the same way
+        under an OpenMRS with paged responses."""
+        collected: list[dict] = []
+        target: Optional[str] = path
+        current_params: dict[str, Any] | None = params
+        while target:
+            try:
+                bundle = await self._get(target, current_params)
+            except httpx.HTTPStatusError as e:
+                # A resource type the fhir2 build does not expose (e.g. ImagingStudy on the
+                # o3 image) answers 404. Treat "not found / unsupported" as no results rather
+                # than raising, so one unavailable slice degrades to [] the way get_patient's
+                # 404 degrades to None — instead of failing the whole search.
+                if e.response.status_code == 404:
+                    return collected
+                raise
+            for entry in bundle.get("entry", []) or []:
+                resource = entry.get("resource") or {}
+                if resource:
+                    collected.append(resource)
+            target, current_params = _bundle_next_link(bundle), None  # next link is absolute
+        return collected
 
     async def resolve_order_by_accession(self, accession: str) -> Optional[dict]:
         """Resolve a DICOM accession to its patient + order refs (issue #11).
@@ -165,3 +263,111 @@ def _accession_number(report: dict) -> Optional[str]:
         if any(isinstance(c, dict) and c.get("code") == "ACSN" for c in codings):
             return ident.get("value")
     return None
+
+
+# --- lean projections for EHR context assembly (issue #4) ----------------
+# Each helper takes a raw FHIR resource (as returned by fhir2) and returns the
+# decision-relevant slice that matches the corresponding items schema in
+# `contracts/skills/ehr.schema.json`. NO raw record dumps — refs, codes, values
+# only (lean-reference: PHI minimization).
+
+
+def _patient_query(fhir_patient_id: str) -> str:
+    """FHIR search accepts either a bare id or a reference; normalize to the bare id
+    since some OpenMRS builds reject the reference form on `patient=` search params."""
+    return fhir_patient_id.split("/", 1)[1] if "/" in fhir_patient_id else fhir_patient_id
+
+
+def _first_coding_value(codeable_concept: dict) -> tuple[Optional[str], Optional[str]]:
+    """Pull the first (code, display) pair from a FHIR CodeableConcept. Callers use
+    this to avoid parsing FHIR CodeableConcept structure in every lean projector."""
+    for coding in (codeable_concept or {}).get("coding", []) or []:
+        if isinstance(coding, dict) and coding.get("code"):
+            return coding["code"], coding.get("display")
+    return None, (codeable_concept or {}).get("text")
+
+
+def _lean_imaging_study(resource: dict) -> dict:
+    """ImagingStudy -> {ref, modality, date}. `modality` on ImagingStudy is a list of
+    Coding under `modality[]`; we take the first code. `date` is `started` (per FHIR R4)."""
+    modality_codings = resource.get("modality") or []
+    modality = (modality_codings[0].get("code") if (modality_codings
+                and isinstance(modality_codings[0], dict)) else None) or ""
+    out: dict = {"ref": f"ImagingStudy/{resource.get('id')}"}
+    if modality:
+        out["modality"] = modality
+    started = resource.get("started")
+    if started:
+        out["date"] = started
+    return out
+
+
+def _lean_observation(resource: dict) -> dict:
+    """Observation -> {code, display, value?, unit?, date?}. Handles `valueQuantity` and
+    `valueString` — the two commonest lab shapes. Missing pieces are simply omitted so
+    schema `required: ["code"]` is met and optionals only appear when known."""
+    code, display = _first_coding_value(resource.get("code") or {})
+    out: dict = {"code": code or ""}
+    if display:
+        out["display"] = display
+    if "valueQuantity" in resource:
+        vq = resource["valueQuantity"] or {}
+        if "value" in vq:
+            out["value"] = vq["value"]
+        if vq.get("unit"):
+            out["unit"] = vq["unit"]
+    elif "valueString" in resource:
+        out["value"] = resource["valueString"]
+    date = resource.get("effectiveDateTime") or resource.get("issued")
+    if date:
+        out["date"] = date
+    return out
+
+
+def _condition_is_active(resource: dict) -> bool:
+    """Client-side re-filter: keep only Conditions whose clinicalStatus is 'active'.
+    The server search may or may not honor `clinical-status=active` (OpenMRS fhir2 has
+    documented gaps — see the #3 spike). Conditions without any clinicalStatus at all
+    are treated as active (defensive: better to surface than to hide)."""
+    clinical_status = resource.get("clinicalStatus") or {}
+    codings = clinical_status.get("coding") or []
+    if not codings:
+        return True
+    return any(isinstance(c, dict) and c.get("code") == "active" for c in codings)
+
+
+def _lean_condition(resource: dict) -> dict:
+    """Condition -> {code, display}. First coding on the `code` CodeableConcept."""
+    code, display = _first_coding_value(resource.get("code") or {})
+    out: dict = {"code": code or ""}
+    if display:
+        out["display"] = display
+    return out
+
+
+def _lean_allergy(resource: dict) -> dict:
+    """AllergyIntolerance -> {code, criticality}. `criticality` is a native FHIR field
+    (low | high | unable-to-assess); omitted if absent."""
+    code, _ = _first_coding_value(resource.get("code") or {})
+    out: dict = {"code": code or ""}
+    criticality = resource.get("criticality")
+    if criticality:
+        out["criticality"] = criticality
+    return out
+
+
+def _medication_is_active(resource: dict) -> bool:
+    return (resource.get("status") or "").lower() == "active"
+
+
+def _lean_medication(resource: dict) -> dict:
+    """MedicationRequest -> {code, display} projected from `medicationCodeableConcept`
+    (the inline-code form; a `medicationReference` would need a follow-up GET which we
+    do not do — those come through with an empty code and are filtered downstream by
+    the medicationFlags matcher when nothing matches)."""
+    med_cc = resource.get("medicationCodeableConcept") or {}
+    code, display = _first_coding_value(med_cc)
+    out: dict = {"code": code or ""}
+    if display:
+        out["display"] = display
+    return out
