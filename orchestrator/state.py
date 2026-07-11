@@ -20,8 +20,15 @@ class State(str, Enum):
 # Task queue + activity names (strings keep the workflow sandbox free of I/O imports).
 TASK_QUEUE = "lhrad-study-tq"
 ACT_CALL_AGENT = "call_agent_skill_activity"
+ACT_START_AGENT = "start_agent_skill_activity"
 ACT_PUBLISH_PRIORITY = "publish_priority_activity"
 ACT_ESCALATE = "escalate_activity"
+
+
+def callback_base_url() -> str:
+    """Where agents POST push-notification callbacks (#24): this ingress, reachable from the
+    agents' network. Env override -> docker-compose default."""
+    return os.environ.get("INGRESS_CALLBACK_BASE_URL", "http://ingress:8090").rstrip("/")
 
 
 def agent_base_url(agent: str) -> str:

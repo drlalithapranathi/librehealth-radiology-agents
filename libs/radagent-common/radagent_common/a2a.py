@@ -41,14 +41,22 @@ from . import paths
 from .validation import validate_skill_output, ContractError
 
 # --- SDK imports kept in one place ------------------------------------------------
+import httpx
+
 from a2a.types import AgentCard  # protobuf message class in 1.0.x  # type: ignore
 from a2a.server.agent_execution import AgentExecutor, RequestContext  # type: ignore
 from a2a.server.events import EventQueue  # type: ignore
 from a2a.server.request_handlers import DefaultRequestHandler  # type: ignore
-from a2a.server.tasks import InMemoryTaskStore  # type: ignore
+from a2a.server.tasks import (  # type: ignore
+    BasePushNotificationSender,
+    InMemoryPushNotificationConfigStore,
+    InMemoryTaskStore,
+    TaskUpdater,
+)
 from a2a.server.routes.agent_card_routes import create_agent_card_routes  # type: ignore
 from a2a.server.routes.jsonrpc_routes import create_jsonrpc_routes  # type: ignore
-from a2a.helpers import new_data_message, get_data_parts  # type: ignore
+from a2a.helpers import new_data_message, new_data_part, new_task, get_data_parts  # type: ignore
+from a2a.types import TaskState  # type: ignore
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH  # type: ignore
 from starlette.applications import Starlette  # provided by a2a-sdk[http-server]
 
@@ -85,18 +93,58 @@ def _extract_payload(context: RequestContext) -> tuple[str, dict]:
     return obj.get("skillId", ""), obj.get("payload", {})
 
 
+def _wants_push(context: RequestContext) -> bool:
+    """A send that carries a push-notification config opts into the Task reply mode (#24)."""
+    config = getattr(context, "configuration", None)
+    try:
+        return bool(config is not None and config.HasField("task_push_notification_config"))
+    except ValueError:  # not a proto message / field unknown -> unary
+        return False
+
+
 class _SkillExecutor(AgentExecutor):
-    """Generic executor: decode -> call handler -> validate output -> emit DataPart."""
+    """Generic executor: decode -> call handler -> validate output -> emit the reply.
+
+    Two reply modes (#24):
+      * default (all of today's callers): a plain Message with one DataPart — byte-identical to
+        the pre-#24 behavior; push notifications never fire for Message replies.
+      * push: when the send carries a `task_push_notification_config`, run the Task lifecycle
+        (submitted -> working -> artifact -> completed) so the SDK's push sender POSTs task
+        events to the caller's callback URL. The contract check runs in BOTH modes before the
+        result leaves this process. With v1's instant stubs the two modes finish equally fast;
+        the split exists so M3's long-running tools change NOTHING here.
+    """
 
     def __init__(self, handler: SkillHandler):
         self._handler = handler
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         skill_id, payload = _extract_payload(context)
-        result = await self._handler(skill_id, payload)
-        # Enforce the inter-agent contract before it ever leaves this process.
-        validate_skill_output(skill_id, result)
-        await event_queue.enqueue_event(new_data_message(result))
+        if not _wants_push(context):
+            result = await self._handler(skill_id, payload)
+            # Enforce the inter-agent contract before it ever leaves this process.
+            validate_skill_output(skill_id, result)
+            await event_queue.enqueue_event(new_data_message(result))
+            return
+
+        # SDK protocol: a full Task object must be enqueued before any status-update events
+        # ("Agent should enqueue Task before TaskStatusUpdateEvent" — enforced by ActiveTask).
+        if context.current_task is None:
+            await event_queue.enqueue_event(
+                new_task(context.task_id, context.context_id, TaskState.TASK_STATE_SUBMITTED)
+            )
+        updater = TaskUpdater(event_queue, context.task_id, context.context_id)
+        await updater.start_work()
+        try:
+            result = await self._handler(skill_id, payload)
+            validate_skill_output(skill_id, result)
+        except Exception:
+            # Terminal FAILED still push-notifies the caller; the callback side maps it to a
+            # failed skill rather than a silent hang.
+            await updater.failed()
+            raise
+        await updater.add_artifact(parts=[new_data_part(result)])
+        await updater.complete()
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         # No long-running work in v1 stubs. TODO(M1): cooperative cancel for real tools.
@@ -118,12 +166,22 @@ class _AgentApp:
 
 
 def build_agent_app(agent_dir_name: str, handler: SkillHandler) -> _AgentApp:
-    """Return an agent app handle. `build_agent_app(name, handle).build()` is the ASGI app."""
+    """Return an agent app handle. `build_agent_app(name, handle).build()` is the ASGI app.
+
+    Push notifications (#24) are wired for every agent: the handler gets a config store + a
+    webhook sender, which makes the cards' `capabilities.pushNotifications: true` actually true.
+    A send with no push config behaves exactly as before (unary Message reply, nothing POSTed).
+    NOTE: both stores are in-memory — an agent restart mid-task loses the pending push config;
+    the orchestrator's workflow-level timeout is the safety net (Database stores are the M3
+    upgrade alongside real long-running tools)."""
     card = load_card(agent_dir_name)
+    push_store = InMemoryPushNotificationConfigStore()
     request_handler = DefaultRequestHandler(
         agent_executor=_SkillExecutor(handler),
         task_store=InMemoryTaskStore(),
         agent_card=card,
+        push_config_store=push_store,
+        push_sender=BasePushNotificationSender(httpx.AsyncClient(timeout=15.0), push_store),
     )
     # 1.0.x has no A2AStarletteApplication: assemble the app from route lists ourselves.
     routes = create_agent_card_routes(

@@ -11,13 +11,15 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.exceptions import WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from radagent_common import validate_against, paths
+from radagent_common.client import parse_push_callback
 from radagent_common.fhir_client import Fhir2Client
+from radagent_common.validation import validate_skill_output
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id
 from .state import TASK_QUEUE
 from .workflow import StudyWorkflow
@@ -26,6 +28,10 @@ from . import activities
 
 TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
 POLL_INTERVAL_S = int(os.environ.get("RIS_POLL_INTERVAL_S", "30"))
+# Shared secret for A2A push callbacks (#24): agents echo it in X-A2A-Notification-Token.
+# Empty (the default) accepts unauthenticated callbacks — dev/compose posture, same as the
+# Orthanc webhook; set it in any deployment that leaves the compose network.
+A2A_CALLBACK_TOKEN = os.environ.get("A2A_CALLBACK_TOKEN", "")
 # Reconcile the index against Temporal every N polls (plus once at startup) to evict rows for
 # workflows that completed/terminated without ever delivering a report.
 RECONCILE_EVERY_POLLS = int(os.environ.get("INGRESS_RECONCILE_EVERY_POLLS", "120"))
@@ -390,6 +396,79 @@ async def dead_letters() -> dict:
     here needs a human to reconcile the study in the RIS against the orchestrator's history."""
     letters = _store().dead_letters()
     return {"count": len(letters), "deadLetters": letters}
+
+
+# Artifact parts buffered per push task until its terminal event arrives (#24): the SDK sender
+# POSTs the result (artifactUpdate) and the terminal state (statusUpdate) as SEPARATE callbacks.
+# In-memory on purpose: entries are popped at the terminal event. If the artifact half is lost
+# (one un-retried POST, or an ingress restart between the two), the surviving terminal COMPLETED
+# has no result to relay and is reported to the workflow as a failure — the workflow re-runs the
+# skill (bounded; see StudyWorkflow._call_push). Size-capped oldest-first because a task whose
+# terminal never arrives would otherwise leak its parts forever — and because with the token
+# unset (dev posture) this endpoint is unauthenticated, an uncapped dict is a free memory-DoS.
+# Tests reset this dict.
+_PUSH_PARTS: dict[str, list] = {}
+_PUSH_PARTS_CAP = int(os.environ.get("A2A_PUSH_BUFFER_CAP", "1024"))
+
+
+@app.post("/callbacks/a2a/{workflow_id}", status_code=202)
+async def a2a_push_callback(
+    workflow_id: str,
+    body: dict,
+    skill: str = "",
+    x_a2a_notification_token: str = Header(default=""),
+) -> dict:
+    """A2A push-notification receiver (#24): an agent reports progress on a push-mode skill.
+
+    Non-terminal events are acknowledged and ignored; the artifact event's data parts are
+    buffered; the terminal event is relayed to the workflow as a `skill_completed` signal keyed
+    by taskId. The workflowId and skillId ride in the callback URL — minted by
+    start_agent_skill_activity — so no task->workflow index is needed. A well-behaved agent
+    validated its output before emitting it, but this endpoint may be reachable by others (the
+    token is optional), so a delivered result is re-validated against the skill's contract here
+    and relayed as a failure if it doesn't conform. A relay the workflow never receives (dropped
+    POST, Temporal briefly down) is recovered by the workflow re-running the skill after its
+    wait times out."""
+    if A2A_CALLBACK_TOKEN and x_a2a_notification_token != A2A_CALLBACK_TOKEN:
+        raise HTTPException(status_code=401, detail="bad callback token")
+    try:
+        parsed = parse_push_callback(body)
+    except Exception as e:  # noqa: BLE001 - not a StreamResponse -> reject, don't 500
+        raise HTTPException(status_code=422, detail=f"unparseable push callback: {e}")
+    if parsed is None:
+        return {"ignored": "non-terminal event"}
+    task_id = parsed["taskId"]
+    if parsed["kind"] == "artifact":
+        if task_id not in _PUSH_PARTS:
+            while len(_PUSH_PARTS) >= _PUSH_PARTS_CAP:  # evict oldest orphan (insertion order)
+                _PUSH_PARTS.pop(next(iter(_PUSH_PARTS)))
+        _PUSH_PARTS.setdefault(task_id, []).extend(parsed["parts"])
+        return {"buffered": task_id}
+
+    parts = parsed["parts"] or _PUSH_PARTS.pop(task_id, [])
+    _PUSH_PARTS.pop(task_id, None)  # failure path cleanup: don't leak buffered parts
+    completed = parsed["state"] == "TASK_STATE_COMPLETED" and bool(parts)
+    if completed and skill:
+        try:
+            validate_skill_output(skill, parts[0])
+        except Exception:  # noqa: BLE001 - non-conforming/forged result (log IDs only, no values)
+            _log.warning("push result for wf=%s task=%s failed the %s output contract; "
+                         "relaying as failure", workflow_id, task_id, skill)
+            completed = False
+    event = ({"taskId": task_id, "result": parts[0]} if completed
+             else {"taskId": task_id, "failed": True})
+    try:
+        client = await _temporal()
+    except Exception:  # noqa: BLE001 - Temporal briefly down: tell the sender, don't 500
+        _log.warning("push callback for %s task %s: temporal unavailable", workflow_id, task_id)
+        raise HTTPException(status_code=503, detail="temporal unavailable")
+    try:
+        await client.get_workflow_handle(workflow_id).signal(
+            StudyWorkflow.skill_completed, event)
+    except Exception:  # noqa: BLE001 - workflow gone: the workflow-side wait timeout re-runs
+        _log.warning("push callback for %s task %s could not be signalled", workflow_id, task_id)
+        raise HTTPException(status_code=404, detail="workflow not found")
+    return {"relayed": task_id}
 
 
 @app.post("/webhooks/orthanc")

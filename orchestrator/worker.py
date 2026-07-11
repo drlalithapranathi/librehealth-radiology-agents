@@ -10,6 +10,7 @@ from .state import TASK_QUEUE
 from .workflow import StudyWorkflow
 from .activities import (
     call_agent_skill_activity,
+    start_agent_skill_activity,
     publish_priority_activity,
     escalate_activity,
 )
@@ -39,6 +40,7 @@ async def main() -> None:
         workflows=[StudyWorkflow],
         activities=[
             call_agent_skill_activity,
+            start_agent_skill_activity,
             publish_priority_activity,
             escalate_activity,
         ],
