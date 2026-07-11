@@ -40,10 +40,12 @@ cd agents/worklist-triage
 python -m pytest -q
 ```
 
-Orchestrator tests are the exception — run those from the repo root:
+Orchestrator tests are the exception. They live outside the default test paths (see
+`testpaths` in `pyproject.toml`), so a bare `pytest` from the root skips them — point pytest at
+the directory explicitly, from the repo root, with the orchestrator deps above installed:
 
 ```bash
-python -m pytest -q
+python -m pytest orchestrator/tests -q
 ```
 
 ## The golden rules
