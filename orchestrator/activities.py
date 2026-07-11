@@ -4,7 +4,10 @@ from typing import Any
 from temporalio import activity
 
 import os
+from pathlib import Path
 from urllib.parse import quote
+
+import yaml
 
 from radagent_common.client import call_agent_skill, start_agent_skill
 from radagent_common.fhir_client import Fhir2Client
@@ -50,14 +53,54 @@ async def publish_priority_activity(workflow_id: str, study_instance_uid: str, t
     )
 
 
-@activity.defn(name=state.ACT_ESCALATE)
-async def escalate_activity(workflow_id: str, reason: str) -> dict:
-    """Sign-off human-gate timed out with no radiologist action -> page the on-call (#23).
+def _escalation_policy_path() -> Path:
+    """Env override -> the in-repo default (baked into the worker image)."""
+    default = Path(__file__).resolve().parent / "config" / "escalation-policy.yaml"
+    return Path(os.environ.get("ESCALATION_POLICY_PATH", default))
 
-    The orchestrator owns the durable escalation clock (Temporal), so on timeout it invokes the
-    Communications Agent exactly once via the A2A `comms.dispatch` boundary. We mark the dispatch
-    critical so the agent routes it to the on-call pager channel -- an unsigned, flagged read must
-    reach a human. The page carries IDs only (lean-reference; no PHI in the message).
+
+@activity.defn(name=state.ACT_LOAD_ESCALATION_POLICY)
+async def load_escalation_policy_activity(tier: str | None) -> list[dict]:
+    """Resolve the sign-off escalation ladder for a priority tier (#29).
+
+    Reads orchestrator/config/escalation-policy.yaml (CI-validated against
+    contracts/escalation-policy.schema.json) and returns the tier's ordered rungs; an unknown or
+    missing tier gets the policy's defaultTier ladder. Read fresh per gate entry -- no cache --
+    so a policy edit (or re-pointed ESCALATION_POLICY_PATH) takes effect without a worker
+    restart. Runs as an activity so the workflow stays deterministic: the resolved ladder is
+    recorded in history, and a mid-wait policy edit cannot desync a replay.
+    """
+    with _escalation_policy_path().open() as f:
+        policy = yaml.safe_load(f)
+    tiers = policy["tiers"]
+    ladder = tiers.get(tier or "") or tiers[policy["defaultTier"]]
+    levels = ladder["levels"]
+    # Validate the two schedule fields the workflow reads with bare subscripts: afterMinutes on
+    # every rung, and repeatEveryMinutes on a repeating rung. A parseable-but-malformed policy
+    # that omits one would otherwise raise a KeyError inside @workflow.run -- which fails only the
+    # workflow TASK and hot-retries forever, wedging the gate with no escalation and no fallback.
+    # Surfacing it here as an activity failure routes the gate to its legacy fallback instead (a
+    # config disaster must not silence escalation). The in-repo policy is CI-validated against the
+    # schema; this guards a live edit or an ESCALATION_POLICY_PATH override, both of which read
+    # fresh per gate entry and bypass CI entirely.
+    for rung in levels:
+        if "afterMinutes" not in rung:
+            raise ValueError(f"escalation rung missing afterMinutes: {rung!r}")
+        if rung.get("repeat") and "repeatEveryMinutes" not in rung:
+            raise ValueError(f"repeating escalation rung missing repeatEveryMinutes: {rung!r}")
+    return levels
+
+
+@activity.defn(name=state.ACT_ESCALATE)
+async def escalate_activity(workflow_id: str, reason: str, escalation: dict | None = None) -> dict:
+    """The sign-off human gate is still open with no radiologist action -> page a human (#23/#29).
+
+    The orchestrator owns the durable escalation clock (Temporal); each fired ladder rung maps
+    onto one Communications Agent dispatch via the A2A `comms.dispatch` boundary. The payload's
+    `escalation` slice (contracts/escalation-policy.schema.json $defs/dispatchEscalation) tells
+    the agent who to reach (targetRole), how (channels), and how loudly (urgency) -- policy + IDs
+    only (lean-reference; no PHI in the message). `escalation=None` is the legacy flat page, kept
+    for the workflow's fallback when the policy itself cannot be loaded.
 
     TODO(M3): wire the REAL Communications Agent (CritCom). This dispatch targets the in-repo
     comms.dispatch STUB; CritCom is shaped differently and needs an adapter:
@@ -70,14 +113,25 @@ async def escalate_activity(workflow_id: str, reason: str) -> dict:
     Note: CritCom's own gate is 'ordering physician didn't ACK a critical result', a DIFFERENT gate
     from this 'radiologist didn't SIGN' one -- when wiring CritCom, don't double-page.
     """
-    activity.logger.warning("ESCALATE wf=%s reason=%s", workflow_id, reason)
-    payload = {
-        "studyContext": {"workflowId": workflow_id},
-        # Mark this dispatch critical so the agent adds the on-call pager channel. This is the only
-        # lever the current comms.dispatch contract offers for "page now"; an explicit urgency
-        # field is a possible contract follow-up (see the M3 CritCom adapter).
-        "verification": {"verificationStatus": "FAIL"},
-    }
+    activity.logger.warning(
+        "ESCALATE wf=%s level=%s attempt=%s reason=%s",
+        workflow_id, (escalation or {}).get("level"), (escalation or {}).get("attempt", 1), reason,
+    )
+    payload: dict[str, Any] = {"studyContext": {"workflowId": workflow_id}}
+    if escalation is None:
+        # Legacy flat page: a FAIL verification is the only "page now" lever the pre-#29 payload
+        # offered (it trips the on-call pager route in agents/communications handler._is_critical).
+        payload["verification"] = {"verificationStatus": "FAIL"}
+    else:
+        # Pass forward only the dispatch slice of the rung (its scheduling fields stay internal).
+        payload["escalation"] = {
+            "level": escalation["level"],
+            "targetRole": escalation["targetRole"],
+            "channels": escalation["channels"],
+            "urgency": escalation["urgency"],
+            "attempt": escalation.get("attempt", 1),
+            "reason": reason,
+        }
     return await call_agent_skill(state.agent_base_url("communications"), "comms.dispatch", payload)
 
 

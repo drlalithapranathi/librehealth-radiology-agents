@@ -23,6 +23,7 @@ ACT_CALL_AGENT = "call_agent_skill_activity"
 ACT_START_AGENT = "start_agent_skill_activity"
 ACT_PUBLISH_PRIORITY = "publish_priority_activity"
 ACT_ESCALATE = "escalate_activity"
+ACT_LOAD_ESCALATION_POLICY = "load_escalation_policy_activity"
 
 
 def callback_base_url() -> str:

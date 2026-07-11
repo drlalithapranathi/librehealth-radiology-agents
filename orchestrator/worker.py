@@ -13,6 +13,7 @@ from .activities import (
     start_agent_skill_activity,
     publish_priority_activity,
     escalate_activity,
+    load_escalation_policy_activity,
 )
 
 TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
@@ -43,6 +44,7 @@ async def main() -> None:
             start_agent_skill_activity,
             publish_priority_activity,
             escalate_activity,
+            load_escalation_policy_activity,
         ],
     )
     await worker.run()

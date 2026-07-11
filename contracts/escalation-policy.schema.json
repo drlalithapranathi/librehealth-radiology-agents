@@ -33,6 +33,20 @@
     }
   },
   "$defs": {
+    "dispatchEscalation": {
+      "type": "object",
+      "description": "The `escalation` slice the orchestrator passes forward in a comms.dispatch input when a ladder rung fires: the rung's who/how/how-loudly plus dispatch context (scheduling fields stay internal to the orchestrator). Policy + IDs only -- never PHI. Not referenced by this document's own structure; it contracts the pass-forward payload shape.",
+      "additionalProperties": false,
+      "required": ["level", "targetRole", "channels", "urgency", "attempt", "reason"],
+      "properties": {
+        "level": { "$ref": "#/$defs/level/properties/level" },
+        "targetRole": { "$ref": "#/$defs/level/properties/targetRole" },
+        "channels": { "$ref": "#/$defs/level/properties/channels" },
+        "urgency": { "$ref": "#/$defs/level/properties/urgency" },
+        "attempt": { "type": "integer", "minimum": 1, "description": "1-based fire count of this rung; >1 only when a repeating final rung re-fires." },
+        "reason": { "type": "string", "description": "Human-readable cause, e.g. 'sign-off gate timed out awaiting radiologist'." }
+      }
+    },
     "level": {
       "type": "object",
       "additionalProperties": false,

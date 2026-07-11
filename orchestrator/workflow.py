@@ -24,18 +24,26 @@ from .state import (
     ACT_START_AGENT,
     ACT_PUBLISH_PRIORITY,
     ACT_ESCALATE,
+    ACT_LOAD_ESCALATION_POLICY,
 )
 
 # Tunables (could be moved to a config activity later).
 PRE_READ_TIMEOUT = timedelta(minutes=5)
 SKILL_TIMEOUT = timedelta(minutes=10)
-# Sign-off gate timeout, tier-dependent (#23): STAT reads escalate fastest, ROUTINE slowest.
+# LEGACY sign-off gate timeouts, tier-dependent (#23): STAT reads escalate fastest, ROUTINE
+# slowest. Since #29 the gate normally climbs the escalation ladder from
+# orchestrator/config/escalation-policy.yaml (whose rung 1 mirrors these values); this map is the
+# fallback when that policy cannot be loaded -- a config disaster must not silence escalation.
 SIGNOFF_GATE_TIMEOUTS = {
     "STAT": timedelta(hours=1),
     "URGENT": timedelta(hours=2),
     "ROUTINE": timedelta(hours=4),
 }
 SIGNOFF_GATE_TIMEOUT_DEFAULT = timedelta(hours=4)  # unknown/missing tier -> most lenient
+# Backstop on a repeating final rung (#29): stop re-paging after this many fires of that rung so
+# an abandoned study cannot grow workflow history without bound. A history-size guard, NOT policy
+# (cadence/audience live in escalation-policy.yaml); the gate itself keeps holding for the ack.
+ESCALATION_REPEAT_CAP = 50
 # Push-mode skill re-runs (#24): the SDK's push sender POSTs each callback exactly once (no
 # retry), so a lost callback times out the wait and we re-run the whole skill — bounded, because
 # each re-run starts a fresh (non-idempotent) agent task. Mirrors the unary path, where Temporal
@@ -44,6 +52,13 @@ PUSH_SKILL_ATTEMPTS = 3
 # Backstop bound on buffered push results (duplicate/orphaned taskIds an activity retry can
 # strand): dicts iterate in insertion order, so evicting the oldest entry is replay-deterministic.
 PUSH_RESULT_CAP = 32
+# Shared activity-retry config (#29): the non-idempotent activities -- starting a push skill and
+# firing an escalation page each mint a fresh side effect on every attempt -- and the policy loader
+# (a deterministic failure that a retry won't fix) share ONE bounded policy instead of an ad-hoc
+# RetryPolicy(maximum_attempts=3) repeated per call site. The idempotent read-through calls (_call
+# agent skills, publish_priority) deliberately keep Temporal's default UNBOUNDED retry, so a
+# transient outage self-heals rather than failing a study that cannot proceed without the result.
+BOUNDED_ACTIVITY_RETRY = RetryPolicy(maximum_attempts=3)
 
 
 def signoff_timeout_for(tier: str | None) -> timedelta:
@@ -69,6 +84,7 @@ class StudyWorkflow:
 
     # ---- helpers -----------------------------------------------------------------
     async def _call(self, agent: str, skill_id: str, payload: dict) -> dict:
+        # Idempotent read-through -> Temporal's default unbounded retry (see BOUNDED_ACTIVITY_RETRY).
         return await workflow.execute_activity(
             ACT_CALL_AGENT,
             args=[agent, skill_id, payload],
@@ -95,9 +111,7 @@ class StudyWorkflow:
                     ACT_START_AGENT,
                     args=[agent, skill_id, payload, workflow.info().workflow_id],
                     start_to_close_timeout=PRE_READ_TIMEOUT,  # only the ACK is awaited here
-                    # Non-idempotent: every activity retry can mint a duplicate agent task, so
-                    # bound it (same pattern as ACT_ESCALATE) instead of the default unlimited.
-                    retry_policy=RetryPolicy(maximum_attempts=3),
+                    retry_policy=BOUNDED_ACTIVITY_RETRY,  # non-idempotent: a retry can mint a dup task
                 )
                 attempted.append(task_id)
                 try:
@@ -123,6 +137,91 @@ class StudyWorkflow:
     def _base_payload(self, ctx: dict, **derived: Any) -> dict:
         """Skill input = StudyContext + the derived slice this skill depends on."""
         return {"studyContext": ctx, **derived}
+
+    # ---- sign-off gate (#29) -------------------------------------------------------
+    async def _ack_or_timeout(self, timeout: timedelta | None) -> bool:
+        """True iff the radiologist ack arrived (already, or within `timeout`; None = wait)."""
+        if timeout is not None and timeout <= timedelta(0):
+            return self._signoff_ack is not None
+        try:
+            await workflow.wait_condition(lambda: self._signoff_ack is not None, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _page(self, wf_id: str, reason: str, rung: Optional[dict]) -> None:
+        """Fire one escalation dispatch (escalate_activity -> comms.dispatch), best-effort.
+
+        Bounded retries cover a transient comms blip, but a persistent outage must NOT strand
+        the durable gate -- we log and let the ladder keep climbing (or the gate keep holding),
+        so the next rung still fires on time.
+        """
+        try:
+            await workflow.execute_activity(
+                ACT_ESCALATE,
+                args=[wf_id, reason, rung],
+                start_to_close_timeout=SKILL_TIMEOUT,
+                retry_policy=BOUNDED_ACTIVITY_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "escalation paging failed for %s (rung level=%s); gate continues",
+                wf_id, (rung or {}).get("level"),
+            )
+
+    async def _hold_signoff_gate(self, wf_id: str) -> None:
+        """Hold AWAITING_SIGNOFF until the radiologist acks, escalating per the tier ladder (#29).
+
+        The orchestrator owns the durable escalation clock (the real comms agent has no
+        self-firing timer): each rung of escalation-policy.yaml fires as its afterMinutes --
+        anchored to gate entry, so a slow/failed page never delays later rungs -- elapses without
+        an ack, paging a widening audience. A repeating final rung keeps re-firing at its cadence
+        (capped by ESCALATION_REPEAT_CAP); either way the gate only opens on the ack signal, and
+        the verify loop then re-checks. If the policy itself cannot be loaded, fall back to the
+        legacy pre-#29 gate (single tier timeout, one flat page, back to the verify loop).
+        """
+        tier = (self._triage or {}).get("priorityTier")
+        reason = "sign-off gate timed out awaiting radiologist"
+        try:
+            ladder: list = await workflow.execute_activity(
+                ACT_LOAD_ESCALATION_POLICY,
+                args=[tier],
+                start_to_close_timeout=PRE_READ_TIMEOUT,
+                retry_policy=BOUNDED_ACTIVITY_RETRY,
+            )
+        except ActivityError:
+            ladder = []
+        if not ladder:  # unavailable or (defensively) empty -> legacy single-timeout gate
+            workflow.logger.warning(
+                "escalation policy unavailable for %s; using legacy single-timeout gate", wf_id
+            )
+            if not await self._ack_or_timeout(signoff_timeout_for(tier)):
+                await self._page(wf_id, reason, None)
+            return
+
+        entered = workflow.now()
+        for rung in ladder:
+            target = entered + timedelta(minutes=rung["afterMinutes"])
+            if await self._ack_or_timeout(target - workflow.now()):
+                return
+            await self._page(wf_id, reason, rung)
+
+        last = ladder[-1]
+        if last.get("repeat"):
+            # Anchor the repeat cadence to gate entry too (like the ladder rungs above), so a slow
+            # or failed page never pushes out later re-fires: attempt N is due at the final rung's
+            # target plus (N-1) cadences, and a <=0 wait fires immediately to catch back up.
+            base = entered + timedelta(minutes=last["afterMinutes"])
+            cadence = timedelta(minutes=last["repeatEveryMinutes"])
+            for attempt in range(2, ESCALATION_REPEAT_CAP + 1):
+                if await self._ack_or_timeout(base + (attempt - 1) * cadence - workflow.now()):
+                    return
+                await self._page(wf_id, reason, {**last, "attempt": attempt})
+            workflow.logger.warning(
+                "escalation repeat cap (%d) reached for %s; gate holds without further paging",
+                ESCALATION_REPEAT_CAP, wf_id,
+            )
+        await self._ack_or_timeout(None)
 
     # ---- main run ----------------------------------------------------------------
     @workflow.run
@@ -182,35 +281,12 @@ class StudyWorkflow:
             if status == "PASS" or not self._verification.get("requiresHumanReview"):
                 break
 
-            # AWAITING_SIGNOFF: wait for radiologist addendum/ack, else escalate.
+            # AWAITING_SIGNOFF: hold for the radiologist addendum/ack, climbing the tier's
+            # escalation ladder (#29) while the report sits unsigned.
             self._state = State.AWAITING_SIGNOFF
             self._signoff_ack = None
-            try:
-                await workflow.wait_condition(
-                    lambda: self._signoff_ack is not None,
-                    timeout=signoff_timeout_for((self._triage or {}).get("priorityTier")),
-                )
-            except asyncio.TimeoutError:
-                # The orchestrator owns the durable escalation clock (the real comms agent has no
-                # self-firing timer of its own), so on timeout WE page the on-call exactly once via
-                # escalate_activity -> comms.dispatch. Best-effort: bounded retries for a transient
-                # comms blip, but a persistent outage must NOT strand the durable gate -- we log and
-                # let the loop re-escalate on the next tier timeout rather than failing the workflow.
-                try:
-                    await workflow.execute_activity(
-                        ACT_ESCALATE,
-                        args=[wf_id, "sign-off gate timed out awaiting radiologist"],
-                        start_to_close_timeout=SKILL_TIMEOUT,
-                        retry_policy=RetryPolicy(maximum_attempts=3),
-                    )
-                except ActivityError:
-                    # Paging is best-effort: the activity failed after its retries, but a persistent
-                    # comms outage must never strand the durable gate. Log and let the loop
-                    # re-escalate on the next tier timeout rather than failing the workflow.
-                    workflow.logger.warning(
-                        "escalation paging failed for %s; re-escalating on next tier timeout", wf_id
-                    )
-                # Loop re-verifies; in M2 an addendum updates self._report_event first.
+            await self._hold_signoff_gate(wf_id)
+            # Loop re-verifies; in M2 an addendum updates self._report_event first.
 
         # --- COMMUNICATE: hand off to the existing Communications Agent (A2A) -----
         self._state = State.COMMUNICATE
