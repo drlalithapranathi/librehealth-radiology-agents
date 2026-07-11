@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+import yaml
 from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,9 +55,41 @@ for fixture, schema in fixture_checks:
     for err in sorted(v.iter_errors(_load(fixture)), key=lambda e: e.path):
         errors.append(f"[fixture invalid] {fixture.name}: {list(err.path)} {err.message}")
 
+# 4. Escalation policy (#29): the YAML matrix validates against its schema -- structurally, and
+#    for the cross-field invariants JSON Schema can't express (ordering, single terminal repeat).
+_escalation_schema = CONTRACTS / "escalation-policy.schema.json"
+_escalation_policy = ROOT / "orchestrator" / "config" / "escalation-policy.yaml"
+if _escalation_schema.exists() and _escalation_policy.exists():
+    with _escalation_policy.open() as f:
+        policy = yaml.safe_load(f)
+    v = Draft202012Validator(_load(_escalation_schema))
+    struct_errs = sorted(v.iter_errors(policy), key=lambda e: list(e.path))
+    for err in struct_errs:
+        errors.append(f"[escalation-policy] {list(err.path)} {err.message}")
+    if not struct_errs:  # cross-field checks only make sense on a structurally-valid doc
+        tiers = policy.get("tiers", {})
+        if policy.get("defaultTier") not in tiers:
+            errors.append(f"[escalation-policy] defaultTier {policy.get('defaultTier')!r} is not a tier")
+        for tier, cfg in tiers.items():
+            levels = cfg.get("levels", [])
+            nums = [lv["level"] for lv in levels]
+            mins = [lv["afterMinutes"] for lv in levels]
+            if nums != sorted(nums) or len(set(nums)) != len(nums):
+                errors.append(f"[escalation-policy] tier {tier}: level numbers must strictly increase, got {nums}")
+            if mins != sorted(mins) or len(set(mins)) != len(mins):
+                errors.append(f"[escalation-policy] tier {tier}: afterMinutes must strictly increase, got {mins}")
+            repeats = [i for i, lv in enumerate(levels) if lv.get("repeat")]
+            if len(repeats) > 1:
+                errors.append(f"[escalation-policy] tier {tier}: at most one level may set repeat")
+            if repeats and repeats[0] != len(levels) - 1:
+                errors.append(f"[escalation-policy] tier {tier}: repeat may only be set on the final level")
+            for lv in levels:
+                if lv.get("repeat") and "repeatEveryMinutes" not in lv:
+                    errors.append(f"[escalation-policy] tier {tier} level {lv['level']}: repeat requires repeatEveryMinutes")
+
 if errors:
     print("CONTRACT VALIDATION FAILED:")
     for e in errors:
         print("  -", e)
     sys.exit(1)
-print(f"OK: {len(schema_files)} schemas, cards, and fixtures validated.")
+print(f"OK: {len(schema_files)} schemas, cards, fixtures, and the escalation policy validated.")

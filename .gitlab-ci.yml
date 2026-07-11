@@ -37,7 +37,7 @@ validate-contracts:
   stage: validate
   image: python:3.11-slim
   script:
-    - pip install jsonschema
+    - pip install jsonschema pyyaml
     - python scripts/validate_contracts.py
 
 agent-tests:
