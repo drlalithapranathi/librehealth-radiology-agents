@@ -152,7 +152,15 @@ services:
     depends_on: [temporal, openmrs, orthanc]
 
   worklist-triage:          { build: { context: ., dockerfile: agents/worklist-triage/Dockerfile },          ports: ["8101:8101"] }
-  ehr-assistant:            { build: { context: ., dockerfile: agents/ehr-assistant/Dockerfile },            ports: ["8102:8102"] }
+  # ehr-assistant does live fhir2 reads (#4) — patient labs, problems, allergies, meds — so it
+  # needs the same credentials as the orchestrator (#53); without them every read 401s and the
+  # whole EHR context packet silently degrades to empty.
+  ehr-assistant:
+    build: { context: ., dockerfile: agents/ehr-assistant/Dockerfile }
+    ports: ["8102:8102"]
+    environment:
+      FHIR2_BASIC_USER: admin
+      FHIR2_BASIC_PASS: Admin123
   interpretation-assistant: { build: { context: ., dockerfile: agents/interpretation-assistant/Dockerfile }, ports: ["8103:8103"] }
   # impression-generation reads report conclusions from live fhir2 (#16), so it needs the same
   # credentials as the orchestrator (#53) — without them every fetch 401s and silently degrades

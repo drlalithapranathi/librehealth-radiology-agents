@@ -105,15 +105,19 @@ class Fhir2Client:
             "AllergyIntolerance", {"patient": _patient_query(fhir_patient_id)})]
 
     async def search_medications(self, fhir_patient_id: str) -> list[dict]:
-        """GET MedicationRequest?patient=...&status=active — current medications.
+        """GET MedicationRequest?patient=... — current medications.
 
         Returns lean records ({code, display}) — one per active med — used by the
         EHR Assistant to derive medicationFlags (onMetformin / onAnticoagulant / etc.)
-        via RxNorm code match with a case-insensitive text fallback. Client-side
-        re-filters `status == active` in case the server ignores the search param."""
+        via RxNorm code match with a case-insensitive text fallback. The `status` search
+        param is deliberately NOT sent: live fhir2 returns 500 on
+        `MedicationRequest?status=...` (a server NPE, verified against the o3 fhir2 build),
+        which the caller would swallow into an empty slice, silently disabling every med
+        flag. Activeness is filtered client-side via `_medication_is_active` instead — the
+        same status-param-avoidance `resolve_order_by_accession` uses."""
         entries = await self._collect(
             "MedicationRequest",
-            {"patient": _patient_query(fhir_patient_id), "status": "active"})
+            {"patient": _patient_query(fhir_patient_id)})
         return [_lean_medication(r) for r in entries if _medication_is_active(r)]
 
     async def _collect(self, path: str, params: dict[str, Any]) -> list[dict]:
@@ -125,7 +129,16 @@ class Fhir2Client:
         target: Optional[str] = path
         current_params: dict[str, Any] | None = params
         while target:
-            bundle = await self._get(target, current_params)
+            try:
+                bundle = await self._get(target, current_params)
+            except httpx.HTTPStatusError as e:
+                # A resource type the fhir2 build does not expose (e.g. ImagingStudy on the
+                # o3 image) answers 404. Treat "not found / unsupported" as no results rather
+                # than raising, so one unavailable slice degrades to [] the way get_patient's
+                # 404 degrades to None — instead of failing the whole search.
+                if e.response.status_code == 404:
+                    return collected
+                raise
             for entry in bundle.get("entry", []) or []:
                 resource = entry.get("resource") or {}
                 if resource:

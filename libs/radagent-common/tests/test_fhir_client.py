@@ -502,5 +502,23 @@ def test_search_medications_returns_active_only_from_medicationCC():
 
     client._get = fake_get  # type: ignore[assignment]
     meds = asyncio.run(client.search_medications("demo-1"))
-    assert calls[0] == ("MedicationRequest", {"patient": "demo-1", "status": "active"})
+    # No `status` param: live fhir2 500s on MedicationRequest?status=... so activeness is
+    # filtered client-side. The completed med is dropped by _medication_is_active, not the server.
+    assert calls[0] == ("MedicationRequest", {"patient": "demo-1"})
     assert meds == [{"code": "6809", "display": "Metformin"}]
+
+
+def test_collect_treats_404_as_empty():
+    """A resource type the fhir2 build doesn't expose (e.g. ImagingStudy on o3) answers 404;
+    the search degrades to [] instead of raising, so the slice just goes empty."""
+    import httpx
+
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        request = httpx.Request("GET", "http://fhir/ImagingStudy")
+        response = httpx.Response(404, request=request)
+        raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.search_imaging_studies("demo-1")) == []
