@@ -26,6 +26,7 @@ from .state import (
     ACT_ESCALATE,
     ACT_LOAD_ESCALATION_POLICY,
     ACT_WRITE_PRESIGN_IMPRESSION,
+    ACT_RECORD_POLICY_FAILURE,
 )
 
 # Tunables (could be moved to a config activity later).
@@ -57,6 +58,15 @@ PUSH_RESULT_CAP = 32
 # own history deterministically, so inserting activity calls mid-path is a breaking change for
 # every study already past that point. See the call site in run().
 PATCH_PRESIGN_IMPRESSION = "presign-impression-v1"
+# Temporal patch marker for the escalation-policy dead-letter write (#54). Same hazard as the
+# presign marker: this inserts a new activity command into the sign-off-gate fallback branch, a
+# path that studies parked at the gate have ALREADY walked. Without the guard, replaying such a
+# study's history against this code finds a command that was not there when it ran and fails with
+# NondeterminismError -- wedged mid-gate. Worse, the fallback fires precisely when the policy is
+# broken, so deploying this fix could wedge many parked studies at once. patched() makes an OLD
+# history skip the write (it never happened for that study) while every NEW study records it.
+# Retire the marker (-> workflow.deprecate_patch) only once no pre-#54 workflow is open.
+PATCH_POLICY_DEAD_LETTER = "policy-dead-letter-v1"
 # Shared activity-retry config (#29): the non-idempotent activities -- starting a push skill and
 # firing an escalation page each mint a fresh side effect on every attempt -- and the policy loader
 # (a deterministic failure that a retry won't fix) share ONE bounded policy instead of an ad-hoc
@@ -235,6 +245,31 @@ class StudyWorkflow:
                 wf_id, (rung or {}).get("level"),
             )
 
+    async def _record_policy_failure(self, wf_id: str, tier: str | None) -> None:
+        """Make a collapsed escalation ladder operator-visible (#54) -- best-effort, never fatal.
+
+        The soft fallback below is deliberate (a broken policy must degrade, not wedge the gate),
+        but degraded-AND-silent is the real hazard: the ladder shrinks to one flat page and nothing
+        says so. This records a dead letter next to the poller's on /admin/dead-letters.
+
+        Swallowed on failure on purpose: the alert is observability, and the study still has to be
+        escalated and read. If we cannot even write the alert, the warning log above stands and the
+        gate proceeds -- an unwritable store must never cost a radiologist their page.
+        """
+        try:
+            await workflow.execute_activity(
+                ACT_RECORD_POLICY_FAILURE,
+                args=[wf_id, tier, "escalation policy could not be loaded",
+                      BOUNDED_ACTIVITY_RETRY.maximum_attempts],
+                start_to_close_timeout=PRE_READ_TIMEOUT,
+                retry_policy=BOUNDED_ACTIVITY_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "could not record the escalation-policy dead letter for %s; "
+                "the gate still falls back and pages", wf_id
+            )
+
     async def _hold_signoff_gate(self, wf_id: str) -> None:
         """Hold AWAITING_SIGNOFF until the radiologist acks, escalating per the tier ladder (#29).
 
@@ -261,6 +296,11 @@ class StudyWorkflow:
             workflow.logger.warning(
                 "escalation policy unavailable for %s; using legacy single-timeout gate", wf_id
             )
+            # Guarded so a study parked at the gate before this change replays deterministically
+            # (see PATCH_POLICY_DEAD_LETTER). The write is best-effort either way; the guard is
+            # about replay safety, not the write's own failure handling.
+            if workflow.patched(PATCH_POLICY_DEAD_LETTER):
+                await self._record_policy_failure(wf_id, tier)
             if not await self._ack_or_timeout(signoff_timeout_for(tier)):
                 await self._page(wf_id, reason, None)
             return

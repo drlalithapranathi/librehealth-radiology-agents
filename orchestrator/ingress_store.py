@@ -22,6 +22,13 @@ import os
 import sqlite3
 from typing import Optional
 
+from radagent_common import paths
+
+# Dead-letter kinds (the `kind` column). A dead letter is anything an operator must see and
+# reconcile by hand; the kind says which surface degraded.
+KIND_SIGNOFF_DROP = "signoff-drop"                          # a sign-off the poller gave up on (#29)
+KIND_POLICY_LOAD_FAILURE = "escalation-policy-load-failure"  # the ladder collapsed to one page (#54)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_index (
     join_key    TEXT PRIMARY KEY,
@@ -45,9 +52,23 @@ CREATE TABLE IF NOT EXISTS dead_letters (
     workflow_id TEXT NOT NULL,
     attempts    INTEGER NOT NULL,
     reason      TEXT NOT NULL,
-    dropped_at  TEXT NOT NULL
+    dropped_at  TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'signoff-drop'
 );
 """
+
+
+def default_store_path() -> str:
+    """The one store path the ingress AND the worker both resolve to.
+
+    Both processes run in the same orchestrator container (compose runs the worker and uvicorn
+    side by side), so the sign-off poller's dead letters and the workflow's policy-load dead
+    letters (#54) land in the SAME sqlite file and surface on the same /admin/dead-letters.
+
+    Production MUST override INGRESS_STORE_PATH to a durable *mounted volume* — the default is a
+    path inside the container and does not survive `docker compose down`.
+    """
+    return os.environ.get("INGRESS_STORE_PATH") or str(paths.repo_root() / "ingress_state.db")
 
 
 class IngressStore:
@@ -65,7 +86,22 @@ class IngressStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.executescript(_SCHEMA)
+        self._migrate()
         self._db.commit()
+
+    def _migrate(self) -> None:
+        """Additive column migrations for stores created by an earlier release.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so a store on a mounted
+        volume from before #54 keeps a `dead_letters` with no `kind` column and every write would
+        fail. Backfill it with the pre-#54 meaning (every existing row IS a dropped sign-off).
+        """
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(dead_letters)")}
+        if "kind" not in columns:
+            self._db.execute(
+                "ALTER TABLE dead_letters ADD COLUMN kind TEXT NOT NULL "
+                f"DEFAULT '{KIND_SIGNOFF_DROP}'"
+            )
 
     # ---- report -> workflow join index -------------------------------------------
     def put_index(self, join_key: str, workflow_id: str) -> None:
@@ -150,22 +186,45 @@ class IngressStore:
                 "lastAttempt": row[3], "attempts": row[4]}
 
     def add_dead_letter(self, report_id: str, workflow_id: str, attempts: int,
-                        reason: str, at_iso: str) -> None:
+                        reason: str, at_iso: str,
+                        kind: str = KIND_SIGNOFF_DROP) -> None:
         """Record a permanently dropped sign-off. Idempotent on report_id (a re-scan at the same
         cursor boundary must not duplicate the row)."""
         self._db.execute(
-            "INSERT INTO dead_letters (report_id, workflow_id, attempts, reason, dropped_at) "
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(report_id) DO NOTHING",
-            (report_id, workflow_id, attempts, reason, at_iso),
+            "INSERT INTO dead_letters (report_id, workflow_id, attempts, reason, dropped_at, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(report_id) DO NOTHING",
+            (report_id, workflow_id, attempts, reason, at_iso, kind),
         )
         self._db.commit()
 
+    def add_policy_load_failure(self, workflow_id: str, tier: Optional[str], attempts: int,
+                                reason: str, at_iso: str) -> None:
+        """Record that a sign-off gate could not load its escalation ladder (#54).
+
+        The gate's soft fallback (one tier timeout, one flat page) is the right safety call and is
+        unchanged — but it silently collapses the whole ladder, so a broken policy deploy can page
+        a single person once and look healthy forever. This puts it on the same operator surface as
+        a dropped sign-off: /admin/dead-letters.
+
+        Keyed per workflow, so a study whose verify loop re-enters the gate records ONE row rather
+        than one per entry. The `report_id` column carries a synthetic key here (there is no
+        report involved) — read `kind` to tell the two apart.
+        """
+        self.add_dead_letter(
+            report_id=f"{KIND_POLICY_LOAD_FAILURE}:{workflow_id}",
+            workflow_id=workflow_id,
+            attempts=attempts,
+            reason=f"{reason} (tier={tier or 'unknown'})",
+            at_iso=at_iso,
+            kind=KIND_POLICY_LOAD_FAILURE,
+        )
+
     def dead_letters(self) -> list[dict]:
         rows = self._db.execute(
-            "SELECT report_id, workflow_id, attempts, reason, dropped_at "
+            "SELECT report_id, workflow_id, attempts, reason, dropped_at, kind "
             "FROM dead_letters ORDER BY dropped_at").fetchall()
         return [{"reportId": r[0], "workflowId": r[1], "attempts": r[2],
-                 "reason": r[3], "droppedAt": r[4]} for r in rows]
+                 "reason": r[3], "droppedAt": r[4], "kind": r[5]} for r in rows]
 
     def close(self) -> None:
         self._db.close()

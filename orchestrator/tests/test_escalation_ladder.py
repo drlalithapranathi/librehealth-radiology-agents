@@ -209,6 +209,18 @@ async def _boom_load_policy(tier: str | None) -> list[dict]:
     raise RuntimeError("policy store down")
 
 
+@activity.defn(name="record_policy_failure_activity")
+async def _mock_record_policy_failure(workflow_id: str, tier: str | None, reason: str,
+                                      attempts: int) -> None:
+    _STATE.setdefault("policy_failures", []).append((workflow_id, tier, reason, attempts))
+
+
+@activity.defn(name="record_policy_failure_activity")
+async def _boom_record_policy_failure(workflow_id: str, tier: str | None, reason: str,
+                                      attempts: int) -> None:
+    raise RuntimeError("dead-letter store unwritable")
+
+
 async def _wait_state(handle, target: str, tries: int = 200) -> None:
     for _ in range(tries):
         if await handle.query(StudyWorkflow.current_state) == target:
@@ -248,13 +260,16 @@ def test_policy_load_failure_falls_back_to_legacy_gate():
     """A config disaster must not silence escalation OR strand the gate: the ladder loader
     fails (bounded retries), the gate falls back to the pre-#29 behavior — single tier
     timeout, one flat page (escalation=None), back to the verify loop — and the study
-    completes without an ack, exactly as it did before #29."""
+    completes without an ack, exactly as it did before #29.
+
+    #54: the fallback is now also LOUD — one dead letter records that escalation is degraded —
+    without changing any of the paging behavior asserted below."""
     async def scenario():
         _reset()
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
                               activities=[_mock_call, _mock_publish, _mock_escalate,
-                                          _boom_load_policy]):
+                                          _boom_load_policy, _mock_record_policy_failure]):
                 handle = await env.client.start_workflow(
                     StudyWorkflow.run, STUDY_CONTEXT, id="wf-ladder-fallback", task_queue=TASK_QUEUE
                 )
@@ -267,4 +282,31 @@ def test_policy_load_failure_falls_back_to_legacy_gate():
         wf, reason, esc = _STATE["escalations"][0]
         assert (wf, esc) == ("wf_ladder", None)    # the legacy flat page, no rung slice
         assert "sign-off" in reason
+        # ...and the collapse was announced exactly once, carrying the tier that lost its ladder.
+        assert len(_STATE["policy_failures"]) == 1
+        dl_wf, dl_tier, dl_reason, dl_attempts = _STATE["policy_failures"][0]
+        assert (dl_wf, dl_tier) == ("wf_ladder", "ROUTINE")
+        assert "policy" in dl_reason and dl_attempts >= 1
+    asyncio.run(scenario())
+
+
+def test_policy_dead_letter_failure_never_costs_the_page():
+    """The alert is observability, the page is safety. If the dead-letter store is unwritable
+    too, the gate must STILL fall back and page — never fail the workflow over a failed alert."""
+    async def scenario():
+        _reset()
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
+                              activities=[_mock_call, _mock_publish, _mock_escalate,
+                                          _boom_load_policy, _boom_record_policy_failure]):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT, id="wf-ladder-dl-boom",
+                    task_queue=TASK_QUEUE,
+                )
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                await handle.signal(StudyWorkflow.report_finalized,
+                                    {"diagnosticReportId": "DiagnosticReport/1"})
+                result = await handle.result()
+        assert result["finalState"] == "ARCHIVED"    # not a workflow failure
+        assert len(_STATE["escalations"]) == 1       # the radiologist still got paged
     asyncio.run(scenario())

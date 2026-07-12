@@ -15,6 +15,7 @@ from .activities import (
     write_presign_impression_activity,
     escalate_activity,
     load_escalation_policy_activity,
+    record_policy_failure_activity,
 )
 
 TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
@@ -45,6 +46,7 @@ ACTIVITIES = [
     write_presign_impression_activity,
     escalate_activity,
     load_escalation_policy_activity,
+    record_policy_failure_activity,
 ]
 
 
