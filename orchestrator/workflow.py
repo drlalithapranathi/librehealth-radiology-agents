@@ -25,6 +25,7 @@ from .state import (
     ACT_PUBLISH_PRIORITY,
     ACT_ESCALATE,
     ACT_LOAD_ESCALATION_POLICY,
+    ACT_WRITE_PRESIGN_IMPRESSION,
 )
 
 # Tunables (could be moved to a config activity later).
@@ -138,6 +139,44 @@ class StudyWorkflow:
         """Skill input = StudyContext + the derived slice this skill depends on."""
         return {"studyContext": ctx, **derived}
 
+    # ---- pre-sign impression assist (#26) -------------------------------------------
+    async def _presign_impression(self, ctx: dict) -> None:
+        """Offer an aiFindings-only draft into the RIS while the radiologist is still reading.
+
+        Both calls are advisory: bounded retries (BOUNDED_ACTIVITY_RETRY), then skip on failure,
+        so a down impression-generation agent or a failed fhir2 write never strands the human
+        read that follows -- the v1 post-sign safety-net covers the study regardless.
+        """
+        try:
+            impression = await workflow.execute_activity(
+                ACT_CALL_AGENT,
+                args=["impression-generation", "impression.generate",
+                      self._base_payload(ctx, ehrContext=self._ehr, aiFindings=self._ai)],
+                start_to_close_timeout=SKILL_TIMEOUT,
+                retry_policy=BOUNDED_ACTIVITY_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "pre-sign impression.generate failed for %s; skipping draft", ctx["workflowId"]
+            )
+            return
+
+        service_request_ref = (ctx.get("order") or {}).get("fhirServiceRequestId")
+        if not service_request_ref:
+            return  # nowhere in the RIS to attach the draft yet
+
+        try:
+            await workflow.execute_activity(
+                ACT_WRITE_PRESIGN_IMPRESSION,
+                args=[service_request_ref, ctx["patient"]["fhirPatientId"], impression["impressionText"]],
+                start_to_close_timeout=SKILL_TIMEOUT,
+                retry_policy=BOUNDED_ACTIVITY_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "pre-sign RIS write failed for %s; draft not offered", ctx["workflowId"]
+            )
+
     # ---- sign-off gate (#29) -------------------------------------------------------
     async def _ack_or_timeout(self, timeout: timedelta | None) -> bool:
         """True iff the radiologist ack arrived (already, or within `timeout`; None = wait)."""
@@ -244,6 +283,9 @@ class StudyWorkflow:
             args=[wf_id, study_uid, self._triage],
             start_to_close_timeout=PRE_READ_TIMEOUT,
         )
+
+        # --- PRESIGN IMPRESSION (#26): offer an aiFindings-only draft ahead of the read -----
+        await self._presign_impression(ctx)
 
         # --- AWAITING_RADIOLOGIST: block until the RIS report is finalized --------
         self._state = State.AWAITING_RADIOLOGIST

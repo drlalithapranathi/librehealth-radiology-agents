@@ -1,4 +1,6 @@
-"""Thin OpenMRS fhir2 (FHIR R4) client. v1 = READ-ONLY (see architecture notes: Risk R1).
+"""Thin OpenMRS fhir2 (FHIR R4) client. Mostly READ-ONLY (see architecture notes: Risk R1);
+`write_presign_impression` (#26) is the one write path, confirmed feasible by the R1 spike
+(DiagnosticReport create/update is wired on the live fhir2 build).
 
 Methods are stubs for M0; wire to the live fhir2 base URL in M1. Every agent that needs
 clinical data uses THIS client (lean-reference: fetch from source, do not pass PHI in messages).
@@ -35,6 +37,18 @@ class Fhir2Client:
         url = path if path.startswith("http") else f"{self.base_url}/{path.lstrip('/')}"
         async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
             r = await c.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+
+    async def _post(self, path: str, resource: dict) -> dict:
+        async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
+            r = await c.post(f"{self.base_url}/{path.lstrip('/')}", json=resource)
+            r.raise_for_status()
+            return r.json()
+
+    async def _put(self, path: str, resource: dict) -> dict:
+        async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
+            r = await c.put(f"{self.base_url}/{path.lstrip('/')}", json=resource)
             r.raise_for_status()
             return r.json()
 
@@ -188,6 +202,48 @@ class Fhir2Client:
         resource = await self._get(ref)
         conclusion = resource.get("conclusion")
         return conclusion if isinstance(conclusion, str) and conclusion.strip() else None
+
+    async def write_presign_impression(
+        self, service_request_ref: str, patient_ref: str, impression_text: str,
+    ) -> str:
+        """Offer the pre-sign draft impression into the RIS as a `preliminary` DiagnosticReport
+        (issue #26) -- advisory only, never transitioned to `final`; the radiologist's own signed
+        report is a separate `final` DiagnosticReport the RIS creates on sign-off.
+
+        Idempotent per order: a pre-sign re-run (e.g. more aiFindings tools complete) updates the
+        SAME draft instead of accumulating duplicates, found via `_find_presign_draft`. `status`
+        is deliberately NOT sent as a search param -- the #3 spike found `DiagnosticReport?status=`
+        400s on live fhir2 -- so the preliminary/final distinction is filtered client-side there,
+        same as `poll_finalized_reports`.
+
+        Returns the written DiagnosticReport's bare id.
+        """
+        existing_id = await self._find_presign_draft(service_request_ref)
+        resource = {
+            "resourceType": "DiagnosticReport",
+            "status": "preliminary",
+            "code": {"text": "AI pre-sign impression draft"},
+            "subject": {"reference": patient_ref},
+            "basedOn": [{"reference": service_request_ref}],
+            "conclusion": impression_text,
+        }
+        if existing_id:
+            resource["id"] = existing_id
+            written = await self._put(f"DiagnosticReport/{existing_id}", resource)
+        else:
+            written = await self._post("DiagnosticReport", resource)
+        return written["id"]
+
+    async def _find_presign_draft(self, service_request_ref: str) -> Optional[str]:
+        """The `preliminary` DiagnosticReport a prior `write_presign_impression` call already
+        created for this order, if any -- the idempotency key an update reuses instead of
+        duplicating. Searches by `based-on` only (see `write_presign_impression` on `status`)."""
+        bundle = await self._get("DiagnosticReport", {"based-on": service_request_ref})
+        for entry in bundle.get("entry", []) or []:
+            resource = entry.get("resource") or {}
+            if resource.get("resourceType") == "DiagnosticReport" and resource.get("status") == "preliminary":
+                return resource.get("id")
+        return None
 
     async def poll_finalized_reports(self, since_iso: str) -> tuple[list[dict], Optional[str]]:
         """RIS sign-off detection. Returns (finalized records oldest-first, high-water cursor).

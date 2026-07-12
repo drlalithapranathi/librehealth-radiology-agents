@@ -219,6 +219,89 @@ def test_get_report_conclusion_empty_id_makes_no_call():
     assert called is False  # empty id short-circuits, no fhir2 round-trip
 
 
+# --- write_presign_impression (issue #26) ----------------------------------
+
+def test_write_presign_impression_creates_when_no_existing_draft():
+    client = Fhir2Client()
+    get_calls = []
+    post_calls = []
+
+    async def fake_get(path, params=None):
+        get_calls.append((path, params))
+        return _bundle()  # no existing preliminary draft for this order
+
+    async def fake_post(path, resource):
+        post_calls.append((path, resource))
+        return {"id": "new-draft-1"}
+
+    client._get = fake_get  # type: ignore[assignment]
+    client._post = fake_post  # type: ignore[assignment]
+    report_id = asyncio.run(client.write_presign_impression(
+        "ServiceRequest/sr-1", "Patient/pat-1", "No acute findings identified."))
+
+    # Searches by `based-on` only -- NOT `status`, which 400s on live fhir2 (#3 spike).
+    assert get_calls == [("DiagnosticReport", {"based-on": "ServiceRequest/sr-1"})]
+    assert post_calls[0][0] == "DiagnosticReport"
+    posted = post_calls[0][1]
+    assert posted["status"] == "preliminary"
+    assert posted["subject"] == {"reference": "Patient/pat-1"}
+    assert posted["basedOn"] == [{"reference": "ServiceRequest/sr-1"}]
+    assert posted["conclusion"] == "No acute findings identified."
+    assert "id" not in posted  # a create, not an update
+    assert report_id == "new-draft-1"
+
+
+def test_write_presign_impression_updates_the_existing_draft():
+    client = Fhir2Client()
+    put_calls = []
+
+    async def fake_get(path, params=None):
+        return _bundle({"resourceType": "DiagnosticReport", "id": "draft-9", "status": "preliminary"})
+
+    async def fake_put(path, resource):
+        put_calls.append((path, resource))
+        return {"id": "draft-9"}
+
+    async def fail_post(path, resource):
+        raise AssertionError("must update the existing draft, not create a new one")
+
+    client._get = fake_get  # type: ignore[assignment]
+    client._put = fake_put  # type: ignore[assignment]
+    client._post = fail_post  # type: ignore[assignment]
+    report_id = asyncio.run(client.write_presign_impression(
+        "ServiceRequest/sr-1", "Patient/pat-1", "Findings consistent with pneumothorax."))
+
+    assert put_calls[0][0] == "DiagnosticReport/draft-9"
+    assert put_calls[0][1]["id"] == "draft-9"
+    assert put_calls[0][1]["conclusion"] == "Findings consistent with pneumothorax."
+    assert report_id == "draft-9"
+
+
+def test_find_presign_draft_ignores_non_preliminary_reports():
+    """A prior order can carry a `final` DiagnosticReport (a signed report from a prior study,
+    or even this one already signed) -- only a `preliminary` one is this draft's idempotency key."""
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle(
+            {"resourceType": "DiagnosticReport", "id": "final-1", "status": "final"},
+            {"resourceType": "DiagnosticReport", "id": "draft-2", "status": "preliminary"},
+        )
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client._find_presign_draft("ServiceRequest/sr-1")) == "draft-2"
+
+
+def test_find_presign_draft_none_when_no_preliminary_report():
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle({"resourceType": "DiagnosticReport", "id": "final-1", "status": "final"})
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client._find_presign_draft("ServiceRequest/sr-1")) is None
+
+
 # ---- basic auth from env (issue #53) ----------------------------------------------
 
 def test_auth_from_env_and_passed_to_httpx(monkeypatch):
