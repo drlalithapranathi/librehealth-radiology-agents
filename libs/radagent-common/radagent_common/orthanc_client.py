@@ -50,6 +50,11 @@ def _lean_study(raw: dict) -> dict:
     Missing tags degrade to empty string rather than raising, so a partial
     Orthanc record does not knock a study off the worklist entirely."""
     main_tags = raw.get("MainDicomTags") or {}
+    # numberOfInstances is intentionally not projected here. The /studies?expand
+    # listing does not carry a Statistics block (instance counts live only on the
+    # separate /studies/{id}/statistics endpoint), so sourcing it from this record
+    # would always be null. A consumer that needs the count should fetch statistics
+    # per study rather than rely on the single expand round-trip.
     return {
         "orthancStudyId":   raw.get("ID", ""),
         "studyInstanceUID": main_tags.get("StudyInstanceUID", ""),
@@ -57,7 +62,5 @@ def _lean_study(raw: dict) -> dict:
         "modality":         main_tags.get("ModalitiesInStudy") or main_tags.get("Modality", ""),
         "studyDescription": main_tags.get("StudyDescription", ""),
         "studyDate":        main_tags.get("StudyDate", ""),
-        "numberOfInstances": raw.get("Statistics", {}).get("CountInstances")
-                             if isinstance(raw.get("Statistics"), dict) else None,
         "lastUpdate":       raw.get("LastUpdate", ""),
     }

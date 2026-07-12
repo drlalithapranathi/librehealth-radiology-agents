@@ -25,7 +25,6 @@ Response shape (documented, not schema-locked — the OHIF extension is issue #2
         "modality":          str,
         "studyDescription":  str,
         "studyDate":         str,   // "YYYYMMDD" from DICOM
-        "numberOfInstances": int | null,
         "priorityTier":      "STAT" | "URGENT" | "ROUTINE",
         "priorityScore":     int,   // 0..100
         "workflowId":        str | null,   // null when un-triaged
@@ -132,7 +131,10 @@ def create_app(
         items.sort(key=lambda it: (
             _TIER_RANK.get(it["priorityTier"], 99),
             -int(it["priorityScore"]),
-            it.get("studyDate", ""),
+            # A missing/empty studyDate must sort LAST within its tier, not first.
+            # Ascending "" would otherwise rank an undated study as the oldest case
+            # and float it above genuinely old stat studies.
+            it.get("studyDate") or "99999999",
         ))
 
         return {"items": items, "generatedAt": now_iso()}

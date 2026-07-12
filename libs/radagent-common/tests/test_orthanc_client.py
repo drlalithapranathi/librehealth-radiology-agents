@@ -23,7 +23,6 @@ def test_lean_study_projects_all_common_fields():
             "StudyDescription": "CT AORTA W CONTRAST",
             "StudyDate":        "20260707",
         },
-        "Statistics": {"CountInstances": 280},
         "LastUpdate": "20260707T123005",
     }
     out = _lean_study(raw)
@@ -34,7 +33,6 @@ def test_lean_study_projects_all_common_fields():
         "modality":          "CT",
         "studyDescription":  "CT AORTA W CONTRAST",
         "studyDate":         "20260707",
-        "numberOfInstances": 280,
         "lastUpdate":        "20260707T123005",
     }
 
@@ -53,16 +51,14 @@ def test_lean_study_tolerates_missing_maindicomtags():
     assert out["orthancStudyId"] == "x"
     assert out["studyInstanceUID"] == ""
     assert out["modality"] == ""
-    assert out["numberOfInstances"] is None
 
 
-def test_lean_study_tolerates_missing_statistics():
-    """The Statistics block is absent on some Orthanc versions or configs.
-    numberOfInstances should degrade to None rather than raising."""
-    raw = {"ID": "x", "MainDicomTags": {"StudyInstanceUID": "1.2.3"},
-           "Statistics": None}
-    out = _lean_study(raw)
-    assert out["numberOfInstances"] is None
+def test_lean_study_omits_instance_count():
+    """numberOfInstances is not projected: /studies?expand carries no Statistics
+    block, so the field would always be null. It must be absent, not null."""
+    out = _lean_study({"ID": "x", "MainDicomTags": {"StudyInstanceUID": "1.2.3"},
+                       "Statistics": {"CountInstances": 280}})
+    assert "numberOfInstances" not in out
 
 
 def test_list_completed_studies_uses_expand_single_round_trip():

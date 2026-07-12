@@ -46,7 +46,6 @@ def _lean(uid: str, orthanc_id: str = None, modality: str = "CT",
         "modality":         modality,
         "studyDescription": extra.get("description", ""),
         "studyDate":        study_date,
-        "numberOfInstances": extra.get("num_instances"),
         "lastUpdate":       extra.get("lastUpdate", ""),
     }
 
@@ -206,6 +205,22 @@ def test_worklist_sort_within_tier_uses_score_then_date():
              _client(orthanc=orthanc, store=store).get("/worklist").json()["items"]]
     # Same tier+score: older date wins. Same tier, lower score: below.
     assert order == ["older-hi", "newer-hi", "stat-mid"]
+
+
+def test_worklist_sort_missing_studydate_sorts_last_within_tier():
+    """A study with no StudyDate must not float to the top of its tier as if it
+    were the oldest case; an empty studyDate sorts after real dates."""
+    orthanc = FakeOrthanc([
+        _lean("no-date", study_date=""),
+        _lean("dated",   study_date="20260701"),
+    ])
+    store = PriorityStore(":memory:")
+    store.put("no-date", "wf_1", "STAT", 90, "t")
+    store.put("dated",   "wf_2", "STAT", 90, "t")
+
+    order = [it["studyInstanceUID"] for it in
+             _client(orthanc=orthanc, store=store).get("/worklist").json()["items"]]
+    assert order == ["dated", "no-date"]
 
 
 def test_worklist_mixed_triaged_and_untriaged_studies():
