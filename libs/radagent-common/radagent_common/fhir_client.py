@@ -254,14 +254,28 @@ class Fhir2Client:
         return written["id"]
 
     async def _find_presign_draft(self, service_request_ref: str, patient_ref: str) -> Optional[str]:
-        """The `preliminary` DiagnosticReport a prior `write_presign_impression` call already
-        created for this order, if any -- the idempotency key an update reuses instead of
-        duplicating.
+        """OUR OWN pre-sign draft for this order, if we already wrote one -- the idempotency key an
+        update reuses instead of duplicating. None means "nothing of ours here", and the caller then
+        POSTs a new report rather than overwriting whatever it found.
 
-        Searches by `subject` (the patient), then filters client-side to a `preliminary` report
-        whose `basedOn` points at this order. Neither `based-on` nor `status` can be a search param:
-        both 400 on live fhir2 ("does not know how to handle GET operation[DiagnosticReport] with
-        parameters"), even though `basedOn` DOES round-trip on the resource body."""
+        AUTHORSHIP IS THE POINT (#26). `preliminary` is also the status a RIS gives a radiologist's
+        OWN unsigned draft (it flips to `final` on sign-off), so matching on status alone cannot
+        tell our draft from theirs -- and `write_presign_impression` PUTs the full resource over the
+        match, which would replace a human's text with the AI's. The discriminator is therefore the
+        `code` concept the draft is stamped with on create (`_presign_report_concept`) AND the
+        order: a report is ours only if it is preliminary, based on this order, AND carries our
+        concept.
+
+        The stamp is the CODE, not an `identifier`: this fhir2 build silently DROPS
+        `DiagnosticReport.identifier` on write, so an identifier stamp would vanish on the way in
+        and every lookup would miss -- accumulating a new draft per re-run.
+
+        Searches by `subject` (the patient), then filters client-side. Neither `based-on` nor
+        `status` can be a search param -- both 400 on live fhir2 ("does not know how to handle GET
+        operation[DiagnosticReport] with parameters") -- even though `basedOn` DOES round-trip on
+        the resource body.
+        """
+        ours = _presign_report_concept()
         bundle = await self._get("DiagnosticReport", {"subject": patient_ref})
         for entry in bundle.get("entry", []) or []:
             resource = entry.get("resource") or {}
@@ -270,8 +284,14 @@ class Fhir2Client:
             if resource.get("status") != "preliminary":
                 continue
             based_on = [ref.get("reference") for ref in (resource.get("basedOn") or [])]
-            if service_request_ref in based_on:
-                return resource.get("id")
+            if service_request_ref not in based_on:
+                continue
+            codes = [c.get("code") for c in ((resource.get("code") or {}).get("coding") or [])]
+            if ours not in codes:
+                # Someone else's preliminary report on this order -- most likely the radiologist's
+                # own draft. Leave it alone.
+                continue
+            return resource.get("id")
         return None
 
     async def poll_finalized_reports(self, since_iso: str) -> tuple[list[dict], Optional[str]]:

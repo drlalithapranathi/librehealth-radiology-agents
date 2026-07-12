@@ -259,9 +259,11 @@ def test_write_presign_impression_updates_the_existing_draft():
     put_calls = []
 
     async def fake_get(path, params=None):
-        # The subject search returns this order's preliminary draft (matched client-side by basedOn).
+        # The subject search returns OUR earlier draft for this order: preliminary, based on this
+        # order, and carrying our concept stamp (#26 — the authorship discriminator).
         return _bundle({"resourceType": "DiagnosticReport", "id": "draft-9", "status": "preliminary",
-                        "basedOn": [{"reference": "ServiceRequest/sr-1"}]})
+                        "basedOn": [{"reference": "ServiceRequest/sr-1"}],
+                        "code": {"coding": [{"code": _OUR_CONCEPT}]}})
 
     async def fake_put(path, resource):
         put_calls.append((path, resource))
@@ -283,9 +285,10 @@ def test_write_presign_impression_updates_the_existing_draft():
 
 
 def test_find_presign_draft_matches_preliminary_for_this_order_only():
-    """The subject search returns every report for the patient. Only a `preliminary` one whose
-    `basedOn` points at THIS order is the idempotency key: a `final` report (already signed) and a
-    `preliminary` draft for a DIFFERENT order must both be ignored."""
+    """The subject search returns every report for the patient. Only OUR OWN draft is the
+    idempotency key: preliminary, based on THIS order, AND stamped with our concept. A signed
+    report, a draft for a different order, and — the one that matters (#26) — the RADIOLOGIST's own
+    preliminary draft on this very order must all be ignored."""
     client = Fhir2Client()
     seen_params = {}
 
@@ -293,11 +296,19 @@ def test_find_presign_draft_matches_preliminary_for_this_order_only():
         seen_params.update(params or {})
         return _bundle(
             {"resourceType": "DiagnosticReport", "id": "final-1", "status": "final",
-             "basedOn": [{"reference": "ServiceRequest/sr-1"}]},
+             "basedOn": [{"reference": "ServiceRequest/sr-1"}],
+             "code": {"coding": [{"code": _OUR_CONCEPT}]}},
             {"resourceType": "DiagnosticReport", "id": "other-order", "status": "preliminary",
-             "basedOn": [{"reference": "ServiceRequest/sr-99"}]},
+             "basedOn": [{"reference": "ServiceRequest/sr-99"}],
+             "code": {"coding": [{"code": _OUR_CONCEPT}]}},
+            # The radiologist's own unsigned draft on THIS order — right status, right order,
+            # NOT ours. Overwriting this is the defect the concept stamp exists to prevent.
+            {"resourceType": "DiagnosticReport", "id": "human-draft", "status": "preliminary",
+             "basedOn": [{"reference": "ServiceRequest/sr-1"}],
+             "code": {"coding": [{"code": "radiology-report-concept"}]}},
             {"resourceType": "DiagnosticReport", "id": "draft-2", "status": "preliminary",
-             "basedOn": [{"reference": "ServiceRequest/sr-1"}]},
+             "basedOn": [{"reference": "ServiceRequest/sr-1"}],
+             "code": {"coding": [{"code": _OUR_CONCEPT}]}},
         )
 
     client._get = fake_get  # type: ignore[assignment]
@@ -619,3 +630,104 @@ def test_collect_treats_404_as_empty():
 
     client._get = fake_get  # type: ignore[assignment]
     assert asyncio.run(client.search_imaging_studies("demo-1")) == []
+
+
+# --- #26: the pre-sign draft only ever overwrites ITS OWN draft ----------------------
+
+_OUR_CONCEPT = "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"   # _DEFAULT_PRESIGN_REPORT_CONCEPT
+
+
+def _draft(report_id, *, concept, status="preliminary", order="ServiceRequest/sr-1"):
+    return {"resourceType": "DiagnosticReport", "id": report_id, "status": status,
+            "basedOn": [{"reference": order}],
+            "code": {"coding": [{"code": concept}]}}
+
+
+def test_presign_write_never_overwrites_a_radiologists_own_draft():
+    """THE one that matters (#26). `preliminary` is also the status a RIS gives a radiologist's own
+    unsigned draft. Matching on status alone would PUT the AI's text over the human's report."""
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(("GET", path))
+        # The radiologist has started their own draft on this order. Different concept -> not ours.
+        return _bundle(_draft("radiologist-draft", concept="some-other-concept"))
+
+    async def fake_post(path, resource):
+        calls.append(("POST", path))
+        return {"id": "our-new-draft"}
+
+    async def fake_put(path, resource):
+        calls.append(("PUT", path))
+        return {"id": path.split("/")[-1]}
+
+    client._get, client._post, client._put = fake_get, fake_post, fake_put  # type: ignore[assignment]
+    written = asyncio.run(client.write_presign_impression(
+        "ServiceRequest/sr-1", "Patient/p1", "AI draft text"))
+
+    # We POST a NEW report and leave theirs untouched. A PUT here would destroy a human's work.
+    assert ("POST", "DiagnosticReport") in calls
+    assert not any(verb == "PUT" for verb, _ in calls)
+    assert written == "our-new-draft"
+
+
+def test_presign_write_updates_its_own_earlier_draft():
+    """Idempotency still holds for OUR draft: same order, same concept -> update, don't duplicate."""
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        return _bundle(_draft("our-draft", concept=_OUR_CONCEPT))
+
+    async def fake_post(path, resource):
+        calls.append("POST")
+        return {"id": "should-not-happen"}
+
+    async def fake_put(path, resource):
+        calls.append("PUT")
+        assert path == "DiagnosticReport/our-draft"
+        return {"id": "our-draft"}
+
+    client._get, client._post, client._put = fake_get, fake_post, fake_put  # type: ignore[assignment]
+    written = asyncio.run(client.write_presign_impression(
+        "ServiceRequest/sr-1", "Patient/p1", "AI draft text v2"))
+
+    assert calls == ["PUT"]           # updated in place, not duplicated
+    assert written == "our-draft"
+
+
+def test_presign_draft_lookup_ignores_our_draft_on_a_DIFFERENT_order():
+    """Our own concept, but a different order -> not this study's draft. Don't touch it."""
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle(_draft("other-order", concept=_OUR_CONCEPT, order="ServiceRequest/sr-999"))
+
+    async def fake_post(path, resource):
+        return {"id": "our-new-draft"}
+
+    async def fake_put(path, resource):
+        raise AssertionError("must not PUT over another order's report")
+
+    client._get, client._post, client._put = fake_get, fake_post, fake_put  # type: ignore[assignment]
+    assert asyncio.run(client.write_presign_impression(
+        "ServiceRequest/sr-1", "Patient/p1", "text")) == "our-new-draft"
+
+
+def test_presign_draft_lookup_ignores_a_FINAL_report():
+    """A signed report is never our draft, whatever it is coded with."""
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle(_draft("signed", concept=_OUR_CONCEPT, status="final"))
+
+    async def fake_post(path, resource):
+        return {"id": "our-new-draft"}
+
+    async def fake_put(path, resource):
+        raise AssertionError("must not PUT over a signed report")
+
+    client._get, client._post, client._put = fake_get, fake_post, fake_put  # type: ignore[assignment]
+    assert asyncio.run(client.write_presign_impression(
+        "ServiceRequest/sr-1", "Patient/p1", "text")) == "our-new-draft"
