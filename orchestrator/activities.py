@@ -11,6 +11,7 @@ import yaml
 
 from radagent_common.client import call_agent_skill, start_agent_skill
 from radagent_common.fhir_client import Fhir2Client
+from radagent_common.worklist_client import publish_priority as publish_priority_to_worklist
 from . import state
 
 
@@ -45,11 +46,34 @@ async def start_agent_skill_activity(agent: str, skill_id: str, payload: dict[st
 async def publish_priority_activity(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
     """Make the triage priority visible to the Worklist API (orchestrator = source of truth).
 
-    TODO(M1): write to the Worklist API / priority store. No DICOM tag mutation.
+    Best-effort publish: the Worklist API's /priority endpoint stores the tier/score so OHIF's
+    reading list can sort by priority (issue #20). A failed publish is a visibility loss, NOT a
+    correctness bug — the study still gets interpreted, reported, and signed either way — so we
+    swallow errors in the helper and log the outcome here rather than fail the workflow. See
+    radagent_common.worklist_client for the "never raises" contract.
+
+    No DICOM tag mutation.
     """
+    tier = triage.get("priorityTier")
+    score = triage.get("priorityScore")
     activity.logger.info(
         "publish priority wf=%s study=%s tier=%s score=%s",
-        workflow_id, study_instance_uid, triage.get("priorityTier"), triage.get("priorityScore"),
+        workflow_id, study_instance_uid, tier, score,
+    )
+    if tier is None or score is None:
+        # Malformed triage output — the activity contract expects both fields; without them the
+        # Worklist API would 422. Log and skip so we don't emit a doomed request.
+        activity.logger.warning(
+            "publish priority skipped (missing tier/score) wf=%s study=%s",
+            workflow_id, study_instance_uid,
+        )
+        return
+    await publish_priority_to_worklist(
+        state.worklist_api_base_url(),
+        study_instance_uid=study_instance_uid,
+        workflow_id=workflow_id,
+        priority_tier=tier,
+        priority_score=score,
     )
 
 

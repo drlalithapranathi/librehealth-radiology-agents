@@ -148,6 +148,9 @@ services:
       FHIR2_BASIC_USER: admin
       FHIR2_BASIC_PASS: Admin123
       ORTHANC_BASE_URL: http://orthanc:8042
+      # Worklist API where publish_priority_activity sends triage priority (issue #20 follow-up).
+      # Best-effort: a Worklist API outage does not fail the workflow (see worklist_client.py).
+      WORKLIST_API_URL: http://worklist-api:8107
     ports: ["8090:8090"]
     depends_on: [temporal, openmrs, orthanc]
 
