@@ -20,6 +20,22 @@ dependencies = [
 # churns hard (0.3 pydantic -> 1.0 protobuf rewrite; see a2a.py). [http-server] pulls starlette.
 # This is the single source of truth for the a2a-sdk pin.
 a2a = ["a2a-sdk[http-server]==1.0.3"]
+# OpenTelemetry tracing (#28). Optional: the core lib + handler tests never touch OTel — only the
+# worker/ingress entrypoints (and the compose stack) install this. tracing.init_tracing imports it
+# lazily. The Temporal TracingInterceptor lives in temporalio.contrib.opentelemetry and only needs
+# opentelemetry-api (pulled here); no separate temporalio[opentelemetry] pin required.
+otel = [
+  "opentelemetry-api>=1.20",
+  "opentelemetry-sdk>=1.20",
+  "opentelemetry-exporter-otlp-proto-http>=1.20",
+  # The instrumentation packages track their own 0.x line, which must match the core version:
+  # core 1.N pairs with instrumentation 0.(N+21)bX. 0.41b0 is the release that pairs with the
+  # 1.20 floor above, so bound it here too — otherwise pip is free to pull a 0.x too old for
+  # the core it just resolved.
+  "opentelemetry-instrumentation-fastapi>=0.41b0",
+  "opentelemetry-instrumentation-starlette>=0.41b0",  # agent-side (a2a.py builds a raw Starlette app)
+  "opentelemetry-instrumentation-httpx>=0.41b0",      # inject/extract traceparent on A2A + fhir2 calls
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

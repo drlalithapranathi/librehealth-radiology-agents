@@ -11,6 +11,15 @@
 #   Orthanc:                http://localhost:8042/
 #   OHIF viewer:            http://localhost:3000/
 # Temporal services below are for the agent orchestrator (independent of the RIS stack).
+#
+# Distributed tracing (#28) is OPT-IN and off by default — with OTEL_EXPORTER_OTLP_ENDPOINT
+# unset, every service's tracing gate is False and no OTel code runs at all. To turn it on:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile otel up -d
+#   Jaeger UI:              http://localhost:16686/   (one trace per study, across all agents)
+
+# Injected into every app service. Empty by default => tracing fully off (see tracing_enabled()).
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
 services:
   # --- EHR / RIS: OpenMRS 3 backend + legacyui + lh-radiology --------------------
@@ -174,6 +183,19 @@ services:
       start_period: 90s
     restart: unless-stopped
 
+  # --- Tracing backend (#28), opt-in: `docker compose --profile otel up` -----------
+  # Jaeger all-in-one = OTLP receiver + storage + UI in one container. It only starts under the
+  # `otel` profile, so the default stack is byte-for-byte unchanged. 4318 = OTLP/HTTP, which is
+  # what init_tracing()'s exporter speaks (opentelemetry.exporter.otlp.proto.http).
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: ["otel"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      - "4318:4318"     # OTLP/HTTP receiver
+
   # --- Application services (M1) -------------------------------------------------
   orchestrator:
     build: { context: ., dockerfile: orchestrator/Dockerfile }
@@ -182,6 +204,7 @@ services:
     command: ["bash", "-c", "python -m orchestrator.worker & uvicorn orchestrator.ingress:app --host 0.0.0.0 --port 8090 & wait -n"]
     restart: unless-stopped
     environment:
+      <<: *otel-env
       TEMPORAL_TARGET: temporal:7233
       FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
       # Live fhir2 401s unauthenticated reads and the callers swallow fhir2 errors by design,
@@ -199,7 +222,11 @@ services:
     ports: ["8090:8090"]
     depends_on: [temporal, openmrs, orthanc]
 
-  worklist-triage:          { build: { context: ., dockerfile: agents/worklist-triage/Dockerfile },          ports: ["8101:8101"] }
+  worklist-triage:
+    build: { context: ., dockerfile: agents/worklist-triage/Dockerfile }
+    ports: ["8101:8101"]
+    environment:
+      <<: *otel-env
   # ehr-assistant does live fhir2 reads (#4) — patient labs, problems, allergies, meds — so it
   # needs the same credentials as the orchestrator (#53); without them every read 401s and the
   # whole EHR context packet silently degrades to empty.
@@ -207,9 +234,14 @@ services:
     build: { context: ., dockerfile: agents/ehr-assistant/Dockerfile }
     ports: ["8102:8102"]
     environment:
+      <<: *otel-env
       FHIR2_BASIC_USER: admin
       FHIR2_BASIC_PASS: Admin123
-  interpretation-assistant: { build: { context: ., dockerfile: agents/interpretation-assistant/Dockerfile }, ports: ["8103:8103"] }
+  interpretation-assistant:
+    build: { context: ., dockerfile: agents/interpretation-assistant/Dockerfile }
+    ports: ["8103:8103"]
+    environment:
+      <<: *otel-env
   # impression-generation reads report conclusions from live fhir2 (#16), so it needs the same
   # credentials as the orchestrator (#53) — without them every fetch 401s and silently degrades
   # to "no critical detection".
@@ -217,9 +249,14 @@ services:
     build: { context: ., dockerfile: agents/impression-generation/Dockerfile }
     ports: ["8104:8104"]
     environment:
+      <<: *otel-env
       FHIR2_BASIC_USER: admin
       FHIR2_BASIC_PASS: Admin123
-  report-verification:      { build: { context: ., dockerfile: agents/report-verification/Dockerfile },      ports: ["8105:8105"] }
+  report-verification:
+    build: { context: ., dockerfile: agents/report-verification/Dockerfile }
+    ports: ["8105:8105"]
+    environment:
+      <<: *otel-env
   # Worklist API (issue #20): serves OHIF a sorted reading worklist by joining Orthanc completed
   # studies + orchestrator triage priority + LH-Radiology assignment (read-only). Priority arrives
   # via POST /priority from orchestrator/activities.publish_priority_activity (wiring lives in

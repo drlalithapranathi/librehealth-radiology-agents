@@ -8,7 +8,7 @@ WORKDIR /app
 # Shared lib in its own layer so the (slow) pip install caches across agent-code changes. Agents
 # serve an A2A server, so they need the [a2a] extra; + uvicorn to run it.
 COPY libs/ ./libs/
-RUN pip install --no-cache-dir -e "libs/radagent-common[a2a]" uvicorn
+RUN pip install --no-cache-dir -e "libs/radagent-common[a2a,otel]" uvicorn
 
 # The A2A factory reads the agent card from /contracts at runtime (load_card); LHRAD_REPO_ROOT
 # points paths.repo_root() at it. The agent dir is on PYTHONPATH so `server`/`handler`/`registry`

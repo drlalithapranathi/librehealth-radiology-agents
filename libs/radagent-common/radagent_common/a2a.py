@@ -39,6 +39,7 @@ from google.protobuf import json_format
 
 from . import paths
 from .validation import validate_skill_output, ContractError
+from .tracing import tracing_enabled, init_tracing
 
 # --- SDK imports kept in one place ------------------------------------------------
 import httpx
@@ -187,4 +188,15 @@ def build_agent_app(agent_dir_name: str, handler: SkillHandler) -> _AgentApp:
     routes = create_agent_card_routes(
         agent_card=card, card_url=WELL_KNOWN_CARD_PATH
     ) + create_jsonrpc_routes(request_handler=request_handler, rpc_url="/")
-    return _AgentApp(Starlette(routes=routes))
+    app = Starlette(routes=routes)
+    if tracing_enabled():
+        # OpenTelemetry (#28): extract the W3C traceparent the orchestrator injects at the HTTP
+        # layer (below the handler -- handlers still never touch a2a.* or headers), so each agent
+        # server span is a child of the calling activity span. Also instrument the agent's own
+        # outgoing httpx (fhir2/Orthanc reads). Gated + lazy, so the [otel] extra stays optional.
+        init_tracing(f"agent-{agent_dir_name}")
+        from opentelemetry.instrumentation.starlette import StarletteInstrumentor
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+        StarletteInstrumentor.instrument_app(app)
+        HTTPXClientInstrumentor().instrument()
+    return _AgentApp(app)

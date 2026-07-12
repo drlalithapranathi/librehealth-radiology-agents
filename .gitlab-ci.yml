@@ -98,12 +98,16 @@ ris-poller-tests:
   stage: test
   image: python:3.11-slim
   script:
-    - pip install -e "libs/radagent-common[a2a]" "temporalio==1.29.0" fastapi pytest
+    # [otel] too (#28): test_worker_tracing.py pins the tracing wiring — the double-span
+    # interceptor and the silently-unexported ingress spans. Without the extra the whole module
+    # importorskips, and CI would go green on exactly the bugs it exists to catch.
+    - pip install -e "libs/radagent-common[a2a,otel]" "temporalio==1.29.0" fastapi pytest
     - >
       python -m pytest
       libs/radagent-common/tests/test_fhir_client.py
       libs/radagent-common/tests/test_fhir_models.py
       libs/radagent-common/tests/test_comms_ledger.py
+      libs/radagent-common/tests/test_tracing.py
       orchestrator/tests -q
 
 orchestrator-e2e-it:

@@ -20,7 +20,7 @@ from radagent_common import validate_against, paths
 from radagent_common.client import parse_push_callback
 from radagent_common.fhir_client import Fhir2Client
 from radagent_common.validation import validate_skill_output
-from radagent_common.tracing import now_iso, new_trace_id, new_span_id
+from radagent_common.tracing import now_iso, new_trace_id, new_span_id, init_tracing, tracing_enabled
 from .state import TASK_QUEUE
 from .workflow import StudyWorkflow
 from .ingress_store import IngressStore, default_store_path
@@ -82,7 +82,13 @@ def _fhir() -> Fhir2Client:
 async def _temporal() -> Client:
     global _client
     if _client is None:
-        _client = await Client.connect(TEMPORAL_TARGET)
+        # OTel (#28): when enabled, the interceptor spans workflow starts/signals and injects trace
+        # context into Temporal headers, linking the webhook span to the worker-side workflow span.
+        interceptors: list = []
+        if tracing_enabled():
+            from temporalio.contrib.opentelemetry import TracingInterceptor
+            interceptors = [TracingInterceptor()]
+        _client = await Client.connect(TEMPORAL_TARGET, interceptors=interceptors)
     return _client
 
 
@@ -372,6 +378,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LH-Radiology Orchestrator Ingress", lifespan=lifespan)
+
+# OpenTelemetry (#28): span the webhook + poller; the Temporal client interceptor in _temporal()
+# then propagates context to the workflow. Fully off unless OTel is configured; all imports lazy
+# so the module (and its tests) never require the [otel] extra.
+#
+# Instrumented HERE, at import, and NOT inside the lifespan: instrument_app() injects ASGI
+# middleware, and by the time the lifespan body runs Starlette has already built and cached its
+# middleware stack — the call would be silently ignored and the ingress would export no spans at
+# all (no error, no warning). The HTTPX instrumentation is process-global, so it rides along.
+if tracing_enabled():
+    init_tracing("orchestrator-ingress")
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+    FastAPIInstrumentor.instrument_app(app)
+    HTTPXClientInstrumentor().instrument()  # fhir2 poller calls inject the traceparent
 
 
 @app.get("/healthz")
