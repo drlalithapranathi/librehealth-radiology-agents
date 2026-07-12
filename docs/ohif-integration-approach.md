@@ -116,8 +116,19 @@ Approach B path is what R2 was implicitly pointing at as the sane middle.
 * **Skeleton is `integrations/ohif-extension/`** — the placeholder already
   exists in the repo (`README.md` there is the current stub).
 * **Extension type: OHIF v3 extension + mode**, packaged as a Node/TS
-  workspace. Registered via `window.config.extensions` and
-  `window.config.modes` in `docker/ohif/app-config.js` (currently `[]`).
+  workspace. **Registration is build-time, not runtime.** OHIF v3 has no
+  runtime plugin loader and the `ohif/app` image is a pre-compiled bundle, so
+  listing the extension in `window.config.extensions`/`modes`
+  (`docker/ohif/app-config.js`) is necessary but NOT sufficient: those
+  namespaces resolve only if the extension is compiled into the bundle. We ship
+  it by building our own OHIF image (a multi-stage Dockerfile in
+  `integrations/ohif-extension/`: a node stage that compiles OHIF v3.6.5 + our
+  extension, then an nginx stage that serves the built `dist/`) and pointing
+  docker-compose at that image instead of the stock `ohif/app`. This is a
+  custom image build, NOT a fork of OHIF: we depend on OHIF and do not edit its
+  source, so a version bump is a dependency bump and a rebuild. Note the Orthanc
+  runtime-mount plugin pattern does not transfer here, because Orthanc has a
+  plugin loader and OHIF does not.
 * **`docker/ohif/app-config.js` change is deferred** to the #21 MR itself so
   the extension is only registered once it exists (avoids a broken viewer
   on the intermediate merge).
