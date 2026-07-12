@@ -2,7 +2,7 @@
   "name": "Communications Agent",
   "description": "Dispatches critical-result and report-ready notifications over the configured channels once a study's report is finalized and verified.",
   "url": "http://communications:8106/",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "capabilities": {
     "streaming": true,
     "pushNotifications": true

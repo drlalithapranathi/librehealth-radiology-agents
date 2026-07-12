@@ -58,14 +58,37 @@ def comms_agent_url():
 
 
 async def test_orchestrator_dispatch_round_trips(comms_agent_url):
+    """The routine COMMUNICATE hand-off, over real A2A transport.
+
+    Deliberately a routine (non-critical) study: since #52 MR 3 a CRITICAL dispatch writes a
+    Communication + ack Task to the comms ledger and reads the order from fhir2, so driving one
+    here would make this transport test depend on two live servers. The closed loop is covered
+    against in-memory doubles in test_handler.py; what this test is for is the wire.
+    """
     out = await call_agent_skill(
         comms_agent_url,
         "comms.dispatch",
-        {"studyContext": {"workflowId": "wf_it_17"},
-         "impression": {"criticalFlags": [{"label": "aortic dissection", "severity": "critical"}]}},
+        {"studyContext": {"workflowId": "wf_it_17"}},
     )
     assert out["workflowId"] == "wf_it_17"
     assert out["dispatchStatus"] == "SENT"
-    # criticality routed to the on-call pager, round-tripped over real A2A transport
-    assert "oncall-pager" in [c["channel"] for c in out["channelResults"]]
-    assert out["agentVersion"] == "0.1.0"
+    assert [c["channel"] for c in out["channelResults"]] == ["ehr-inbox"]
+    assert out["acrCategory"] == "None"
+    assert out["agentVersion"] == "0.2.0"
+
+
+async def test_signoff_escalation_rung_round_trips(comms_agent_url):
+    """The #29 ladder's page, over real A2A transport — byte-for-byte the payload
+    orchestrator/activities.escalate_activity sends. It needs no ledger and no fhir2 (there is no
+    signed report to acknowledge), so it is the sharpest transport acceptance we have."""
+    out = await call_agent_skill(
+        comms_agent_url,
+        "comms.dispatch",
+        {"studyContext": {"workflowId": "wf_it_29"},
+         "escalation": {"level": 2, "targetRole": "on-call-radiologist",
+                        "channels": ["pager", "sms"], "urgency": "critical", "attempt": 1,
+                        "reason": "sign-off gate timed out awaiting radiologist"}},
+    )
+    assert out["dispatchStatus"] == "SENT"
+    assert [c["channel"] for c in out["channelResults"]] == ["pager", "sms"]
+    assert "taskId" not in out           # the SIGN gate opens no ack clock — do not double-page

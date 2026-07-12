@@ -16,20 +16,41 @@ Per-skill schemas: `contracts/skills/comms.dispatch.schema.json`,
 `$defs/input` = input). Card: `contracts/cards/communications.json`. The orchestrator acts on
 `taskId` + `deadline` + escalate's `escalated` boolean; `acrCategory` is optional/informational.
 
-## v1 vs later
-- **v1 (#52 MR 1, contracts):** `comms.dispatch` keeps the #17 channel-selection stub (routine →
-  EHR inbox; critical → also page on-call; criticality = impression `criticalFlags` or a failed
-  verification). A sign-off escalation rung (#29) arrives as an `escalation` input slice
-  (`escalation-policy.schema.json` `$defs/dispatchEscalation`) whose channels are dispatched as
-  requested — the ladder already chose who/how. `comms.checkAck` / `comms.escalate` return
-  contract-valid stubs. Delivery is stubbed (no real EHR/pager/SMS I/O).
-- **#52 MR 2/3:** swap the FHIR client to `radagent_common.fhir_client` (reads) + a separate
-  comms-ledger (Communication/Task writes); port CritCom's tools + the ACR classifier stub, so
-  `comms.dispatch` returns real `communicationId`/`taskId`/`deadline`.
-- **M3:** real channel delivery + real Gemini ACR classifier.
+## The two stores
+Clinical context is READ from **fhir2** (`radagent_common.fhir_client`, read-only). The
+notification and its ack are WRITTEN to the **comms ledger** (`radagent_common.comms_ledger`,
+a separate HAPI FHIR server) — fhir2 implements neither `Communication` nor `PractitionerRole`.
+See `comms_ledger.py` for the full reasoning.
 
-> Note: #29's ladder is the "radiologist didn't SIGN" gate; CritCom's checkAck/escalate loop is the
-> "physician didn't ACK a critical result" gate. Different gates — do not double-page.
+`resolve_ordering_provider` carries `ServiceRequest.requester` **verbatim** and never dereferences
+it: the order lives in fhir2 and the on-call directory in the ledger, so following that reference
+across stores would be a guess about matching ids. Recording who we notified does not require
+dialling them. The on-call provider IS dereferenced — `PractitionerRole` is ledger-native.
+
+## The closed loop (#52 MR 3, real)
+`comms.dispatch` classifies (ACR), and for a **critical** result writes a `Communication` ("we told
+someone") + an ack `Task` ("did they answer"), returning `communicationId` / `taskId` / `deadline` /
+`recipient`. A **routine** result posts to the EHR inbox and opens **no ack clock** — a timer on a
+clean chest X-ray is how alert fatigue starts. `comms.checkAck` reads the Task; `comms.escalate`
+marks it FAILED and opens a fresh loop on the on-call provider.
+
+Ack windows: Cat1 = 60 min, Cat2 = 24 h (`CRITCOM_CAT{1,2}_ACK_TIMEOUT_MINUTES`).
+
+**The agent never self-fires a timer.** It opens the clock and reports the deadline; the
+orchestrator owns the durable wait and calls back (#52 MR 4).
+
+## v1 vs later
+- **v1:** the ACR classifier is deterministic — it reads Impression's `criticalFlags` and
+  Verification's status, not the narrative (`classifier.py`). Channel delivery is still stubbed
+  (no real EHR/pager/SMS I/O); what is real is the FHIR record of it.
+- **M3:** real channel delivery + the real Gemini ACR classifier behind the same `classify()`
+  signature (the pattern `interpretation-assistant/registry.py` uses).
+
+> ## Two gates. Do not double-page.
+> **#29's ladder** = "the radiologist didn't SIGN". Its fired rung arrives as an `escalation` input
+> slice on `comms.dispatch`; the ladder already chose who/how, so those channels are dispatched
+> verbatim and **no ack clock is opened** — there is no signed report to acknowledge.
+> **checkAck/escalate** = "the physician didn't ACK a critical result", on a report that IS signed.
 
 ## Run / test
 `cd agents/communications && python -m pytest -q`
