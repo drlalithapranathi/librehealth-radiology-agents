@@ -89,12 +89,22 @@ ris-poller-tests:
   # Issue #12: fhir2 finalized-report query + the ingress report->workflow poller. Needs the
   # orchestrator deps (temporalio + fastapi); ingress imports radagent_common.client, so the
   # a2a extra comes along too. Run from repo root so `orchestrator` imports as a package.
+  #
+  # The FHIR test files are named EXPLICITLY rather than running the whole tests/ dir, because
+  # the other files there need extras this job does not install. That means a new test file is
+  # invisible to CI until it is added HERE -- so #52's comms-ledger + R4-model tests are listed
+  # below. A guard CI never runs is not a guard.
   extends: .default-rules
   stage: test
   image: python:3.11-slim
   script:
     - pip install -e "libs/radagent-common[a2a]" "temporalio==1.29.0" fastapi pytest
-    - python -m pytest libs/radagent-common/tests/test_fhir_client.py orchestrator/tests -q
+    - >
+      python -m pytest
+      libs/radagent-common/tests/test_fhir_client.py
+      libs/radagent-common/tests/test_fhir_models.py
+      libs/radagent-common/tests/test_comms_ledger.py
+      orchestrator/tests -q
 
 orchestrator-e2e-it:
   # Issue #9 / #19: the orchestrator runs FULLY ON MOCKS end-to-end. Boots all six agents as
