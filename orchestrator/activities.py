@@ -53,6 +53,27 @@ async def publish_priority_activity(workflow_id: str, study_instance_uid: str, t
     )
 
 
+@activity.defn(name=state.ACT_WRITE_PRESIGN_IMPRESSION)
+async def write_presign_impression_activity(
+    service_request_ref: str, patient_ref: str, impression_text: str,
+) -> str:
+    """Offer the pre-sign draft impression into the RIS as a preliminary DiagnosticReport (#26).
+
+    Thin wrapper over Fhir2Client.write_presign_impression, which is idempotent per order and
+    reuses the existing draft on a re-run. This is advisory and is the one fhir2 write path.
+    Errors propagate so the workflow can retry with its bounded policy and then skip the draft on
+    final failure, so a fhir2 outage never strands the human read (see workflow._presign_impression).
+    Returns the written DiagnosticReport id.
+    """
+    report_id = await Fhir2Client().write_presign_impression(
+        service_request_ref, patient_ref, impression_text,
+    )
+    activity.logger.info(
+        "wrote pre-sign impression draft report=%s order=%s", report_id, service_request_ref,
+    )
+    return report_id
+
+
 def _escalation_policy_path() -> Path:
     """Env override -> the in-repo default (baked into the worker image)."""
     default = Path(__file__).resolve().parent / "config" / "escalation-policy.yaml"

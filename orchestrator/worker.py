@@ -12,6 +12,7 @@ from .activities import (
     call_agent_skill_activity,
     start_agent_skill_activity,
     publish_priority_activity,
+    write_presign_impression_activity,
     escalate_activity,
     load_escalation_policy_activity,
 )
@@ -43,6 +44,7 @@ async def main() -> None:
             call_agent_skill_activity,
             start_agent_skill_activity,
             publish_priority_activity,
+            write_presign_impression_activity,
             escalate_activity,
             load_escalation_policy_activity,
         ],
