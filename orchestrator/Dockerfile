@@ -9,7 +9,7 @@ WORKDIR /app
 # Shared lib in its own layer so the pip install caches across orchestrator-code changes. The
 # orchestrator is the A2A client (radagent_common.client -> [a2a]) and runs on Temporal + FastAPI.
 COPY libs/ ./libs/
-RUN pip install --no-cache-dir -e "libs/radagent-common[a2a]" "temporalio==1.29.0" fastapi uvicorn
+RUN pip install --no-cache-dir -e "libs/radagent-common[a2a,otel]" "temporalio==1.29.0" fastapi uvicorn
 
 # Contracts are read at runtime (event validation, agent cards); LHRAD_REPO_ROOT points at them.
 COPY contracts/ ./contracts/
