@@ -13,7 +13,9 @@ optional `channelResults[]` of `{channel, status}`). Card: `contracts/cards/comm
 ## v1 vs later
 - **v1:** channel *selection* by urgency (routine → EHR inbox; critical → also page on-call);
   delivery is stubbed (no real EHR/pager/SMS I/O). Criticality = impression `criticalFlags` or a
-  failed verification.
+  failed verification. A sign-off escalation rung (#29) arrives as an `escalation` input slice
+  (`escalation-policy.schema.json` `$defs/dispatchEscalation`) whose channels are dispatched
+  as requested — the ladder already chose who/how.
 - **M3:** real channel delivery + closed-loop acknowledgement.
 
 ## Run / test

@@ -38,6 +38,19 @@ async def test_failed_verification_also_pages_oncall():
     assert "oncall-pager" in [c["channel"] for c in out["channelResults"]]
 
 
+async def test_escalation_rung_dispatches_its_requested_channels():
+    """A fired sign-off ladder rung (#29) dispatches exactly the channels the policy chose."""
+    out = await handle("comms.dispatch", {
+        "studyContext": SAMPLE_CONTEXT,
+        "escalation": {"level": 2, "targetRole": "on-call-radiologist",
+                       "channels": ["pager", "sms"], "urgency": "critical", "attempt": 1,
+                       "reason": "sign-off gate timed out awaiting radiologist"},
+    })
+    validate_skill_output("comms.dispatch", out)
+    assert [c["channel"] for c in out["channelResults"]] == ["pager", "sms"]
+    assert all(c["status"] == "SENT" for c in out["channelResults"])
+
+
 async def test_unexpected_skill_raises():
     import pytest
     with pytest.raises(ValueError):
