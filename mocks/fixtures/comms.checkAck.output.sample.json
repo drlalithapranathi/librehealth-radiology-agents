@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "wf_fx",
+  "taskId": "Task/task-1",
+  "ackStatus": "REQUESTED",
+  "deadline": "2026-07-12T00:00:00Z",
+  "overdue": false,
+  "agentVersion": "0.1.0",
+  "checkedAt": "2026-07-11T00:00:00Z"
+}

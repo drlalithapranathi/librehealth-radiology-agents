@@ -41,12 +41,16 @@ for cf in sorted((CONTRACTS / "cards").glob("*.json")):
 
 # 3. Fixtures validate against their schema (extend as fixtures are added).
 _studycontext_schema = CONTRACTS / "studycontext.schema.json"
+_skills = CONTRACTS / "skills"
 fixture_checks = [
     (ROOT / "mocks/fixtures/studycontext.sample.json", _studycontext_schema),
     (ROOT / "mocks/fixtures/studycontext.ct_aortic_dissection.json", _studycontext_schema),
     (ROOT / "mocks/fixtures/studycontext.cxr_pneumothorax.json", _studycontext_schema),
     (ROOT / "mocks/fixtures/studycontext.mammo_routine.json", _studycontext_schema),
     (ROOT / "mocks/fixtures/studycontext.mr_brain.json", _studycontext_schema),
+    # CritCom comms-skill outputs (#52) validate against their per-skill schemas.
+    (ROOT / "mocks/fixtures/comms.dispatch.output.sample.json", _skills / "comms.dispatch.schema.json"),
+    (ROOT / "mocks/fixtures/comms.checkAck.output.sample.json", _skills / "comms.checkAck.schema.json"),
 ]
 for fixture, schema in fixture_checks:
     if not fixture.exists():

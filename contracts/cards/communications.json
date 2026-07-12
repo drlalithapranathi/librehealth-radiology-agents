@@ -3,15 +3,47 @@
   "description": "Dispatches critical-result and report-ready notifications over the configured channels once a study's report is finalized and verified.",
   "url": "http://communications:8106/",
   "version": "0.1.0",
-  "capabilities": { "streaming": true, "pushNotifications": true },
-  "defaultInputModes": ["application/json"],
-  "defaultOutputModes": ["application/json"],
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": true
+  },
+  "defaultInputModes": [
+    "application/json"
+  ],
+  "defaultOutputModes": [
+    "application/json"
+  ],
   "skills": [
     {
       "id": "comms.dispatch",
-      "name": "Dispatch notifications",
-      "description": "Sends result notifications over configured channels; returns dispatchStatus and per-channel results. When the input carries an `escalation` slice (a fired sign-off ladder rung, #29 -- see escalation-policy.schema.json $defs/dispatchEscalation), its channels override urgency-based selection.",
-      "tags": ["communications", "notification", "dispatch"]
+      "name": "Dispatch critical-result notification",
+      "description": "Classify the finding (ACR), page the right provider, and open an acknowledgement clock. When the input carries an `escalation` slice (a fired sign-off ladder rung, #29 -- see escalation-policy.schema.json $defs/dispatchEscalation), its channels override urgency-based selection.",
+      "tags": [
+        "communications",
+        "notification",
+        "dispatch",
+        "acr"
+      ]
+    },
+    {
+      "id": "comms.checkAck",
+      "name": "Check acknowledgement",
+      "description": "Poll the acknowledgement Task for a sent notification; reports status and whether it is overdue.",
+      "tags": [
+        "communications",
+        "acknowledgement",
+        "task"
+      ]
+    },
+    {
+      "id": "comms.escalate",
+      "name": "Escalate to on-call",
+      "description": "Escalate an unacknowledged critical result to the on-call provider (new notification + ack Task).",
+      "tags": [
+        "communications",
+        "escalation",
+        "on-call"
+      ]
     }
   ]
 }

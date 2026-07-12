@@ -21,9 +21,15 @@ def contracts_dir() -> Path:
 
 
 def skill_schema(skill_id: str) -> Path:
-    # skill_id like "triage.score" -> contracts/skills/triage.schema.json
+    # Prefer a per-skill file `<skill_id>.schema.json` (e.g. comms.dispatch.schema.json when an
+    # agent serves several skills, #52); fall back to `<domain>.schema.json` for the one-skill
+    # agents (e.g. triage.score -> triage.schema.json).
+    skills = contracts_dir() / "skills"
+    per_skill = skills / f"{skill_id}.schema.json"
+    if per_skill.exists():
+        return per_skill
     domain = skill_id.split(".", 1)[0]
-    return contracts_dir() / "skills" / f"{domain}.schema.json"
+    return skills / f"{domain}.schema.json"
 
 
 def card_path(agent_dir_name: str) -> Path:

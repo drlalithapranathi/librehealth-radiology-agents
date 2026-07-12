@@ -64,7 +64,7 @@ def _load_mock_handle():
 
 async def _comms_handle(skill_id: str, payload: dict) -> dict:
     """Communications mock (comms.dispatch) — kept here, not in mocks/mock_agent.py, so #19
-    stays Chaitra's to finish. Output must satisfy contracts/skills/comms.schema.json."""
+    stays Chaitra's to finish. Output must satisfy contracts/skills/comms.dispatch.schema.json."""
     wf = payload.get("studyContext", {}).get("workflowId", "wf_mock")
     return {
         "schemaVersion": "1.0.0", "workflowId": wf, "dispatchStatus": "SENT",
