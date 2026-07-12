@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "1.0.0",
+  "workflowId": "wf_fx",
+  "dispatchStatus": "SENT",
+  "acrCategory": "Cat2",
+  "communicationId": "Communication/comm-1",
+  "taskId": "Task/task-1",
+  "deadline": "2026-07-12T00:00:00Z",
+  "recipient": "Practitioner/9",
+  "agentVersion": "0.1.0",
+  "dispatchedAt": "2026-07-11T00:00:00Z"
+}

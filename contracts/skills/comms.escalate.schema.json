@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:skill:comms.escalate:output:1.0.0",
+  "title": "comms.escalate output (#52)",
+  "description": "Escalate an unacknowledged critical result to the on-call provider (new Communication + Task), or report there is no further escalation target.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "escalated",
+    "agentVersion",
+    "escalatedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "workflowId": {
+      "type": "string"
+    },
+    "escalated": {
+      "type": "boolean"
+    },
+    "newCommunicationId": {
+      "type": "string"
+    },
+    "newTaskId": {
+      "type": "string"
+    },
+    "newDeadline": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "reason": {
+      "type": "string",
+      "description": "Why escalation did/didn't proceed (e.g. no on-call configured)."
+    },
+    "agentVersion": {
+      "type": "string"
+    },
+    "escalatedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "input": {
+      "$id": "urn:lhrad:skill:comms.escalate:input:1.0.0",
+      "title": "comms.escalate input",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "studyContext",
+        "taskId"
+      ],
+      "properties": {
+        "studyContext": {
+          "type": "object"
+        },
+        "taskId": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

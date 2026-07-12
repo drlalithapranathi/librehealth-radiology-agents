@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:skill:comms.checkAck:output:1.0.0",
+  "title": "comms.checkAck output (#52)",
+  "description": "Poll the acknowledgement Task for a sent critical-result notification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "taskId",
+    "ackStatus",
+    "deadline",
+    "overdue",
+    "agentVersion",
+    "checkedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "workflowId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "ackStatus": {
+      "type": "string",
+      "enum": [
+        "REQUESTED",
+        "COMPLETED",
+        "OVERDUE"
+      ]
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "overdue": {
+      "type": "boolean"
+    },
+    "agentVersion": {
+      "type": "string"
+    },
+    "checkedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "input": {
+      "$id": "urn:lhrad:skill:comms.checkAck:input:1.0.0",
+      "title": "comms.checkAck input",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "studyContext",
+        "taskId"
+      ],
+      "properties": {
+        "studyContext": {
+          "type": "object"
+        },
+        "taskId": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

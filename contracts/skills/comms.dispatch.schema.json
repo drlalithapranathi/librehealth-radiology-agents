@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:skill:comms.dispatch:output:1.0.0",
+  "title": "comms.dispatch output (CritCom Communications Agent, #52)",
+  "description": "Classify the finding (ACR), page the right provider, open an acknowledgement clock. `acrCategory` is optional/informational (audit/RIS); the orchestrator acts on `taskId`+`deadline`. `channelResults` is the legacy #17 channel shape, kept optional through the CritCom transition (MR 3 switches dispatch to Communication/Task).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "dispatchStatus",
+    "agentVersion",
+    "dispatchedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "workflowId": {
+      "type": "string"
+    },
+    "dispatchStatus": {
+      "type": "string",
+      "enum": [
+        "SENT",
+        "QUEUED",
+        "FAILED",
+        "PARTIAL",
+        "SKIPPED"
+      ],
+      "description": "SKIPPED = ACR Cat3/None: not a critical result, no page."
+    },
+    "acrCategory": {
+      "type": "string",
+      "enum": [
+        "Cat1",
+        "Cat2",
+        "Cat3",
+        "None"
+      ],
+      "description": "ACR actionable-findings category. Informational (audit/RIS); optional."
+    },
+    "communicationId": {
+      "type": "string",
+      "description": "FHIR Communication id in the comms-ledger (when a page was sent)."
+    },
+    "taskId": {
+      "type": "string",
+      "description": "FHIR Task id tracking the ack (when a page was sent)."
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Ack deadline; the orchestrator's ack timer fires here."
+    },
+    "recipient": {
+      "type": "string",
+      "description": "Practitioner reference the notification was sent to."
+    },
+    "channelResults": {
+      "type": "array",
+      "description": "Legacy per-channel dispatch results (#17).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "channel",
+          "status"
+        ],
+        "properties": {
+          "channel": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "agentVersion": {
+      "type": "string"
+    },
+    "dispatchedAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "input": {
+      "$id": "urn:lhrad:skill:comms.dispatch:input:1.0.0",
+      "title": "comms.dispatch input",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "studyContext"
+      ],
+      "properties": {
+        "studyContext": {
+          "type": "object"
+        },
+        "diagnosticReportId": {
+          "type": "string"
+        },
+        "patientId": {
+          "type": "string"
+        },
+        "serviceRequestId": {
+          "type": "string"
+        },
+        "report": {
+          "type": "object"
+        },
+        "impression": {
+          "type": "object"
+        },
+        "verification": {
+          "type": "object"
+        },
+        "escalation": {
+          "type": "object",
+          "description": "A fired sign-off escalation rung (#29). Authoritative shape: contracts/escalation-policy.schema.json $defs/dispatchEscalation — typed loosely here for the same reason studyContext/report/impression are (the slice is validated against its own schema where it is produced, in the orchestrator). The ladder has already chosen the audience (targetRole), the channels, and the urgency, so the agent dispatches it verbatim rather than re-deriving criticality. Absent on the routine COMMUNICATE hand-off."
+        }
+      }
+    }
+  }
+}
