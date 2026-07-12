@@ -147,6 +147,10 @@ services:
       # so missing credentials fail SILENTLY (#53). Dev-stack values = the o3 admin account.
       FHIR2_BASIC_USER: admin
       FHIR2_BASIC_PASS: Admin123
+      # Pre-sign impression draft (#26) codes its DiagnosticReport with a real OpenMRS Concept
+      # (fhir2 rejects a text-only code with codeRequired). Defaults in-code to the CIEL
+      # "Provisional diagnosis" concept; set FHIR2_PRESIGN_REPORT_CONCEPT to a deployment's own
+      # radiology-report concept UUID to override.
       ORTHANC_BASE_URL: http://orthanc:8042
     ports: ["8090:8090"]
     depends_on: [temporal, openmrs, orthanc]

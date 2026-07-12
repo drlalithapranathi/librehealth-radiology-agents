@@ -1,6 +1,8 @@
 """Thin OpenMRS fhir2 (FHIR R4) client. Mostly READ-ONLY (see architecture notes: Risk R1);
-`write_presign_impression` (#26) is the one write path, confirmed feasible by the R1 spike
-(DiagnosticReport create/update is wired on the live fhir2 build).
+`write_presign_impression` (#26) is the one write path. Verified live against the docker o3
+build: DiagnosticReport create/update works only when `code` resolves to a real Concept (a
+text-only code 500s with codeRequired), and the idempotency lookup searches by `subject`
+because `based-on` and `status` both 400 on this fhir2.
 
 Methods are stubs for M0; wire to the live fhir2 base URL in M1. Every agent that needs
 clinical data uses THIS client (lean-reference: fetch from source, do not pass PHI in messages).
@@ -24,6 +26,19 @@ def _basic_auth_from_env() -> Optional[tuple[str, str]]:
     if bool(user) != bool(password):
         raise ValueError("FHIR2_BASIC_USER and FHIR2_BASIC_PASS must be set together")
     return (user, password) if user else None
+
+
+# OpenMRS fhir2 requires a DiagnosticReport.code that resolves to a real Concept: a text-only code
+# (or an unmapped LOINC) maps to code=null and the create 500s (codeRequired). This is the concept
+# the pre-sign draft (#26) is coded with, overridable per deployment. The default is the CIEL
+# "Provisional diagnosis" concept, which ships with the reference dictionary and reads as a
+# preliminary, non-final AI impression. A deployment with a dedicated radiology-report concept sets
+# FHIR2_PRESIGN_REPORT_CONCEPT to that concept's UUID.
+_DEFAULT_PRESIGN_REPORT_CONCEPT = "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
+def _presign_report_concept() -> str:
+    return os.environ.get("FHIR2_PRESIGN_REPORT_CONCEPT", _DEFAULT_PRESIGN_REPORT_CONCEPT)
 
 
 class Fhir2Client:
@@ -210,19 +225,23 @@ class Fhir2Client:
         (issue #26) -- advisory only, never transitioned to `final`; the radiologist's own signed
         report is a separate `final` DiagnosticReport the RIS creates on sign-off.
 
+        `code` references a real OpenMRS Concept by UUID (see `_presign_report_concept`): live
+        fhir2 rejects a text-only code with 500 codeRequired, so the human label rides in
+        `code.text` while `code.coding` drives the concept resolution.
+
         Idempotent per order: a pre-sign re-run (e.g. more aiFindings tools complete) updates the
-        SAME draft instead of accumulating duplicates, found via `_find_presign_draft`. `status`
-        is deliberately NOT sent as a search param -- the #3 spike found `DiagnosticReport?status=`
-        400s on live fhir2 -- so the preliminary/final distinction is filtered client-side there,
-        same as `poll_finalized_reports`.
+        SAME draft instead of accumulating duplicates, found via `_find_presign_draft`.
 
         Returns the written DiagnosticReport's bare id.
         """
-        existing_id = await self._find_presign_draft(service_request_ref)
+        existing_id = await self._find_presign_draft(service_request_ref, patient_ref)
         resource = {
             "resourceType": "DiagnosticReport",
             "status": "preliminary",
-            "code": {"text": "AI pre-sign impression draft"},
+            "code": {
+                "coding": [{"code": _presign_report_concept()}],
+                "text": "AI pre-sign impression draft",
+            },
             "subject": {"reference": patient_ref},
             "basedOn": [{"reference": service_request_ref}],
             "conclusion": impression_text,
@@ -234,14 +253,24 @@ class Fhir2Client:
             written = await self._post("DiagnosticReport", resource)
         return written["id"]
 
-    async def _find_presign_draft(self, service_request_ref: str) -> Optional[str]:
+    async def _find_presign_draft(self, service_request_ref: str, patient_ref: str) -> Optional[str]:
         """The `preliminary` DiagnosticReport a prior `write_presign_impression` call already
         created for this order, if any -- the idempotency key an update reuses instead of
-        duplicating. Searches by `based-on` only (see `write_presign_impression` on `status`)."""
-        bundle = await self._get("DiagnosticReport", {"based-on": service_request_ref})
+        duplicating.
+
+        Searches by `subject` (the patient), then filters client-side to a `preliminary` report
+        whose `basedOn` points at this order. Neither `based-on` nor `status` can be a search param:
+        both 400 on live fhir2 ("does not know how to handle GET operation[DiagnosticReport] with
+        parameters"), even though `basedOn` DOES round-trip on the resource body."""
+        bundle = await self._get("DiagnosticReport", {"subject": patient_ref})
         for entry in bundle.get("entry", []) or []:
             resource = entry.get("resource") or {}
-            if resource.get("resourceType") == "DiagnosticReport" and resource.get("status") == "preliminary":
+            if resource.get("resourceType") != "DiagnosticReport":
+                continue
+            if resource.get("status") != "preliminary":
+                continue
+            based_on = [ref.get("reference") for ref in (resource.get("basedOn") or [])]
+            if service_request_ref in based_on:
                 return resource.get("id")
         return None
 

@@ -239,14 +239,17 @@ def test_write_presign_impression_creates_when_no_existing_draft():
     report_id = asyncio.run(client.write_presign_impression(
         "ServiceRequest/sr-1", "Patient/pat-1", "No acute findings identified."))
 
-    # Searches by `based-on` only -- NOT `status`, which 400s on live fhir2 (#3 spike).
-    assert get_calls == [("DiagnosticReport", {"based-on": "ServiceRequest/sr-1"})]
+    # Searches by `subject` -- NOT `based-on` or `status`, both of which 400 on live fhir2.
+    assert get_calls == [("DiagnosticReport", {"subject": "Patient/pat-1"})]
     assert post_calls[0][0] == "DiagnosticReport"
     posted = post_calls[0][1]
     assert posted["status"] == "preliminary"
     assert posted["subject"] == {"reference": "Patient/pat-1"}
     assert posted["basedOn"] == [{"reference": "ServiceRequest/sr-1"}]
     assert posted["conclusion"] == "No acute findings identified."
+    # code must resolve to a real Concept (coding.code = a concept UUID); text-only 500s on fhir2.
+    assert posted["code"]["coding"][0]["code"] == "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    assert posted["code"]["text"] == "AI pre-sign impression draft"
     assert "id" not in posted  # a create, not an update
     assert report_id == "new-draft-1"
 
@@ -256,7 +259,9 @@ def test_write_presign_impression_updates_the_existing_draft():
     put_calls = []
 
     async def fake_get(path, params=None):
-        return _bundle({"resourceType": "DiagnosticReport", "id": "draft-9", "status": "preliminary"})
+        # The subject search returns this order's preliminary draft (matched client-side by basedOn).
+        return _bundle({"resourceType": "DiagnosticReport", "id": "draft-9", "status": "preliminary",
+                        "basedOn": [{"reference": "ServiceRequest/sr-1"}]})
 
     async def fake_put(path, resource):
         put_calls.append((path, resource))
@@ -277,29 +282,38 @@ def test_write_presign_impression_updates_the_existing_draft():
     assert report_id == "draft-9"
 
 
-def test_find_presign_draft_ignores_non_preliminary_reports():
-    """A prior order can carry a `final` DiagnosticReport (a signed report from a prior study,
-    or even this one already signed) -- only a `preliminary` one is this draft's idempotency key."""
+def test_find_presign_draft_matches_preliminary_for_this_order_only():
+    """The subject search returns every report for the patient. Only a `preliminary` one whose
+    `basedOn` points at THIS order is the idempotency key: a `final` report (already signed) and a
+    `preliminary` draft for a DIFFERENT order must both be ignored."""
     client = Fhir2Client()
+    seen_params = {}
 
     async def fake_get(path, params=None):
+        seen_params.update(params or {})
         return _bundle(
-            {"resourceType": "DiagnosticReport", "id": "final-1", "status": "final"},
-            {"resourceType": "DiagnosticReport", "id": "draft-2", "status": "preliminary"},
+            {"resourceType": "DiagnosticReport", "id": "final-1", "status": "final",
+             "basedOn": [{"reference": "ServiceRequest/sr-1"}]},
+            {"resourceType": "DiagnosticReport", "id": "other-order", "status": "preliminary",
+             "basedOn": [{"reference": "ServiceRequest/sr-99"}]},
+            {"resourceType": "DiagnosticReport", "id": "draft-2", "status": "preliminary",
+             "basedOn": [{"reference": "ServiceRequest/sr-1"}]},
         )
 
     client._get = fake_get  # type: ignore[assignment]
-    assert asyncio.run(client._find_presign_draft("ServiceRequest/sr-1")) == "draft-2"
+    assert asyncio.run(client._find_presign_draft("ServiceRequest/sr-1", "Patient/pat-1")) == "draft-2"
+    assert seen_params == {"subject": "Patient/pat-1"}  # searched by subject, not based-on/status
 
 
 def test_find_presign_draft_none_when_no_preliminary_report():
     client = Fhir2Client()
 
     async def fake_get(path, params=None):
-        return _bundle({"resourceType": "DiagnosticReport", "id": "final-1", "status": "final"})
+        return _bundle({"resourceType": "DiagnosticReport", "id": "final-1", "status": "final",
+                        "basedOn": [{"reference": "ServiceRequest/sr-1"}]})
 
     client._get = fake_get  # type: ignore[assignment]
-    assert asyncio.run(client._find_presign_draft("ServiceRequest/sr-1")) is None
+    assert asyncio.run(client._find_presign_draft("ServiceRequest/sr-1", "Patient/pat-1")) is None
 
 
 # ---- basic auth from env (issue #53) ----------------------------------------------
