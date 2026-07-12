@@ -153,6 +153,19 @@ services:
       # The agent creates Communication/Task with server-assigned ids, and seeds the on-call
       # directory by PUTting Practitioner/PractitionerRole at known ids.
       hapi.fhir.allow_external_references: "true"
+      # The ledger deliberately holds RELATIVE references to resources that live in fhir2, not here:
+      # Communication.subject and Task.for point at Patient/*, and basedOn/about point at
+      # ServiceRequest/*. Those must NOT exist in the ledger (fhir2 is the only source of clinical
+      # truth, never copied in). Two things break without this:
+      #   1. HAPI enforces referential integrity on write by default and rejects such a reference
+      #      with HTTP 400 (HAPI-1094 "Resource Patient/... not found"), so every ledger write fails.
+      #   2. Even with integrity off, HAPI does not INDEX a reference whose target is absent, so
+      #      search_communications by based-on/subject silently returns nothing (a lost audit trail).
+      # Auto-creating an empty placeholder target (no clinical content, just a typed id) fixes both:
+      # the write passes integrity and the reference indexes, so the audit-by-order search works.
+      # Verified end-to-end against this HAPI image (create + for-alias + read-modify-write +
+      # search-by-based-on + audit join, all green).
+      hapi.fhir.auto_create_placeholder_reference_targets: "true"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/fhir/metadata"]
       interval: 15s
