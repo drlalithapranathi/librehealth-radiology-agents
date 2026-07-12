@@ -731,3 +731,81 @@ def test_presign_draft_lookup_ignores_a_FINAL_report():
     client._get, client._post, client._put = fake_get, fake_post, fake_put  # type: ignore[assignment]
     assert asyncio.run(client.write_presign_impression(
         "ServiceRequest/sr-1", "Patient/p1", "text")) == "our-new-draft"
+
+
+# --- typed clinical reads for the Communications Agent (#52) -------------------------
+# Read-only: fhir2 stays the source of clinical context. The notification and its ack are
+# written to the comms ledger instead (see test_comms_ledger.py).
+
+def test_get_diagnostic_report_returns_the_whole_typed_report():
+    """Distinct from get_report_conclusion (#16), which returns only the narrative. CritCom
+    decides who to call and how loudly from the ACR extension too, so it needs the resource."""
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(path)
+        return {"resourceType": "DiagnosticReport", "id": "rep-1", "status": "final",
+                "subject": {"reference": "Patient/p1"},
+                "basedOn": [{"reference": "ServiceRequest/sr-1"}],
+                "conclusion": "Large tension pneumothorax.",
+                "extension": [{"url": "http://critcom/StructureDefinition/acr-category",
+                               "valueCode": "Cat1"}]}
+
+    client._get = fake_get  # type: ignore[assignment]
+    report = asyncio.run(client.get_diagnostic_report("rep-1"))
+
+    assert calls == ["DiagnosticReport/rep-1"]      # bare id gets prefixed
+    assert report.conclusion == "Large tension pneumothorax."
+    assert report.acr_category == "Cat1"
+    assert report.service_request_id == "sr-1"
+    assert report.patient_id == "p1"
+
+
+def test_get_diagnostic_report_accepts_a_qualified_ref_and_empty_id():
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(path)
+        return {"resourceType": "DiagnosticReport", "id": "rep-1", "status": "final"}
+
+    client._get = fake_get  # type: ignore[assignment]
+    asyncio.run(client.get_diagnostic_report("DiagnosticReport/rep-1"))
+    assert calls == ["DiagnosticReport/rep-1"]      # not double-prefixed
+    assert asyncio.run(client.get_diagnostic_report("")) is None
+    assert calls == ["DiagnosticReport/rep-1"]      # empty id makes no call
+
+
+def test_get_service_request_reads_the_order_by_id():
+    client = Fhir2Client()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(path)
+        return {"resourceType": "ServiceRequest", "id": "sr-1", "status": "active",
+                "priority": "stat", "subject": {"reference": "Patient/p1"},
+                "requester": {"reference": "Practitioner/dr-1"}}
+
+    client._get = fake_get  # type: ignore[assignment]
+    order = asyncio.run(client.get_service_request("sr-1"))
+
+    assert calls == ["ServiceRequest/sr-1"]
+    assert order.priority == "stat"                 # drives how loudly CritCom escalates
+    assert order.requester.reference == "Practitioner/dr-1"   # the physician to notify
+
+
+def test_missing_report_or_order_is_none_not_a_crash():
+    """A 404 degrades to None so the agent can fall back, rather than failing the dispatch."""
+    import httpx
+
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        request = httpx.Request("GET", "http://fhir/x")
+        raise httpx.HTTPStatusError(
+            "not found", request=request, response=httpx.Response(404, request=request))
+
+    client._get = fake_get  # type: ignore[assignment]
+    assert asyncio.run(client.get_diagnostic_report("nope")) is None
+    assert asyncio.run(client.get_service_request("nope")) is None

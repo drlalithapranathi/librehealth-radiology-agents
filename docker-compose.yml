@@ -133,6 +133,47 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
     depends_on: [temporal]
 
+  # --- Comms ledger (#52): the Communications Agent's write store -----------------
+  # A SEPARATE FHIR server, on purpose. The Communications Agent must durably record "we told
+  # someone" (Communication) and "did they acknowledge?" (Task, with the ack deadline on
+  # restriction.period), and look up who is on call (PractitionerRole). OpenMRS fhir2 implements
+  # NONE of those, and the locked decision keeps it a read-only source of clinical context — so
+  # these writes land here instead. fhir2 is still the only source of clinical truth: a report's
+  # content is always read from fhir2, never copied into this ledger. See
+  # libs/radagent-common/radagent_common/comms_ledger.py.
+  #
+  # H2 in-memory by default (hapi.fhir.* defaults): fine for the dev stack, wiped on `down`. A
+  # deployment points HAPI at a real database — this is a clinical-communication audit trail.
+  comms-ledger:
+    image: hapiproject/hapi:v7.4.0
+    ports: ["8108:8080"]
+    environment:
+      # R4 to match every other FHIR surface in the stack (fhir2 is R4).
+      hapi.fhir.fhir_version: R4
+      # The agent creates Communication/Task with server-assigned ids, and seeds the on-call
+      # directory by PUTting Practitioner/PractitionerRole at known ids.
+      hapi.fhir.allow_external_references: "true"
+      # The ledger deliberately holds RELATIVE references to resources that live in fhir2, not here:
+      # Communication.subject and Task.for point at Patient/*, and basedOn/about point at
+      # ServiceRequest/*. Those must NOT exist in the ledger (fhir2 is the only source of clinical
+      # truth, never copied in). Two things break without this:
+      #   1. HAPI enforces referential integrity on write by default and rejects such a reference
+      #      with HTTP 400 (HAPI-1094 "Resource Patient/... not found"), so every ledger write fails.
+      #   2. Even with integrity off, HAPI does not INDEX a reference whose target is absent, so
+      #      search_communications by based-on/subject silently returns nothing (a lost audit trail).
+      # Auto-creating an empty placeholder target (no clinical content, just a typed id) fixes both:
+      # the write passes integrity and the reference indexes, so the audit-by-order search works.
+      # Verified end-to-end against this HAPI image (create + for-alias + read-modify-write +
+      # search-by-based-on + audit join, all green).
+      hapi.fhir.auto_create_placeholder_reference_targets: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/fhir/metadata"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
+
   # --- Application services (M1) -------------------------------------------------
   orchestrator:
     build: { context: ., dockerfile: orchestrator/Dockerfile }

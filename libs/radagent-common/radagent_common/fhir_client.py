@@ -12,6 +12,13 @@ from typing import Any, Optional
 import os
 import httpx
 
+from .fhir_models import DiagnosticReport, ServiceRequest
+
+
+def _typed_ref(resource_type: str, id_or_ref: str) -> str:
+    """Accept a bare id ('abc') or an already-qualified reference ('DiagnosticReport/abc')."""
+    return id_or_ref if "/" in id_or_ref else f"{resource_type}/{id_or_ref}"
+
 
 def _basic_auth_from_env() -> Optional[tuple[str, str]]:
     """(user, pass) for live fhir2, or None to stay unauthenticated (mocks, unit tests).
@@ -217,6 +224,45 @@ class Fhir2Client:
         resource = await self._get(ref)
         conclusion = resource.get("conclusion")
         return conclusion if isinstance(conclusion, str) and conclusion.strip() else None
+
+    # --- typed clinical reads for the Communications Agent (#52) ---------------------
+    # CritCom decides WHO to call and HOW LOUDLY from the report and its order, so it needs the
+    # whole resource, not just the conclusion: the ACR-category extension, presentedForm, and the
+    # order's priority/requester. Both are READ-ONLY -- fhir2 stays a source of clinical context
+    # (the notification and its ack are written to the comms ledger; see comms_ledger.py).
+
+    async def get_diagnostic_report(self, diagnostic_report_id: str) -> Optional[DiagnosticReport]:
+        """GET DiagnosticReport/{id} as a typed model. None if the id is empty or it is missing.
+
+        Distinct from `get_report_conclusion`, which returns just the narrative for Impression
+        Generation's keyword scan (#16). The Communications Agent needs the whole report.
+        """
+        if not diagnostic_report_id:
+            return None
+        ref = _typed_ref("DiagnosticReport", diagnostic_report_id)
+        try:
+            return DiagnosticReport.model_validate(await self._get(ref))
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
+    async def get_service_request(self, service_request_id: str) -> Optional[ServiceRequest]:
+        """GET ServiceRequest/{id} as a typed model -- the order behind a report. None if missing.
+
+        Read by id ONLY. `ServiceRequest?identifier=` (the DICOM accession) is NOT supported by the
+        deployed fhir2 -- it 400s, and the field is absent from the resource entirely -- so the
+        accession join stays where it is (#11), and this is the by-reference read that works.
+        """
+        if not service_request_id:
+            return None
+        ref = _typed_ref("ServiceRequest", service_request_id)
+        try:
+            return ServiceRequest.model_validate(await self._get(ref))
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
 
     async def write_presign_impression(
         self, service_request_ref: str, patient_ref: str, impression_text: str,
