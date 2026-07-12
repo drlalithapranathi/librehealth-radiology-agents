@@ -33,6 +33,12 @@ def callback_base_url() -> str:
     return os.environ.get("INGRESS_CALLBACK_BASE_URL", "http://ingress:8090").rstrip("/")
 
 
+def worklist_api_base_url() -> str:
+    """Where the orchestrator publishes triage priority (issue #20 + follow-up).
+    Env override -> docker-compose default. Consumed by publish_priority_activity."""
+    return os.environ.get("WORKLIST_API_URL", "http://worklist-api:8107").rstrip("/")
+
+
 def agent_base_url(agent: str) -> str:
     """Resolve an agent base URL (env override -> docker-compose default)."""
     defaults = {
