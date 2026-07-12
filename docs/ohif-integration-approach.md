@@ -16,7 +16,7 @@ proceed without re-litigating the scope.
    `StudyDate` desc; there is no DICOM search parameter for "priority" and
    never will be, because priority lives outside DICOM.
 2. **Priors and overlays surfaced at read time.** Priors come from the EHR
-   Assistant's context packet (#4). Overlays reference Interpretation
+   Assistant's context packet (#13). Overlays reference Interpretation
    Assistant SC output. Both need to appear as panels alongside the images.
 3. **`StudyOpenedEvent` emission** when a radiologist opens a study.
    Contract: `contracts/events/ohif-opened.schema.json`. Enables read-time
