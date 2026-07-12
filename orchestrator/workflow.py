@@ -58,6 +58,15 @@ PUSH_RESULT_CAP = 32
 # own history deterministically, so inserting activity calls mid-path is a breaking change for
 # every study already past that point. See the call site in run().
 PATCH_PRESIGN_IMPRESSION = "presign-impression-v1"
+# Temporal patch marker for the escalation-policy dead-letter write (#54). Same hazard as the
+# presign marker: this inserts a new activity command into the sign-off-gate fallback branch, a
+# path that studies parked at the gate have ALREADY walked. Without the guard, replaying such a
+# study's history against this code finds a command that was not there when it ran and fails with
+# NondeterminismError -- wedged mid-gate. Worse, the fallback fires precisely when the policy is
+# broken, so deploying this fix could wedge many parked studies at once. patched() makes an OLD
+# history skip the write (it never happened for that study) while every NEW study records it.
+# Retire the marker (-> workflow.deprecate_patch) only once no pre-#54 workflow is open.
+PATCH_POLICY_DEAD_LETTER = "policy-dead-letter-v1"
 # Shared activity-retry config (#29): the non-idempotent activities -- starting a push skill and
 # firing an escalation page each mint a fresh side effect on every attempt -- and the policy loader
 # (a deterministic failure that a retry won't fix) share ONE bounded policy instead of an ad-hoc
@@ -287,7 +296,11 @@ class StudyWorkflow:
             workflow.logger.warning(
                 "escalation policy unavailable for %s; using legacy single-timeout gate", wf_id
             )
-            await self._record_policy_failure(wf_id, tier)
+            # Guarded so a study parked at the gate before this change replays deterministically
+            # (see PATCH_POLICY_DEAD_LETTER). The write is best-effort either way; the guard is
+            # about replay safety, not the write's own failure handling.
+            if workflow.patched(PATCH_POLICY_DEAD_LETTER):
+                await self._record_policy_failure(wf_id, tier)
             if not await self._ack_or_timeout(signoff_timeout_for(tier)):
                 await self._page(wf_id, reason, None)
             return
