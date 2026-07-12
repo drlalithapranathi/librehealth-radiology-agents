@@ -86,6 +86,20 @@ async def publish_priority(
         try:
             async with httpx.AsyncClient(timeout=timeout) as c:
                 resp = await c.post(url, json=payload)
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol) as e:
+            # The configured base_url is fundamentally unusable: a bad port, a
+            # bracketed host, a missing or unknown scheme. This is a config error,
+            # not a transient blip. Retrying the same URL fails identically, so give
+            # up now without burning the readiness-for-read budget. Caught explicitly
+            # because httpx.InvalidURL is NOT an httpx.HTTPError. Without this clause
+            # it escapes and breaks the never-raises contract, and because the
+            # activity runs under Temporal's unbounded retry it wedges the study at
+            # READY_FOR_READ forever instead of degrading to a logged visibility loss.
+            _log.warning(
+                "worklist publish skipped wf=%s study=%s: unusable WORKLIST_API_URL %r (%s, no retry)",
+                workflow_id, study_instance_uid, base_url, e,
+            )
+            return False
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             # Transient by classification: network hiccup, DNS blip, timeout.
             last_reason = f"network ({e.__class__.__name__}: {e})"
@@ -95,6 +109,18 @@ async def publish_priority(
             _log.warning(
                 "worklist publish failed after %s attempts wf=%s study=%s: %s",
                 _PUBLISH_MAX_ATTEMPTS, workflow_id, study_instance_uid, last_reason,
+            )
+            return False
+        except Exception as e:  # noqa: BLE001 (never-raises backstop)
+            # The docstring promises this helper NEVER raises: an escape here fails
+            # the publish activity and, under its unbounded retry, wedges the study.
+            # So we swallow any unforeseen error too, treating it as permanent (no
+            # retry) and logging it distinctly so a genuine bug still surfaces.
+            # asyncio.CancelledError is a BaseException, not an Exception, so
+            # Temporal activity cancellation still propagates through this clause.
+            _log.warning(
+                "worklist publish skipped wf=%s study=%s: unexpected %s: %s (no retry)",
+                workflow_id, study_instance_uid, e.__class__.__name__, e,
             )
             return False
 

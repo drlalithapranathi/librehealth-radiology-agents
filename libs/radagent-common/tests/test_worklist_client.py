@@ -324,6 +324,48 @@ def test_publish_priority_recovers_after_5xx_blip(monkeypatch):
     assert call_count == 2
 
 
+def test_publish_priority_swallows_malformed_url_never_raises(monkeypatch, caplog):
+    """A malformed WORKLIST_API_URL (here: an invalid port) makes httpx raise
+    httpx.InvalidURL, which is NOT an httpx.HTTPError. The helper must still swallow
+    it and return False. If it escaped, the publish activity would fail, and under
+    its unbounded Temporal retry (the same URL fails identically every time) that
+    would wedge the study at READY_FOR_READ forever. No network call is made and
+    there is no retry: URL parsing fails before the transport is ever reached."""
+    _zero_backoff(monkeypatch)  # prove the failure is NOT the retry path sleeping
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(handler)
+    _install(monkeypatch, transport)
+    with caplog.at_level("WARNING"):
+        ok = _run(publish_priority(
+            "http://[::bad",  # unparseable: invalid port -> httpx.InvalidURL
+            study_instance_uid="1.2.3", workflow_id="wf_1",
+            priority_tier="STAT", priority_score=95,
+        ))
+    assert ok is False
+    assert calls["n"] == 0  # never reached the transport; no wasted attempts
+    joined = " ".join(r.message for r in caplog.records)
+    assert "no retry" in joined
+    assert "wf_1" in joined
+
+
+def test_publish_priority_swallows_unusable_scheme_without_retry(monkeypatch):
+    """A base_url with no/unknown scheme raises httpx.UnsupportedProtocol. Like a
+    malformed URL it is a permanent config error, so the helper gives up after one
+    attempt rather than burning the full retry budget on a URL that can never work."""
+    _zero_backoff(monkeypatch)
+    ok = _run(publish_priority(
+        "worklist-api:8107",  # missing scheme -> httpx.UnsupportedProtocol
+        study_instance_uid="1.2.3", workflow_id="wf_1",
+        priority_tier="STAT", priority_score=95,
+    ))
+    assert ok is False  # swallowed, never raised
+
+
 def test_publish_priority_success_first_try_makes_only_one_call(monkeypatch):
     """Sanity: happy path should NOT retry; a successful publish must be one
     HTTP call, not the full attempt budget."""
