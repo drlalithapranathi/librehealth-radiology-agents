@@ -46,10 +46,21 @@ def _reset() -> None:
     _STATE["write_calls"] = []
     _STATE["write_should_fail"] = False
     _STATE["impression_should_fail"] = False
+    # A real (M3) tool ran. The pre-sign write is GATED on this (#26): with the v1 registry every
+    # finding is STUBBED, the impression falls through to its constant "no acute findings" text,
+    # and writing that into a chart ahead of the read is what the gate exists to prevent. Tests
+    # that want the v1 reality flip this to STUBBED.
+    _STATE["finding_status"] = "COMPLETE"
 
 
 @activity.defn(name="call_agent_skill_activity")
 async def mock_call_agent(agent: str, skill_id: str, payload: dict) -> dict:
+    if skill_id == "interpretation.runTools":
+        return {"schemaVersion": "1.0.0", "workflowId": payload["studyContext"]["workflowId"],
+                "findings": [{"toolId": "cxr-detect", "label": "pneumothorax",
+                              "status": _STATE["finding_status"]}],
+                "overallStatus": _STATE["finding_status"], "agentVersion": "mock",
+                "ranAt": "2026-06-26T00:00:00Z"}
     if skill_id == "impression.generate":
         _STATE["impression_calls"].append(payload)
         if _STATE["impression_should_fail"]:
@@ -192,4 +203,57 @@ def test_presign_generate_failure_does_not_strand_the_read():
                 await handle.signal(StudyWorkflow.report_finalized, {"diagnosticReportId": "DiagnosticReport/1"})
                 result = await handle.result()
         assert result["finalState"] == "ARCHIVED"
+    asyncio.run(scenario())
+
+
+# --- #26: the write is gated on the draft actually knowing something -----------------
+
+def test_stubbed_findings_write_nothing_into_the_chart():
+    """THE gate (#26, a hard condition of the amended locked decision).
+
+    In v1 the Interpretation registry returns every finding STUBBED with an empty label. The
+    impression then has nothing to work from and falls through to its constant fallback -- so
+    writing the draft would put a fixed NEGATIVE impression ("No acute findings identified..."),
+    authored by nobody, into EVERY patient's chart before the radiologist has read anything. That
+    is exactly the automation bias the post-sign rule existed to prevent.
+
+    The feature therefore stays inert until the real tools land in M3, and lights up on its own
+    when they do -- no flag to remember to flip.
+    """
+    async def scenario():
+        _reset()
+        _STATE["finding_status"] = "STUBBED"          # the v1 reality
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with _worker(env):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT_WITH_ORDER,
+                    id="wf-presign-stubbed", task_queue=TASK_QUEUE)
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                await handle.signal(StudyWorkflow.report_finalized,
+                                    {"diagnosticReportId": "DiagnosticReport/1"})
+                await handle.result()
+
+        # Nothing was drafted and nothing was written. The post-sign impression still runs.
+        assert _STATE["write_calls"] == []
+        presign_calls = [p for p in _STATE["impression_calls"] if "report" not in p]
+        assert presign_calls == [], "impression.generate must not even be asked pre-sign"
+    asyncio.run(scenario())
+
+
+def test_a_complete_finding_lets_the_draft_through():
+    """The flip side: once a real tool produces a COMPLETE finding, the draft is offered."""
+    async def scenario():
+        _reset()
+        _STATE["finding_status"] = "COMPLETE"
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with _worker(env):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT_WITH_ORDER,
+                    id="wf-presign-complete", task_queue=TASK_QUEUE)
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                await handle.signal(StudyWorkflow.report_finalized,
+                                    {"diagnosticReportId": "DiagnosticReport/1"})
+                await handle.result()
+
+        assert len(_STATE["write_calls"]) == 1
     asyncio.run(scenario())

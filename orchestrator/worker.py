@@ -34,20 +34,27 @@ async def _connect_with_retry(target: str, attempts: int = 60, delay: float = 2.
             await asyncio.sleep(delay)
 
 
+# The activity list the study worker serves. A module-level constant, not a literal buried in
+# main(), so test_worker_registration.py can assert it is COMPLETE against activities.py rather
+# than re-declaring a copy that would drift. An activity defined but missing from this list imports
+# fine and fails at RUNTIME, when the workflow dispatches a name the worker never registered (#26).
+ACTIVITIES = [
+    call_agent_skill_activity,
+    start_agent_skill_activity,
+    publish_priority_activity,
+    write_presign_impression_activity,
+    escalate_activity,
+    load_escalation_policy_activity,
+]
+
+
 async def main() -> None:
     client = await _connect_with_retry(TEMPORAL_TARGET)
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
         workflows=[StudyWorkflow],
-        activities=[
-            call_agent_skill_activity,
-            start_agent_skill_activity,
-            publish_priority_activity,
-            write_presign_impression_activity,
-            escalate_activity,
-            load_escalation_policy_activity,
-        ],
+        activities=ACTIVITIES,
     )
     await worker.run()
 

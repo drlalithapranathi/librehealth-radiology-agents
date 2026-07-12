@@ -53,6 +53,10 @@ PUSH_SKILL_ATTEMPTS = 3
 # Backstop bound on buffered push results (duplicate/orphaned taskIds an activity retry can
 # strand): dicts iterate in insertion order, so evicting the oldest entry is replay-deterministic.
 PUSH_RESULT_CAP = 32
+# Temporal patch marker for the pre-sign impression block (#26). A workflow's code must replay its
+# own history deterministically, so inserting activity calls mid-path is a breaking change for
+# every study already past that point. See the call site in run().
+PATCH_PRESIGN_IMPRESSION = "presign-impression-v1"
 # Shared activity-retry config (#29): the non-idempotent activities -- starting a push skill and
 # firing an escalation page each mint a fresh side effect on every attempt -- and the policy loader
 # (a deterministic failure that a retry won't fix) share ONE bounded policy instead of an ad-hoc
@@ -140,6 +144,22 @@ class StudyWorkflow:
         return {"studyContext": ctx, **derived}
 
     # ---- pre-sign impression assist (#26) -------------------------------------------
+    def _has_complete_finding(self) -> bool:
+        """Did any Interpretation tool actually produce a real result for this study?
+
+        The v1 registry returns every finding as STUBBED with an empty label -- no tool has run.
+        The impression then has nothing to work from and falls through to its constant fallback
+        ("No acute findings identified. Clinical correlation recommended."), so writing that draft
+        would put a fixed NEGATIVE impression, authored by nobody, into every patient's chart ahead
+        of the read. That is the automation bias the post-sign rule existed to prevent.
+
+        So the write is gated on the pre-sign draft actually knowing something: at least one
+        COMPLETE finding. Inert until the real tools land in M3, live automatically after.
+        A hard condition of the amended locked decision (CLAUDE.md, #26).
+        """
+        findings = (self._ai or {}).get("findings") or []
+        return any(f.get("status") == "COMPLETE" for f in findings)
+
     async def _presign_impression(self, ctx: dict) -> None:
         """Offer an aiFindings-only draft into the RIS while the radiologist is still reading.
 
@@ -147,6 +167,13 @@ class StudyWorkflow:
         so a down impression-generation agent or a failed fhir2 write never strands the human
         read that follows -- the v1 post-sign safety-net covers the study regardless.
         """
+        if not self._has_complete_finding():
+            workflow.logger.info(
+                "no COMPLETE aiFinding for %s; skipping the pre-sign draft (nothing to offer)",
+                ctx["workflowId"],
+            )
+            return
+
         try:
             impression = await workflow.execute_activity(
                 ACT_CALL_AGENT,
@@ -285,7 +312,15 @@ class StudyWorkflow:
         )
 
         # --- PRESIGN IMPRESSION (#26): offer an aiFindings-only draft ahead of the read -----
-        await self._presign_impression(ctx)
+        # Guarded by workflow.patched(): this block inserts activity commands into the middle of a
+        # path that in-flight studies have ALREADY walked. A study parked at the sign-off gate when
+        # the worker redeploys replays its history against the new code, finds commands that were
+        # not there when it ran, and fails with NondeterminismError -- wedged, mid-gate, on a study
+        # awaiting a radiologist. patched() makes the replay of an OLD history skip the block (it
+        # never happened for that study) while every NEW study takes it.
+        # Retire the marker (-> workflow.deprecate_patch) only once no pre-#26 workflow is open.
+        if workflow.patched(PATCH_PRESIGN_IMPRESSION):
+            await self._presign_impression(ctx)
 
         # --- AWAITING_RADIOLOGIST: block until the RIS report is finalized --------
         self._state = State.AWAITING_RADIOLOGIST
