@@ -23,7 +23,7 @@ from radagent_common.validation import validate_skill_output
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id
 from .state import TASK_QUEUE
 from .workflow import StudyWorkflow
-from .ingress_store import IngressStore
+from .ingress_store import IngressStore, default_store_path
 from . import activities
 
 TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
@@ -53,9 +53,11 @@ _STORE: IngressStore | None = None
 
 def _default_store_path() -> str:
     """Absolute + CWD-independent, so a restart from any working directory finds the same DB.
-    Production MUST override INGRESS_STORE_PATH to a durable *mounted volume* — a path inside the
-    container's own filesystem is wiped on redeploy, defeating the whole point."""
-    return os.environ.get("INGRESS_STORE_PATH") or str(paths.repo_root() / "ingress_state.db")
+
+    Delegates to ingress_store so the worker's dead-letter activity (#54) resolves the SAME file
+    from the other process in this container — one store, one /admin/dead-letters.
+    """
+    return default_store_path()
 
 
 def _store() -> IngressStore:
@@ -390,10 +392,17 @@ async def ris_event() -> dict:
 
 @app.get("/admin/dead-letters")
 async def dead_letters() -> dict:
-    """Sign-offs the poller permanently gave up on (#29): the report was delivered by the RIS
-    and mapped to a workflow, every signal attempt failed, and the workflow closed before one
-    landed. Rows carry IDs only (lean-reference, no PHI). Empty is the healthy state; anything
-    here needs a human to reconcile the study in the RIS against the orchestrator's history."""
+    """Everything the pipeline permanently gave up on. Rows carry IDs only (lean-reference, no
+    PHI). Empty is the healthy state; anything here needs a human. Read `kind`:
+
+    * `signoff-drop` (#29) — the RIS delivered a finalized report, it mapped to a workflow, every
+      signal attempt failed, and the workflow closed before one landed. Reconcile the study in the
+      RIS against the orchestrator's history.
+    * `escalation-policy-load-failure` (#54) — a sign-off gate could not load its escalation
+      ladder, so it fell back to a single flat page. The study is still escalated and readable, but
+      escalation is DEGRADED until the policy is fixed: check escalation-policy.yaml and any
+      ESCALATION_POLICY_PATH override.
+    """
     letters = _store().dead_letters()
     return {"count": len(letters), "deadLetters": letters}
 

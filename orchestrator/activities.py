@@ -12,7 +12,9 @@ import yaml
 from radagent_common.client import call_agent_skill, start_agent_skill
 from radagent_common.fhir_client import Fhir2Client
 from radagent_common.worklist_client import publish_priority as publish_priority_to_worklist
+from radagent_common.tracing import now_iso
 from . import state
+from .ingress_store import IngressStore, default_store_path
 
 
 @activity.defn(name=state.ACT_CALL_AGENT)
@@ -134,6 +136,33 @@ async def load_escalation_policy_activity(tier: str | None) -> list[dict]:
         if rung.get("repeat") and "repeatEveryMinutes" not in rung:
             raise ValueError(f"repeating escalation rung missing repeatEveryMinutes: {rung!r}")
     return levels
+
+
+@activity.defn(name=state.ACT_RECORD_POLICY_FAILURE)
+async def record_policy_failure_activity(workflow_id: str, tier: str | None, reason: str,
+                                         attempts: int) -> None:
+    """A sign-off gate could not load its escalation ladder -> make it operator-visible (#54).
+
+    The gate's soft fallback stays exactly as it was (one tier timeout, one flat page): a broken
+    policy deploy must degrade, never wedge. But degraded-and-silent is its own failure -- the
+    ladder collapses to a single page and the system looks healthy -- so record a dead letter on
+    the same surface an operator already watches, /admin/dead-letters, alongside the existing
+    warning log.
+
+    An activity because the workflow must stay deterministic (golden rule 5): this is the I/O.
+    Writes to the SAME sqlite store the ingress poller uses (see ingress_store.default_store_path);
+    the worker and the ingress share a container, so one file backs both writers and the endpoint.
+    """
+    store = IngressStore(default_store_path())
+    try:
+        store.add_policy_load_failure(workflow_id, tier, attempts, reason, now_iso())
+    finally:
+        store.close()
+    activity.logger.error(
+        "DEAD LETTER: escalation policy unavailable for %s (tier=%s) after %d attempt(s); the "
+        "sign-off gate fell back to a single flat page. See /admin/dead-letters",
+        workflow_id, tier or "unknown", attempts,
+    )
 
 
 @activity.defn(name=state.ACT_ESCALATE)
