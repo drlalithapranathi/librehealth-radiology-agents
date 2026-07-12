@@ -68,8 +68,15 @@ scripts/          validate_contracts.py (CI gate)
 - **Radiologist assignment is owned by LH-Radiology** (specialty + case importance + call
   times); the Worklist API reads it read-only and never writes it.
 - Worklist priority source of truth = orchestrator state; **no DICOM tag mutation**.
-- v1: Impression + Verification run **post-sign** as a read-only safety-net; contracts are
-  timing-agnostic so M2 can turn on pre-sign assist without changing them.
+- Verification runs **post-sign** as a read-only safety-net. **Pre-sign impression assist is
+  enabled (#26; PI + lead sign-off 2026-07-12):** the orchestrator may run `impression.generate`
+  before the read and offer the result into the RIS as a `preliminary` DiagnosticReport. This is
+  the **one authorized fhir2 write path**; fhir2 stays read-mostly otherwise. It carries three
+  hard conditions: the write is **best-effort and advisory** (a failure never strands the read);
+  it is **gated on at least one `COMPLETE` finding**, so it stays inert while the Interpretation
+  tools are stubbed (never write a constant fallback impression into a chart); and the draft is
+  **authorship-stamped** so it only ever updates its own draft, never a radiologist's. Contracts
+  stay timing-agnostic, so the M2 pre-sign turn-on needs no contract change.
 
 ## Run / verify
 ```bash
