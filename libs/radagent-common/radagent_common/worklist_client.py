@@ -8,24 +8,48 @@ orthanc_client.py and fhir_client.py.
 Best-effort by design (READ THIS): the publish is *visibility*, not
 *correctness*. If the Worklist API is unreachable when the orchestrator
 publishes a triage result, the study still gets interpreted, reported, and
-signed — it just doesn't show priority-ordered in OHIF until the next publish
-succeeds. So this helper NEVER raises; a failed publish is a WARNING log line
-and a falsy return value, not an exception that would fail the Temporal
-activity and block the workflow.
+signed — it just doesn't show priority-ordered in OHIF. So this helper NEVER
+raises; a failed publish is a WARNING log line and a falsy return value, not
+an exception that would fail the Temporal activity and block the workflow.
+
+Bounded self-heal (per #20 review): publish_priority_activity is called once
+per study on the way to READY_FOR_READ, and nothing republishes if that call
+loses to a 2-second network blip. The whole point of the feature is that an
+urgent study floats to the top of the reading list, so silently dropping the
+publish on a transient blip turns a cosmetic outage into a clinical
+prioritization failure. To self-heal transient blips without ever raising,
+the helper retries a bounded number of times inside itself (see
+_PUBLISH_MAX_ATTEMPTS below), with exponential backoff and jitter. Same
+philosophy as BOUNDED_ACTIVITY_RETRY in orchestrator/workflow.py.
+
+Retries fire on network errors and 5xx server responses; 4xx (client bug in
+the payload we sent — bad tier, out-of-range score) does NOT retry because
+the same payload will 422 forever. Any error path still returns False, never
+raises: the activity keeps its "workflow never fails on a publish outage"
+contract.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from typing import Optional
 
 import httpx
 
 _log = logging.getLogger(__name__)
 
-# Short timeout: this call is on the readiness-for-read path; a slow publish
-# should not stall the transition. Temporal activity retries with backoff give
-# us the eventual-consistency safety net.
+# Short per-attempt timeout: this call is on the readiness-for-read path; a
+# slow publish should not stall the transition. The bounded retry loop
+# (see _PUBLISH_MAX_ATTEMPTS) handles transient blips.
 _DEFAULT_TIMEOUT = 5.0
+
+# Bounded retry to self-heal transient blips without dragging the read path.
+# Mirrors orchestrator.workflow.BOUNDED_ACTIVITY_RETRY (maximum_attempts=3).
+# Worst-case retry latency at the current backoff (0.25s + 0.5s = 0.75s of
+# sleep) sits well under the activity's start_to_close_timeout budget.
+_PUBLISH_MAX_ATTEMPTS = 3
+_PUBLISH_BACKOFF_BASE = 0.25  # seconds; doubles per retry
 
 
 async def publish_priority(
@@ -38,14 +62,17 @@ async def publish_priority(
 ) -> bool:
     """POST the study's triage priority to the Worklist API.
 
-    Returns True on 2xx, False on any error (network, timeout, non-2xx). Never
-    raises. The caller (publish_priority_activity) uses the return value only
-    for its structured log line; there is no branching on it.
+    Returns True on 2xx, False on any error (network, timeout, non-2xx) after
+    bounded retries are exhausted. Never raises.
+
+    Retries: bounded internal loop on network errors and 5xx server errors.
+    Does NOT retry on 4xx (a Worklist API 422 means we sent a malformed
+    payload — retrying with the same body will fail identically). The caller
+    (publish_priority_activity) uses the return value only for its structured
+    log line; there is no branching on it.
 
     Payload shape matches integrations/worklist-api/main.py's PriorityPush
-    pydantic model — a Worklist API-side 422 (schema violation) means the
-    caller passed a bad tier or score and is a real bug worth logging, but
-    still not fatal to the workflow.
+    pydantic model.
     """
     url = base_url.rstrip("/") + "/priority"
     payload = {
@@ -54,25 +81,54 @@ async def publish_priority(
         "priorityTier": priority_tier,
         "priorityScore": priority_score,
     }
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as c:
-            resp = await c.post(url, json=payload)
-    except (httpx.HTTPError, httpx.TimeoutException) as e:
+    last_reason: Optional[str] = None
+    for attempt in range(1, _PUBLISH_MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                resp = await c.post(url, json=payload)
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            # Transient by classification: network hiccup, DNS blip, timeout.
+            last_reason = f"network ({e.__class__.__name__}: {e})"
+            if attempt < _PUBLISH_MAX_ATTEMPTS:
+                await _sleep_backoff(attempt)
+                continue
+            _log.warning(
+                "worklist publish failed after %s attempts wf=%s study=%s: %s",
+                _PUBLISH_MAX_ATTEMPTS, workflow_id, study_instance_uid, last_reason,
+            )
+            return False
+
+        if 200 <= resp.status_code < 300:
+            return True
+        if 400 <= resp.status_code < 500:
+            # Caller-side bug — same payload will 422 again. Log and give up.
+            _log.warning(
+                "worklist publish rejected wf=%s study=%s: HTTP %s %s (no retry, caller bug)",
+                workflow_id, study_instance_uid, resp.status_code, _brief(resp),
+            )
+            return False
+        # 5xx: server-side transient. Retry within budget.
+        last_reason = f"HTTP {resp.status_code} {_brief(resp)}"
+        if attempt < _PUBLISH_MAX_ATTEMPTS:
+            await _sleep_backoff(attempt)
+            continue
         _log.warning(
-            "worklist publish failed (network) wf=%s study=%s: %s",
-            workflow_id, study_instance_uid, e,
+            "worklist publish failed after %s attempts wf=%s study=%s: %s",
+            _PUBLISH_MAX_ATTEMPTS, workflow_id, study_instance_uid, last_reason,
         )
         return False
 
-    if resp.status_code >= 400:
-        # 422 in particular is a caller-side bug (bad tier/score) — log at
-        # WARNING with the response body for triage without failing the workflow.
-        _log.warning(
-            "worklist publish rejected wf=%s study=%s: HTTP %s %s",
-            workflow_id, study_instance_uid, resp.status_code, _brief(resp),
-        )
-        return False
-    return True
+    # Loop always returns from inside; this line is unreachable but keeps type
+    # checkers happy and marks the "should never happen" boundary explicitly.
+    return False
+
+
+async def _sleep_backoff(attempt: int) -> None:
+    """Exponential backoff with jitter — 0.25s / 0.5s / 1s in the base case,
+    ± up to 50% jitter to spread reconnect storms when the Worklist API
+    restarts and every in-flight workflow retries at once."""
+    base = _PUBLISH_BACKOFF_BASE * (2 ** (attempt - 1))
+    await asyncio.sleep(base * (1.0 + random.random() * 0.5))
 
 
 def _brief(resp: httpx.Response) -> str:

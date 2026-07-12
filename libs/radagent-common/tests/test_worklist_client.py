@@ -86,7 +86,15 @@ def test_publish_priority_trims_trailing_slash_on_base_url(monkeypatch):
 # --- Best-effort: never raise, return False -----------------------------------
 
 def test_publish_priority_swallows_connection_error(monkeypatch, caplog):
-    """The Worklist API being down at publish time must NOT fail the activity."""
+    """The Worklist API being down at publish time must NOT fail the activity.
+    Retry budget is exercised by the dedicated retry tests below; this one just
+    pins the final swallow behavior."""
+    import radagent_common.worklist_client as _wc
+
+    async def _instant(_attempt):  # skip backoff sleeps in this test
+        return None
+    monkeypatch.setattr(_wc, "_sleep_backoff", _instant)
+
     def refuse(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
@@ -104,6 +112,12 @@ def test_publish_priority_swallows_connection_error(monkeypatch, caplog):
 
 
 def test_publish_priority_swallows_timeout(monkeypatch, caplog):
+    import radagent_common.worklist_client as _wc
+
+    async def _instant(_attempt):
+        return None
+    monkeypatch.setattr(_wc, "_sleep_backoff", _instant)
+
     def slow(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("timed out", request=request)
 
@@ -121,7 +135,7 @@ def test_publish_priority_swallows_timeout(monkeypatch, caplog):
 def test_publish_priority_returns_false_on_422(monkeypatch, caplog):
     """The Worklist API rejects malformed payloads with 422. Even that must not
     raise — a bad tier/score in the triage output is a bug worth logging but not
-    a reason to fail the workflow."""
+    a reason to fail the workflow. 4xx does NOT retry (see dedicated test)."""
     transport, _ = _client_returning(422, body='{"detail":"invalid tier"}')
     _install(monkeypatch, transport)
     with caplog.at_level("WARNING"):
@@ -138,6 +152,12 @@ def test_publish_priority_returns_false_on_422(monkeypatch, caplog):
 
 
 def test_publish_priority_returns_false_on_500(monkeypatch, caplog):
+    import radagent_common.worklist_client as _wc
+
+    async def _instant(_attempt):
+        return None
+    monkeypatch.setattr(_wc, "_sleep_backoff", _instant)
+
     transport, _ = _client_returning(500, body="Internal Server Error")
     _install(monkeypatch, transport)
     ok = _run(publish_priority(
@@ -160,3 +180,167 @@ def test_publish_priority_success_on_200(monkeypatch):
         priority_tier="ROUTINE", priority_score=50,
     ))
     assert ok is True
+
+
+# --- Bounded retry behavior (added per #20 review feedback) -----------------
+# The helper must self-heal transient blips (network hiccup, Worklist API
+# restart) without ever raising or stalling the read path. These tests pin:
+#   * the retry count matches _PUBLISH_MAX_ATTEMPTS
+#   * 5xx retries but 4xx does not (same bad payload will 422 again)
+#   * a transient blip that recovers mid-loop actually succeeds
+# Backoff is monkey-patched to zero so tests stay fast.
+
+import radagent_common.worklist_client as _wc
+
+
+def _zero_backoff(monkeypatch):
+    """Patch backoff to zero — retries fire instantly. Preserves the retry
+    COUNT semantics we care about testing without slowing the suite."""
+    async def _instant(_attempt):
+        return None
+    monkeypatch.setattr(_wc, "_sleep_backoff", _instant)
+
+
+def test_publish_priority_retries_on_network_error_then_gives_up(monkeypatch, caplog):
+    """A persistent network outage should be tried _PUBLISH_MAX_ATTEMPTS times,
+    then log the final failure and return False. Never raises."""
+    _zero_backoff(monkeypatch)
+    call_count = 0
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        raise httpx.ConnectError("connection refused", request=request)
+
+    transport = httpx.MockTransport(refuse)
+    _install(monkeypatch, transport)
+    with caplog.at_level("WARNING"):
+        ok = _run(publish_priority(
+            "http://worklist-api:8107",
+            study_instance_uid="1.2.3", workflow_id="wf_1",
+            priority_tier="STAT", priority_score=95,
+        ))
+    assert ok is False
+    assert call_count == _wc._PUBLISH_MAX_ATTEMPTS
+    # Final log line should reference the attempt count so operators can
+    # distinguish "single blip" from "extended outage".
+    joined = " ".join(r.message for r in caplog.records)
+    assert f"after {_wc._PUBLISH_MAX_ATTEMPTS} attempts" in joined
+
+
+def test_publish_priority_retries_on_5xx_then_gives_up(monkeypatch, caplog):
+    """5xx is server-side transient — retry within budget."""
+    _zero_backoff(monkeypatch)
+    call_count = 0
+
+    def five_hundred(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(503, text="worklist-api restarting")
+
+    transport = httpx.MockTransport(five_hundred)
+    _install(monkeypatch, transport)
+    with caplog.at_level("WARNING"):
+        ok = _run(publish_priority(
+            "http://worklist-api:8107",
+            study_instance_uid="1.2.3", workflow_id="wf_1",
+            priority_tier="STAT", priority_score=95,
+        ))
+    assert ok is False
+    assert call_count == _wc._PUBLISH_MAX_ATTEMPTS
+
+
+def test_publish_priority_does_NOT_retry_on_4xx(monkeypatch, caplog):
+    """4xx = caller-side bug. The same bad payload will 422 forever, so retrying
+    just wastes latency budget. Try once, log, give up."""
+    _zero_backoff(monkeypatch)
+    call_count = 0
+
+    def bad_request(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(422, text='{"detail":"bad tier"}')
+
+    transport = httpx.MockTransport(bad_request)
+    _install(monkeypatch, transport)
+    with caplog.at_level("WARNING"):
+        ok = _run(publish_priority(
+            "http://worklist-api:8107",
+            study_instance_uid="1.2.3", workflow_id="wf_1",
+            priority_tier="BADTIER", priority_score=999,
+        ))
+    assert ok is False
+    assert call_count == 1  # exactly one attempt; no retries
+    joined = " ".join(r.message for r in caplog.records)
+    assert "no retry" in joined  # log spells it out for operators
+
+
+def test_publish_priority_recovers_after_transient_blip(monkeypatch):
+    """The whole point of the retry: a single transient blip self-heals.
+    Verify that if the first attempt fails but the second succeeds, we get
+    True back — the study's priority makes it to the store."""
+    _zero_backoff(monkeypatch)
+    call_count = 0
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise httpx.ConnectError("blip", request=request)
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(flaky)
+    _install(monkeypatch, transport)
+    ok = _run(publish_priority(
+        "http://worklist-api:8107",
+        study_instance_uid="1.2.3", workflow_id="wf_1",
+        priority_tier="STAT", priority_score=95,
+    ))
+    assert ok is True
+    assert call_count == 2  # recovered on the second attempt
+
+
+def test_publish_priority_recovers_after_5xx_blip(monkeypatch):
+    """Same recovery contract for a 5xx that clears on retry — the Worklist API
+    briefly restarts, then succeeds. Priority still makes it through."""
+    _zero_backoff(monkeypatch)
+    call_count = 0
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(502)
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(flaky)
+    _install(monkeypatch, transport)
+    ok = _run(publish_priority(
+        "http://worklist-api:8107",
+        study_instance_uid="1.2.3", workflow_id="wf_1",
+        priority_tier="URGENT", priority_score=70,
+    ))
+    assert ok is True
+    assert call_count == 2
+
+
+def test_publish_priority_success_first_try_makes_only_one_call(monkeypatch):
+    """Sanity: happy path should NOT retry; a successful publish must be one
+    HTTP call, not the full attempt budget."""
+    _zero_backoff(monkeypatch)
+    call_count = 0
+
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(204)
+
+    transport = httpx.MockTransport(ok_handler)
+    _install(monkeypatch, transport)
+    ok = _run(publish_priority(
+        "http://worklist-api:8107",
+        study_instance_uid="1.2.3", workflow_id="wf_1",
+        priority_tier="ROUTINE", priority_score=50,
+    ))
+    assert ok is True
+    assert call_count == 1  # exactly one; no wasted attempts
