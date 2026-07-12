@@ -52,3 +52,11 @@ def test_mg_selects_mammo_screen():
 def test_unknown_modality_returns_empty():
     tools = select_tools("XY", "UNKNOWN STUDY")
     assert tools == []
+
+def test_ct_multi_region_collects_all_matching_regions():
+    tools = select_tools("CT", "CT CHEST ABDOMEN PELVIS")
+    assert tools == ["lung-nodule-detect", "pe-detect", "liver-lesion-detect"]
+
+def test_ct_no_region_match_falls_back_to_star():
+    tools = select_tools("CT", "CT MISC PROTOCOL")
+    assert tools == ["generic-ct-screen"]

@@ -35,10 +35,20 @@ _REGISTRY: dict[str, dict[str, list[str]]] = {
 
 
 def select_tools(modality: str, description: str) -> list[str]:
-    """Return the tool list for a given modality and study description."""
+    """Return the tool list for a given modality and study description.
+
+    Collects tools from every matching body-part key (deduped, in registry
+    order) so multi-region studies run all applicable regional tools, not
+    just the first match. Falls back to "*" when no body-part key matches.
+    """
     desc = (description or "").lower()
     by_mod = _REGISTRY.get(modality, {})
+    matched: list[str] = []
     for key, tools in by_mod.items():
         if key != "*" and key in desc:
-            return tools
+            for tool in tools:
+                if tool not in matched:
+                    matched.append(tool)
+    if matched:
+        return matched
     return by_mod.get("*", [])
