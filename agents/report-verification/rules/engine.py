@@ -15,7 +15,23 @@ from pathlib import Path
 from typing import Any
 import yaml
 
+from rules.report_body import detect_laterality, parse_report_body
+
 _MISSING = object()
+
+
+def enrich_report_body(ctx: dict, narrative: str) -> None:
+    """Populate ctx['report']['body'] from the fetched report NARRATIVE (issue #22) so the
+    body-dependent rules have structured fields (laterality, sections, BI-RADS, density) to match
+    on, and derive the impression's own laterality from its text (the impression agent emits none)
+    for the laterality cross-check. Mutates ctx in place. Pure: the handler does the fetch, parsing
+    here has no I/O. An already-structured `report.body` dict is left untouched."""
+    report = ctx.setdefault("report", {})
+    if not isinstance(report.get("body"), dict):
+        report["body"] = parse_report_body(narrative)
+    impression = ctx.setdefault("impression", {})
+    if "derivedLaterality" not in impression:
+        impression["derivedLaterality"] = detect_laterality(impression.get("impressionText") or "")
 
 
 @dataclass
@@ -62,8 +78,11 @@ def _truthy_problem(when: dict, ctx: dict) -> bool:
     if op == "not_exists":  return left is _MISSING
     if op == "empty":       return left is _MISSING or left in ([], "", {}, None)
     if op == "non_empty":   return left is not _MISSING and bool(left)
-    if left is _MISSING or right is _MISSING:
-        return False  # cannot compare missing values -> rule does not fire
+    # equals/not_equals/contains/gt/lt need two real operands. A missing OR null value is not
+    # comparable, so the rule does not fire -- and gt/lt never raise on None (a parsed report.body
+    # carries its fields as null when absent, e.g. biradsAssessment on a non-mammography read).
+    if left is _MISSING or right is _MISSING or left is None or right is None:
+        return False
     if op == "equals":      return left == right
     if op == "not_equals":  return left != right
     if op == "contains":    return right in left

@@ -258,11 +258,16 @@ services:
       <<: *otel-env
       FHIR2_BASIC_USER: admin
       FHIR2_BASIC_PASS: Admin123
+  # report-verification reads the finalized report's conclusion from live fhir2 (#22) to parse
+  # report.body (laterality, sections, BI-RADS, density) for the PI rules — same credentials as
+  # impression-generation; without them every fetch 401s and the body rules silently stay inert.
   report-verification:
     build: { context: ., dockerfile: agents/report-verification/Dockerfile }
     ports: ["8105:8105"]
     environment:
       <<: *otel-env
+      FHIR2_BASIC_USER: admin
+      FHIR2_BASIC_PASS: Admin123
   # Worklist API (issue #20): serves OHIF a sorted reading worklist by joining Orthanc completed
   # studies + orchestrator triage priority + LH-Radiology assignment (read-only). Priority arrives
   # via POST /priority from orchestrator/activities.publish_priority_activity (wiring lives in

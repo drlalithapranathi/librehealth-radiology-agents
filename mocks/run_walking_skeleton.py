@@ -51,6 +51,7 @@ async def main() -> int:
     impression = load_handler("impression-generation")
     impression.__globals__["_FHIR"] = _DemoFhir()  # inject the fhir2 the handler fetches from (#16)
     verify = load_handler("report-verification")
+    verify.__globals__["_FHIR"] = _DemoFhir()  # verify parses report.body from the same conclusion (#22)
 
     # 1) Pre-read fan-out (triage ‖ ehr ‖ interpretation)
     t, e, a = await asyncio.gather(
