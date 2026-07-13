@@ -90,6 +90,11 @@ uvicorn orchestrator.ingress:app --port 8090
 ```
 
 ## Status
-M0 (contract freeze + harness). Agents return validated stubs; real AI, live fhir2/Orthanc
-reads, A2A transport, and the Temporal end-to-end run land in M1. Search `TODO(M1)` /
-`TODO(M2)` for next steps; the full plan is the GitLab issue backlog.
+**M2 complete (v0.2.0).** M0 (contract freeze + harness), M1 (walking skeleton: agents on Temporal,
+Orthanc->start, RIS polling->report pipeline), and M2 (Worklist API + OHIF data source,
+tier-dependent sign-off escalation, A2A push-notifications, pre-sign impression assist, the
+verification rule library with report-body parsing, and opt-in OpenTelemetry tracing) are all
+merged. AI models stay stubbed behind the Interpretation tool registry. **M3 is in progress:** real
+AI/CAD tools (#27), the security/PHI review of the fhir2 write-back (#30), and provisioning the
+dedicated pre-sign impression-draft concept (#55). Search `TODO(M3)` for next steps; the full plan
+is the GitLab issue backlog.
