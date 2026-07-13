@@ -263,6 +263,13 @@ services:
       # Worklist API where publish_priority_activity sends triage priority (issue #20 follow-up).
       # Best-effort: a Worklist API outage does not fail the workflow (see worklist_client.py).
       WORKLIST_API_URL: http://worklist-api:8107
+      # Sign-off gate override (#57). Both must be set or the escape hatch is INERT: with no token
+      # the endpoint refuses every call (503 -- it will not release a safety gate anonymously), and
+      # with no URL every escalation page goes out without telling the human it wakes how to release
+      # the study. A dev-stack secret; a real deployment sets its own, and SIGNOFF_OVERRIDE_URL must
+      # be an address the paged human can actually reach (not the compose-internal hostname).
+      SIGNOFF_OVERRIDE_TOKEN: dev-signoff-override-secret
+      SIGNOFF_OVERRIDE_URL: http://localhost:8090/signoff/{workflowId}/override
     ports: ["8090:8090"]
     depends_on: [temporal, openmrs, orthanc]
 

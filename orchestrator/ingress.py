@@ -511,7 +511,12 @@ async def signoff_override(
             status_code=503,
             detail="sign-off override is not configured (set SIGNOFF_OVERRIDE_TOKEN)",
         )
-    if not hmac.compare_digest(x_signoff_token, SIGNOFF_OVERRIDE_TOKEN):
+    # Compare as BYTES. hmac.compare_digest on str raises TypeError the moment either side holds a
+    # non-ASCII character -- so a junk header with one accented byte would crash the auth check into
+    # an unhandled 500 instead of a clean 401, and a deployment whose token happened to be non-ASCII
+    # would 500 on every call, i.e. brick the escape hatch.
+    if not hmac.compare_digest(x_signoff_token.encode("utf-8"),
+                               SIGNOFF_OVERRIDE_TOKEN.encode("utf-8")):
         raise HTTPException(status_code=401, detail="bad sign-off override token")
 
     # Who and why are the whole point: this is the audit record of a human waiving a safety verdict.

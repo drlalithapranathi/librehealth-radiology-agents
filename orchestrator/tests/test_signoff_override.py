@@ -104,6 +104,17 @@ def test_a_wrong_token_is_rejected(temporal):
     assert temporal.signals == []
 
 
+def test_a_non_ascii_token_is_rejected_cleanly_rather_than_crashing_the_auth_check(temporal):
+    """hmac.compare_digest raises TypeError on str the moment either side is non-ASCII. Comparing
+    the raw strings therefore turned a junk header with one accented byte into an unhandled 500 --
+    an auth check that crashes instead of denying -- and would have bricked the endpoint outright
+    for any deployment whose token was not pure ASCII."""
+    with pytest.raises(HTTPException) as e:
+        _call({"acknowledgedBy": WHO, "reason": WHY}, token="pásswörd")
+    assert e.value.status_code == 401     # not a 500
+    assert temporal.signals == []
+
+
 # --- the audit record must be real ----------------------------------------------------
 
 

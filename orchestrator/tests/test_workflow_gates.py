@@ -250,6 +250,106 @@ def test_repeating_rung_stops_at_the_cap_and_then_RELEASES_the_study():
     asyncio.run(scenario())
 
 
+# A ladder whose last rung does NOT repeat: the gate reaches its end after exactly one page, which
+# isolates what happens in the instant AFTER the final page goes out.
+_SINGLE_RUNG_LADDER = [
+    {"level": 1, "afterMinutes": 1, "targetRole": "reading-radiologist",
+     "channels": ["in-app"], "urgency": "routine"},
+]
+
+
+@activity.defn(name="load_escalation_policy_activity")
+async def mock_load_single_rung_policy(tier: str | None) -> list[dict]:
+    return _SINGLE_RUNG_LADDER
+
+
+def test_the_last_page_gets_a_window_to_be_answered_before_the_study_is_abandoned():
+    """Bounded must not mean abrupt.
+
+    The gate fires its final page and then ends. If it ended in the SAME instant, that page would be
+    unanswerable by construction: we would wake someone and give up on the study before they could
+    reach for a phone -- and then dead-letter it as though nobody had cared.
+
+    So after the last page the gate waits one more window before abandoning, and an ack landing in
+    that window still releases the study. Without the wait this test fails with signoff=ABANDONED and
+    a dead letter, having paged a human it had already stopped listening to.
+    """
+    async def scenario():
+        _reset([("FAIL", True), ("PASS", False)])
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
+                              activities=[mock_call_agent, mock_publish, mock_escalate,
+                                          mock_load_single_rung_policy,
+                                          mock_record_signoff_abandoned],
+                              max_cached_workflows=0):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT, id="wf-gate-grace", task_queue=TASK_QUEUE
+                )
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                await handle.signal(StudyWorkflow.report_finalized,
+                                    {"diagnosticReportId": "DiagnosticReport/1"})
+                await _wait_state(handle, "AWAITING_SIGNOFF")
+
+                await env.sleep(timedelta(minutes=2))     # past the only rung (1m): it pages
+                await _wait_escalations(1)                # ...and the ladder is now exhausted
+
+                # The person it just woke answers. Pre-fix the study was already gone.
+                await handle.signal(StudyWorkflow.signoff_acknowledged, {
+                    "acknowledgedBy": "Practitioner/dept-lead",
+                    "reason": "picked up the page; spoke to the referrer directly",
+                    "acknowledgedAt": "2026-07-13T11:00:00Z",
+                })
+                result = await handle.result()
+
+        assert result["finalState"] == "ARCHIVED"
+        assert result["signoff"]["status"] == "ACKNOWLEDGED", (
+            "the study was abandoned in the same instant as its last page -- a page nobody could "
+            "have answered in time"
+        )
+        assert result["signoff"]["acknowledgedBy"] == "Practitioner/dept-lead"
+        assert _STATE.get("abandoned", []) == [], "an answered gate must not be dead-lettered"
+    asyncio.run(scenario())
+
+
+def test_an_override_that_beats_the_gate_open_is_still_honoured():
+    """The signal can land before AWAITING_SIGNOFF is reached -- ingress does not (and cannot
+    race-freely) check the workflow's state before signalling, so an override sent while the report
+    is still being verified arrives early.
+
+    The ack used to be cleared on the way INTO the gate, which ate exactly that signal: ingress had
+    already told the radiologist the study was released (202), and the study then paged its entire
+    ladder at people and abandoned itself. A gate must honour an acknowledgement that beat it to the
+    door.
+    """
+    async def scenario():
+        _reset([("FAIL", True), ("PASS", False)])
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with _worker(env):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT, id="wf-gate-early-ack", task_queue=TASK_QUEUE
+                )
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                # Signal the ack BEFORE the report is even finalized: it is buffered, and the gate
+                # opens well after the handler has run.
+                await handle.signal(StudyWorkflow.signoff_acknowledged, {
+                    "acknowledgedBy": "Practitioner/dr-early",
+                    "reason": "called the referrer before the report came back",
+                    "acknowledgedAt": "2026-07-13T09:00:00Z",
+                })
+                await handle.signal(StudyWorkflow.report_finalized,
+                                    {"diagnosticReportId": "DiagnosticReport/1"})
+                result = await handle.result()
+
+        assert result["finalState"] == "ARCHIVED"
+        assert result["signoff"]["status"] == "ACKNOWLEDGED"
+        assert result["signoff"]["acknowledgedBy"] == "Practitioner/dr-early", (
+            "the override was accepted by ingress (202) and then silently dropped by the gate"
+        )
+        assert _STATE["escalations"] == [], "an already-acknowledged gate must not page anyone"
+        assert _STATE.get("abandoned", []) == []
+    asyncio.run(scenario())
+
+
 def test_workflow_survives_worker_restart_during_gate():
     """Restart-during-wait: kill the worker while the workflow waits at the gate; a fresh worker
     resumes it from durable history and it completes once signalled."""
