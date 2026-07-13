@@ -228,6 +228,53 @@ async def test_escalate_fails_the_open_loop_and_opens_a_new_one_on_call(stores):
     assert new_task.status is TaskStatus.REQUESTED
 
 
+async def test_an_escalated_cat2_gets_the_SHORT_window_not_another_24_hours(stores):
+    """The escalation window is deliberately NOT the category's window (#52, @sunbiz).
+
+    A Cat2 result must be communicated within 24h. If nobody acknowledges and we escalate, handing
+    on-call a fresh 24h clock would mean the finding could take 48 hours to land -- the escalation
+    would make the deadline WORSE. An escalated result is already late, so it runs on one short
+    window regardless of category.
+
+    This is also the fix for a dead read: _escalate used to take its window from
+    payload.get("ackMinutes"), but comms.escalate's input schema admits only studyContext + taskId
+    with additionalProperties false, so that read could never receive data and every escalated loop
+    silently took a 60-minute fallback nobody had chosen.
+    """
+    _, ledger = stores
+    # FAIL + requiresHumanReview -> Cat2, whose own ack window is 24 hours.
+    sent = await handle("comms.dispatch", {
+        "studyContext": SAMPLE_CONTEXT,
+        "verification": {"verificationStatus": "FAIL", "requiresHumanReview": True, "issues": []},
+    })
+    assert sent["acrCategory"] == "Cat2"
+    original = ledger.tasks[sent["taskId"]].restriction.period.end
+
+    out = await handle("comms.escalate",
+                       {"studyContext": SAMPLE_CONTEXT, "taskId": sent["taskId"]})
+    validate_skill_output("comms.escalate", out)
+    escalated = ledger.tasks[out["newTaskId"]].restriction.period.end
+
+    # The original clock really was the Cat2 window (~24h), and the escalated one is ~1h.
+    assert original - datetime.now(timezone.utc) > timedelta(hours=20)
+    assert escalated - datetime.now(timezone.utc) < timedelta(hours=2)
+    assert escalated < original, "escalation must not push the deadline further out"
+
+
+async def test_the_escalation_window_is_configurable(stores, monkeypatch):
+    """Same knob shape as the per-category windows (CRITCOM_CAT*_ACK_TIMEOUT_MINUTES): a deployment
+    that chases harder or softer sets it, rather than editing a hardcoded 60."""
+    monkeypatch.setenv("CRITCOM_ESCALATION_ACK_TIMEOUT_MINUTES", "15")
+    _, ledger = stores
+    sent = await handle("comms.dispatch", {"studyContext": SAMPLE_CONTEXT, "impression": CRITICAL})
+
+    out = await handle("comms.escalate",
+                       {"studyContext": SAMPLE_CONTEXT, "taskId": sent["taskId"]})
+    escalated = ledger.tasks[out["newTaskId"]].restriction.period.end
+
+    assert escalated - datetime.now(timezone.utc) < timedelta(minutes=16)
+
+
 async def test_escalate_with_nobody_on_call_says_so_instead_of_claiming_success(stores):
     """An unescalatable critical result is exactly the thing a human must hear about. Returning
     escalated=true with no recipient would bury it."""

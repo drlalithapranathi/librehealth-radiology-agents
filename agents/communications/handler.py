@@ -31,7 +31,7 @@ from radagent_common.comms_ledger import CommsLedgerClient
 from radagent_common.fhir_client import Fhir2Client
 from radagent_common.tracing import now_iso
 
-from classifier import ACRCategory, classify
+from classifier import ACRCategory, classify, escalation_ack_minutes
 from tools import (
     ack_state,
     dispatch_communication,
@@ -196,7 +196,11 @@ async def _escalate(payload: dict) -> dict:
         service_request_ref=order_ref,
         acr_category=acr,
         finding=finding,
-        ack_minutes=int(payload.get("ackMinutes") or 60),
+        # NOT the category's window. This result is already late -- re-using it would give on-call a
+        # fresh 24h on a Cat2, so a finding that had to be communicated within 24h could take 48.
+        # See classifier.escalation_ack_minutes (this replaces a payload.get("ackMinutes") read the
+        # input schema could never satisfy -- @sunbiz on #52).
+        ack_minutes=escalation_ack_minutes(),
     )
     return _out(payload, escalatedAt=now_iso(), **result)
 

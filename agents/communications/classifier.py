@@ -43,6 +43,27 @@ def _ack_minutes(category: ACRCategory) -> int | None:
     return int(os.environ.get(f"CRITCOM_{category.value.upper()}_ACK_TIMEOUT_MINUTES", default))
 
 
+# Minutes ON-CALL has to acknowledge an ESCALATED result -- deliberately NOT the category's window.
+#
+# An escalated result is by definition already late: its original window elapsed with no answer.
+# Re-using the category window would hand on-call a fresh 24 hours on a Cat2, so a finding that had
+# to be communicated within 24h could take 48 -- the escalation would make the deadline worse, not
+# better. Once a result is overdue we chase harder, whatever its category, so the escalated loop
+# runs on one short window.
+#
+# (This replaces a dead `payload.get("ackMinutes")` read in _escalate: comms.escalate's input
+# schema admits only studyContext + taskId with additionalProperties false, so that read could
+# never receive data and every escalated loop silently took the 60-minute fallback anyway. Now it
+# is a stated policy with a knob, rather than a default nobody chose. Raised by @sunbiz on #52.)
+ESCALATION_ACK_MINUTES = "CRITCOM_ESCALATION_ACK_TIMEOUT_MINUTES"
+_DEFAULT_ESCALATION_ACK_MINUTES = 60
+
+
+def escalation_ack_minutes() -> int:
+    """The ack window for the loop an escalation opens on the on-call provider."""
+    return int(os.environ.get(ESCALATION_ACK_MINUTES, _DEFAULT_ESCALATION_ACK_MINUTES))
+
+
 @dataclass(frozen=True)
 class Classification:
     category: ACRCategory
