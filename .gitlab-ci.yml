@@ -85,6 +85,56 @@ comms-roundtrip-it:
     - pip install -e "libs/radagent-common[a2a]" uvicorn pytest pytest-asyncio
     - cd agents/communications && python -m pytest tests/test_roundtrip.py -q
 
+comms-ledger-it:
+  # Issue #52: the comms ledger against a LIVE HAPI. Everything else in this pipeline mocks the
+  # transport, so it asserts what we SEND -- and passes even when the server rejects every write.
+  # Which is what happened: the ledger holds references to resources that live in fhir2 and are
+  # absent here (Communication.subject / Task.for -> Patient/*, basedOn -> ServiceRequest/*), HAPI
+  # enforces referential integrity on write, and every write came back 400 (HAPI-1094). With
+  # integrity merely disabled, HAPI does not INDEX a reference whose target is absent, so the audit
+  # searches silently returned 0 rows. Neither failure is expressible in a mock, and both were found
+  # only by driving a real image (!41).
+  #
+  # The fix is one compose setting (auto_create_placeholder_reference_targets). This job is what
+  # stops it silently regressing -- via the compose config, the search params, or the reference
+  # shapes -- while the mocked lanes stay green. MR 3 (agent) and MR 4 (ack timer) both write here.
+  extends: .default-rules
+  stage: test
+  image: python:3.11-slim
+  services:
+    # Same image and settings as the `comms-ledger` service in docker-compose.yml. Passed as
+    # SPRING_APPLICATION_JSON rather than compose's dotted `hapi.fhir.*` keys because GitLab CI
+    # variable names cannot contain dots; Spring binds it to the identical properties (verified
+    # against the real image -- the suite is 7/7 under both shapes, and 5/7 RED without the
+    # placeholder setting, which is the regression this lane exists to catch).
+    - name: hapiproject/hapi:v7.4.0
+      alias: comms-ledger
+      variables:
+        SPRING_APPLICATION_JSON: '{"hapi":{"fhir":{"fhir_version":"R4","allow_external_references":true,"auto_create_placeholder_reference_targets":true}}}'
+  variables:
+    COMMS_LEDGER_BASE_URL: "http://comms-ledger:8080/fhir"
+  script:
+    # Core lib only: the ledger client needs httpx + pydantic, no a2a/otel/temporal extras.
+    - pip install -e libs/radagent-common pytest
+    # HAPI takes ~a minute to migrate its schema and serve /metadata. Poll it, and FAIL if it never
+    # comes up -- a job that proceeds to a suite it cannot reach would just skip and go green.
+    - |
+      python - <<'PY'
+      import sys, time, urllib.request
+      url = "http://comms-ledger:8080/fhir/metadata"
+      for i in range(60):
+          try:
+              with urllib.request.urlopen(url, timeout=5) as r:
+                  if r.status == 200:
+                      print(f"comms-ledger ready after ~{i * 5}s")
+                      sys.exit(0)
+          except Exception:
+              pass
+          time.sleep(5)
+      sys.exit("comms-ledger never became healthy after 300s; the integration lane cannot run")
+      PY
+    - cd libs/radagent-common && python -m pytest tests/test_comms_ledger_it.py -q
+
 ris-poller-tests:
   # Issue #12: fhir2 finalized-report query + the ingress report->workflow poller. Needs the
   # orchestrator deps (temporalio + fastapi); ingress imports radagent_common.client, so the
