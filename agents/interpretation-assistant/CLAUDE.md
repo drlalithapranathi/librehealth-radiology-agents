@@ -13,8 +13,14 @@ with `evidenceRef`, `overallStatus` STUBBED|COMPLETE|PARTIAL|ERROR).
 ## v1 vs later
 - **v1:** `registry.select_tools(modality, description)` picks tool names; results are
   `STUBBED`. The registry interface is the contract — keep it stable.
-- **M3:** wire real CAD/detection tools behind the same registry; emit `evidenceRef` to
-  DICOM SC/overlay objects.
+- **First real slice (#27):** `pneumothorax-detect` cross-checks the referral reason code
+  (order.reasonCode) rather than reading pixels. Its `evidenceRef` is plain text (e.g.
+  `"order.reasonCode=J93.1"`), not an image ref. Every other tool stays `STUBBED` until it
+  gets its own real implementation.
+- **DICOM SC/overlay evidenceRef is deferred, not v1/M3 scope here.** Writing AI-made
+  images/overlays into the patient record needs a safety review that hasn't happened yet, and
+  it's a shared-lib (`orthanc_client.py`) change — **do not touch that file from this agent.**
+  That work is tracked separately (#59) and owned outside this directory.
 
 ## Data deps
 Orthanc imaging metadata via `radagent_common.orthanc_client` (M3). No PHI in messages.
