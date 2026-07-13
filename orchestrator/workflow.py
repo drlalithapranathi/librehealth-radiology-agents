@@ -11,7 +11,7 @@ Signals drive the two human gates:
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from temporalio import workflow
@@ -67,6 +67,30 @@ PATCH_PRESIGN_IMPRESSION = "presign-impression-v1"
 # history skip the write (it never happened for that study) while every NEW study records it.
 # Retire the marker (-> workflow.deprecate_patch) only once no pre-#54 workflow is open.
 PATCH_POLICY_DEAD_LETTER = "policy-dead-letter-v1"
+# The critical-results ack loop (#52). CritCom OPENS the ack clock and reports its deadline; it has
+# no self-firing timer, so if the orchestrator does not watch the clock, nobody does -- a Cat1
+# finding gets a 60-minute deadline that no one is waiting on. The orchestrator owns the durable
+# wait (Temporal timers survive restarts), re-checks the Task at the deadline, and escalates an
+# unacknowledged critical result to on-call.
+#
+# Bounded, deliberately. Each escalation opens a FRESH loop on a new person, so an uncapped chase
+# would page forever and grow history without bound; after the cap the study archives with
+# ackStatus recorded rather than hanging (see the sign-off gate, which does hang -- that is a known
+# hole, not a pattern to copy). ACK_GRACE absorbs clock skew between us and the ledger: without it,
+# waking exactly ON the deadline can find the Task not-yet-overdue and spin.
+#
+# Guarded by a patch marker like the other two. The loop appends its commands at the very end of the
+# path, so an OPEN study replays fine without it -- but a CLOSED one does not, and closed histories
+# ARE replayed: a query against a finished study (and Temporal's own reset) replays its history, and
+# there the recorded next event after comms.dispatch is WorkflowExecutionCompleted while this code
+# now schedules comms.checkAck. That is a command/event mismatch on every study we have already
+# archived. Retire the marker (-> workflow.deprecate_patch) once no pre-#52 history is queried.
+PATCH_ACK_LOOP = "critcom-ack-loop-v1"
+ACK_ESCALATION_CAP = 3
+ACK_GRACE = timedelta(minutes=1)
+# Total loop iterations, counting re-checks that found the Task not yet overdue. A backstop against
+# a ledger whose clock is far behind ours: without it, "not overdue -> wait again" could spin.
+ACK_LOOP_CAP = 2 * ACK_ESCALATION_CAP + 2
 # Shared activity-retry config (#29): the non-idempotent activities -- starting a push skill and
 # firing an escalation page each mint a fresh side effect on every attempt -- and the policy loader
 # (a deterministic failure that a retry won't fix) share ONE bounded policy instead of an ad-hoc
@@ -270,6 +294,89 @@ class StudyWorkflow:
                 "the gate still falls back and pages", wf_id
             )
 
+    # ---- the critical-results ack loop (#52) -----------------------------------------
+    @staticmethod
+    def _deadline(iso: str) -> Optional[datetime]:
+        """Parse an agent-reported ISO deadline. Pure -- no I/O, no wall-clock read -- so it is safe
+        inside the workflow sandbox (golden rule 5). A naive timestamp is read as UTC rather than
+        raising when compared against workflow.now(), which is always tz-aware."""
+        try:
+            dt = datetime.fromisoformat(iso)
+        except (TypeError, ValueError):
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    async def _await_ack(self, ctx: dict, comms: dict) -> dict:
+        """Watch the ack clock CritCom opened, and escalate a critical result nobody acknowledges.
+
+        The agent records that we told someone and by when they must answer -- and then stops. It
+        has NO self-firing timer, so without this loop a Cat1 finding carries a 60-minute deadline
+        that nothing is waiting on: the Task sits `requested` in the ledger forever and the on-call
+        provider is never told. The orchestrator owns the durable wait; Temporal timers survive a
+        worker restart, which is the whole reason the clock lives here and not in the agent.
+
+        Always returns, and the study always archives. An unacknowledged result is recorded as such
+        (`ackStatus: UNACKNOWLEDGED`) rather than hanging the workflow -- a stranded study helps
+        nobody, and the escalation itself has already paged a human.
+        """
+        task_id = comms.get("taskId")
+        deadline = self._deadline(comms.get("deadline") or "")
+        if not task_id or deadline is None:
+            # No clock was opened: a routine result, a SKIPPED dispatch, or a sign-off-ladder rung
+            # (#29's gate, which deliberately opens no ack loop -- see the agent's two-gates note).
+            return {}
+
+        escalations = 0
+        for _ in range(ACK_LOOP_CAP):
+            wait = deadline + ACK_GRACE - workflow.now()
+            if wait > timedelta(0):
+                await workflow.sleep(wait)
+
+            state = await self._call(
+                "communications", "comms.checkAck", self._base_payload(ctx, taskId=task_id))
+            if state.get("ackStatus") == "COMPLETED":
+                return {"ackStatus": "COMPLETED", "taskId": task_id, "escalations": escalations}
+
+            if not state.get("overdue"):
+                # Not actually late: the ledger's clock trails ours, or the deadline moved. Re-read
+                # it and wait again -- escalating a result that is not overdue pages a human early
+                # and, worse, teaches them the pages are noise. Floor the next check at one grace
+                # period from now: a ledger that keeps reporting the SAME stale deadline would
+                # otherwise make every wait non-positive and burn the loop cap in a sleepless spin.
+                moved = self._deadline(state.get("deadline") or "")
+                floor = workflow.now() + ACK_GRACE
+                deadline = max(moved, floor) if moved is not None else floor
+                continue
+
+            if escalations >= ACK_ESCALATION_CAP:
+                break
+
+            esc = await self._call(
+                "communications", "comms.escalate", self._base_payload(ctx, taskId=task_id))
+            escalations += 1
+            if not esc.get("escalated"):
+                # Nobody left to tell -- an empty on-call directory. The agent said so honestly
+                # instead of reporting a page it never sent; do not spin on it.
+                workflow.logger.error(
+                    "critical result on %s is unacknowledged AND unescalatable (%s); archiving",
+                    ctx["workflowId"], esc.get("reason") or "no on-call provider",
+                )
+                return {"ackStatus": "UNACKNOWLEDGED", "taskId": task_id,
+                        "escalations": escalations,
+                        "reason": esc.get("reason") or "nobody to escalate to"}
+
+            new_task = esc.get("newTaskId")
+            new_deadline = self._deadline(esc.get("newDeadline") or "")
+            if not new_task or new_deadline is None:
+                break  # escalated, but no new loop to watch: nothing further we can do here
+            task_id, deadline = new_task, new_deadline
+
+        workflow.logger.error(
+            "critical result on %s never acknowledged after %d escalation(s); archiving unacked",
+            ctx["workflowId"], escalations,
+        )
+        return {"ackStatus": "UNACKNOWLEDGED", "taskId": task_id, "escalations": escalations}
+
     async def _hold_signoff_gate(self, wf_id: str) -> None:
         """Hold AWAITING_SIGNOFF until the radiologist acks, escalating per the tier ladder (#29).
 
@@ -418,6 +525,13 @@ class StudyWorkflow:
             ),
         )
 
+        # The agent opened an ack clock and reported its deadline; nobody else is watching it.
+        # Guarded: see PATCH_ACK_LOOP (a query against an already-archived study replays its
+        # history, where the next event after the dispatch is the workflow completing).
+        ack: dict = {}
+        if workflow.patched(PATCH_ACK_LOOP):
+            ack = await self._await_ack(ctx, comms)
+
         self._state = State.ARCHIVED
         return {
             "workflowId": wf_id,
@@ -425,6 +539,7 @@ class StudyWorkflow:
             "triage": self._triage,
             "verification": self._verification,
             "comms": comms,
+            "ack": ack,
         }
 
     # ---- signals & queries -------------------------------------------------------
