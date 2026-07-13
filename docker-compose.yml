@@ -100,20 +100,25 @@ services:
     # up are logged and dropped. StableAge (60s default) makes an early race unlikely.
 
   # --- Viewer -------------------------------------------------------------------
-  # The stock ohif/app image ships no nginx server block and an empty app-config.js,
-  # so we supply both. nginx serves OHIF and proxies /dicom-web + /wado to Orthanc on
-  # the same origin (no CORS). Browser opens http://localhost:3000/.
+  # OHIF viewer with our custom extension + reading mode baked in (issue #21).
+  # Built from integrations/ohif-extension/Dockerfile: multi-stage build that
+  # clones OHIF Viewers @ v3.6.5, drops our workspace packages under
+  # extensions/ and modes/, registers them in pluginConfig.json, runs the OHIF
+  # webpack build, then serves the dist/ from nginx. NOT a fork -- we consume
+  # OHIF at a pinned tag and add our plugin alongside; version bumps are a
+  # single-line change to the Dockerfile's OHIF_REF arg.
+  #
+  # nginx also proxies /reading-api/* -> worklist-api and /orchestrator-api/*
+  # -> ingress so the browser stays same-origin (no CORS on either service).
   ohif:
-    # Pinned by digest to the exact OHIF v3.6.5 image validated with this stack. `:latest`
-    # drifts and this build has quirks we work around here: bundles are shipped gzip-only
-    # (need nginx gzip_static -> docker/ohif/default.conf), app-config ships empty (we mount
-    # our own), and a WASM codec chunk references Node's __filename (shimmed in app-config.js).
-    image: ohif/app@sha256:b1ff4afbd30908aaae8c3ed4ad4033ee91028c0e37675acaf3839bf6275754ef  # OHIF v3.6.5
+    build:
+      context: .
+      dockerfile: integrations/ohif-extension/Dockerfile
     ports: ["3000:80"]
     volumes:
       - ./docker/ohif/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./docker/ohif/app-config.js:/usr/share/nginx/html/app-config.js:ro
-    depends_on: [orthanc]
+    depends_on: [orthanc, worklist-api]
     restart: unless-stopped
 
   # --- Temporal (durable orchestration engine, for the agent system) ------------

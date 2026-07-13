@@ -16,6 +16,12 @@ window.__dirname = window.__dirname || '/';
 
 window.config = {
   routerBasename: '/',
+  // Our @lhrad/extension-worklist is compiled into the OHIF bundle at build
+  // time via pluginConfig.json (see integrations/ohif-extension/Dockerfile).
+  // The /reading route is injected by the extension's preRegistration hook
+  // via customizationService.setGlobalCustomization('customRoutes', ...) —
+  // no custom mode is registered (see the R2 doc addendum). These arrays are
+  // for RUNTIME dynamic registration of additional plugins loaded from URLs.
   extensions: [],
   modes: [],
   showStudyList: true,
