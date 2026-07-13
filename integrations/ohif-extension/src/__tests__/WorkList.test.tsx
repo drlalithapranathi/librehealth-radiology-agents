@@ -12,9 +12,18 @@
  *   * OHIF's customRoutes extension point mounts this at /reading (see index.ts preRegistration)
  *   * The 30 s refresh interval — asserting on timers with happy-dom is finicky
  *     and the risk/reward isn't there for a first MR
+ *
+ * All renders are wrapped in <MemoryRouter> because WorkList calls
+ * `useNavigate()` at render time (see WorkList.tsx file-header comment for why);
+ * without a Router in the tree the hook throws. The renderWithRouter helper
+ * keeps every render() call inside the same MemoryRouter context so the
+ * tests match how the component is used in production (mounted inside OHIF's
+ * BrowserRouter via customRoutes).
  */
+import * as React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
+import { MemoryRouter } from 'react-router-dom';
 
 import { WorkList } from '../components/WorkList';
 import type { WorklistItem } from '../types';
@@ -44,6 +53,11 @@ const withFetch = (
   vi.stubGlobal('fetch', vi.fn(handler));
 };
 
+/** Mount the component inside a MemoryRouter so useNavigate() resolves.
+ *  See file-header comment for rationale. */
+const renderWithRouter = (ui: React.ReactElement) =>
+  render(<MemoryRouter>{ui}</MemoryRouter>);
+
 afterEach(() => {
   vi.unstubAllGlobals();
   cleanup();
@@ -52,7 +66,7 @@ afterEach(() => {
 describe('<WorkList />', () => {
   it('renders loading state initially', () => {
     withFetch(async () => new Promise(() => {})); // never resolves
-    render(<WorkList />);
+    renderWithRouter(<WorkList />);
     expect(screen.getByTestId('lhrad-worklist-loading')).toBeInTheDocument();
   });
 
@@ -67,7 +81,7 @@ describe('<WorkList />', () => {
         ],
       }),
     );
-    render(<WorkList />);
+    renderWithRouter(<WorkList />);
     await waitFor(() => expect(screen.queryByTestId('lhrad-worklist-loading')).not.toBeInTheDocument());
     const rows = screen.getAllByRole('row').slice(1); // skip <thead>
     expect(rows.map((r) => r.getAttribute('data-testid'))).toEqual([
@@ -84,14 +98,14 @@ describe('<WorkList />', () => {
         items: [item({ studyInstanceUID: 's', priorityTier: 'STAT', priorityScore: 90 })],
       }),
     );
-    render(<WorkList />);
+    renderWithRouter(<WorkList />);
     await waitFor(() => screen.getByTestId('lhrad-row-s'));
     expect(screen.getByTestId('lhrad-row-s')).toHaveAttribute('data-priority-tier', 'STAT');
   });
 
   it('renders empty state for zero-item response', async () => {
     withFetch(async () => jsonResponse({ generatedAt: 't', items: [] }));
-    render(<WorkList />);
+    renderWithRouter(<WorkList />);
     await waitFor(() => screen.getByTestId('lhrad-worklist-empty'));
     expect(screen.getByTestId('lhrad-worklist-empty')).toHaveTextContent(
       /no studies pending/i,
@@ -100,7 +114,7 @@ describe('<WorkList />', () => {
 
   it('renders error banner (loud, not empty list) on 503', async () => {
     withFetch(async () => jsonResponse({ detail: 'orthanc unreachable' }, 503));
-    render(<WorkList />);
+    renderWithRouter(<WorkList />);
     await waitFor(() => screen.getByTestId('lhrad-worklist-error'));
     expect(screen.getByTestId('lhrad-worklist-error')).toHaveTextContent(/503/);
     expect(screen.getByRole('alert')).toBeInTheDocument();
@@ -114,7 +128,7 @@ describe('<WorkList />', () => {
       }),
     );
     const onOpenStudy = vi.fn();
-    render(<WorkList onOpenStudy={onOpenStudy} />);
+    renderWithRouter(<WorkList onOpenStudy={onOpenStudy} />);
     await waitFor(() => screen.getByTestId('lhrad-row-clickme'));
     fireEvent.click(screen.getByTestId('lhrad-row-clickme'));
     expect(onOpenStudy).toHaveBeenCalledWith('clickme');
@@ -128,7 +142,7 @@ describe('<WorkList />', () => {
       }),
     );
     const onOpenStudy = vi.fn();
-    render(<WorkList onOpenStudy={onOpenStudy} />);
+    renderWithRouter(<WorkList onOpenStudy={onOpenStudy} />);
     await waitFor(() => screen.getByTestId('lhrad-row-kb'));
     fireEvent.keyDown(screen.getByTestId('lhrad-row-kb'), { key: 'Enter' });
     expect(onOpenStudy).toHaveBeenCalledWith('kb');

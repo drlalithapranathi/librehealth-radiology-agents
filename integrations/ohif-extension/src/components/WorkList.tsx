@@ -13,6 +13,15 @@
  *   3. render rows; click → emit StudyOpenedEvent + navigate to OHIF viewer
  *   4. auto-refresh every REFRESH_MS to pick up new studies + updated priorities
  *
+ * Navigation: uses react-router-dom's useNavigate hook (client-side) rather
+ * than window.location.assign (full page reload). The full-page path caused
+ * a real UX bug -- after a Back from /viewer the browser landed on / (Study
+ * List) rather than /reading, because the /viewer full-page load re-booted
+ * OHIF and its startup routing pushed / to history before react-router
+ * resolved /viewer. Client-side navigation stays inside the same SPA lifetime
+ * and history behaves as expected. Our route is mounted inside OHIF's
+ * BrowserRouter (via customRoutes), so useNavigate resolves correctly.
+ *
  * Styling: intentionally plain HTML. `@ohif/ui` is React-17 + tightly coupled to
  * OHIF's Redux services, so importing its Table components requires being loaded
  * inside the OHIF app context. Rather than fight that from a standalone extension,
@@ -21,6 +30,7 @@
  */
 import * as React from 'react';
 import { useEffect, useState, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 
 import type { WorklistItem, WorklistResponse } from '../types';
 import {
@@ -53,6 +63,7 @@ export const WorkList: React.FC<WorkListProps> = ({
   onOpenStudy,
 }) => {
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
+  const navigate = useNavigate();
 
   const load = useCallback(async (signal: AbortSignal) => {
     try {
@@ -96,10 +107,12 @@ export const WorkList: React.FC<WorkListProps> = ({
       if (onOpenStudy) {
         onOpenStudy(uid);
       } else {
-        window.location.assign(buildViewerUrl(uid));
+        // Client-side navigation via react-router: single history entry,
+        // Back returns to /reading (see file header comment).
+        navigate(buildViewerUrl(uid));
       }
     },
-    [radiologistId, onOpenStudy],
+    [radiologistId, onOpenStudy, navigate],
   );
 
   if (state.kind === 'loading') {
