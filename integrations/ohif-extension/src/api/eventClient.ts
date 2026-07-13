@@ -6,7 +6,8 @@
  *   * losing an ohif.study.opened event = losing pre-read assist for that study, NOT
  *     losing the ability to read/report/sign the study
  *   * so a network failure logs a warning and returns false rather than blocking
- *     the mode entry (which would prevent the radiologist from actually opening the study)
+ *     navigation to the viewer (which would prevent the radiologist from actually
+ *     opening the study)
  *
  * The orchestrator's `orthanc_webhook` ingest surface in `orchestrator/ingress.py` is
  * the model for the sibling endpoint we POST to; wiring that endpoint is flagged as
@@ -26,7 +27,7 @@ export interface EmitOptions {
   fetchImpl?: typeof fetch;
   /** Same-origin path override — production deployments may proxy events differently. */
   url?: string;
-  /** Short timeout — this call is on the mode-entry path; a slow ingest should
+  /** Short timeout: this call is on the study-open path; a slow ingest should
    *  not stall the viewer from loading. 5 s matches the Worklist API's own
    *  publish_priority timeout for symmetry. */
   timeoutMs?: number;
@@ -34,8 +35,8 @@ export interface EmitOptions {
 
 /**
  * Emit `ohif.study.opened` for the given study. Returns `true` on 2xx, `false`
- * on any error (network, timeout, non-2xx). Never throws — the caller (mode
- * onModeEnter) is on the critical UI path and cannot fail on this.
+ * on any error (network, timeout, non-2xx). Never throws: the caller (the
+ * WorkList row click handler) is on the critical UI path and cannot fail on this.
  */
 export async function emitStudyOpenedEvent(
   studyInstanceUID: string,

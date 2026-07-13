@@ -1,10 +1,11 @@
 /**
- * WorkList — the priority-ordered reading list surfaced at the mode's route.
+ * WorkList -- the priority-ordered reading list surfaced at /reading.
  *
- * This component is what OHIF's mode `layoutTemplate.component` renders when the
- * radiologist hits the mode's route (see `mode.ts`). It replaces the built-in
- * OHIF Study List with our own list that hits the Worklist API and orders by
- * priorityTier / priorityScore instead of just StudyDate desc.
+ * Rendered by the customRoutes entry that the extension's preRegistration hook
+ * injects into OHIF's router (see src/index.ts); there is no custom mode. It
+ * replaces the built-in OHIF Study List with our own list that hits the
+ * Worklist API and orders by priorityTier / priorityScore instead of just
+ * StudyDate desc.
  *
  * Data flow:
  *   1. mount → fetchWorklist() from /reading-api/worklist
@@ -15,8 +16,8 @@
  * Styling: intentionally plain HTML. `@ohif/ui` is React-17 + tightly coupled to
  * OHIF's Redux services, so importing its Table components requires being loaded
  * inside the OHIF app context. Rather than fight that from a standalone extension,
- * we render our own table with minimal inline styles. The mode's layout wraps
- * us so we inherit OHIF's dark-mode background.
+ * we render our own table with minimal inline styles. OHIF's app shell wraps
+ * the route so we inherit its dark background.
  */
 import * as React from 'react';
 import { useEffect, useState, useCallback } from 'react';
