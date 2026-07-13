@@ -19,6 +19,20 @@ class OrthancClient:
     async def get_study(self, orthanc_study_id: str) -> dict:
         return await self._get(f"studies/{orthanc_study_id}")
 
+    async def get_study_description(self, orthanc_study_id: str) -> str:
+        """The study's DICOM StudyDescription, or "" when Orthanc has no such tag (#62).
+
+        This is the field the interpretation tool registry selects on (`select_tools(modality,
+        description)`), and the Orthanc stable event does not carry it -- so ingress fetches it
+        here. Imaging metadata comes from Orthanc, which is what Golden rule 2 asks for; keeping the
+        DICOM tag name on this side of the client is the point of the client.
+
+        Not PHI: StudyDescription is the protocol ("CT HEAD WITHOUT CONTRAST"), not the patient.
+        """
+        raw = await self.get_study(orthanc_study_id)
+        main_tags = (raw or {}).get("MainDicomTags") or {}
+        return (main_tags.get("StudyDescription") or "").strip()
+
     async def list_completed_studies(self) -> list[dict]:
         """Used by the Worklist API to build the reading worklist.
 
