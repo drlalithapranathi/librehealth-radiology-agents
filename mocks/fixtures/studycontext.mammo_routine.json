@@ -13,8 +13,8 @@
   "order": { "fhirServiceRequestId": "ServiceRequest/demo-mammo", "priority": "routine", "reasonCode": ["Z12.31"] },
   "assignment": { "radiologistId": null, "assignedAt": null },
   "meta": {
-    "traceId": "trc_mammo000000001",
-    "spanId": "spn_mammo0001",
+    "traceId": "ac7e0000000000000000000000000003",
+    "spanId": "ac7e000000000003",
     "emittedAt": "2026-06-27T13:00:00Z",
     "source": "mocks.fixtures",
     "schemaRef": "studycontext@1.0.0"

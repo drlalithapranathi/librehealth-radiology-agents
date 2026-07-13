@@ -13,8 +13,8 @@
   "order": { "fhirServiceRequestId": "ServiceRequest/demo-cxr", "priority": "stat", "reasonCode": ["J93.1"] },
   "assignment": { "radiologistId": null, "assignedAt": null },
   "meta": {
-    "traceId": "trc_cxr0000000001",
-    "spanId": "spn_cxr00001",
+    "traceId": "c0ffee0000000000000000000000ec04",
+    "spanId": "c0ffee00000000c4",
     "emittedAt": "2026-06-27T12:00:00Z",
     "source": "mocks.fixtures",
     "schemaRef": "studycontext@1.0.0"

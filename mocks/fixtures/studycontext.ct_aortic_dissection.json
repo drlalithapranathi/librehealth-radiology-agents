@@ -13,8 +13,8 @@
   "order": { "fhirServiceRequestId": "ServiceRequest/demo-aorta", "priority": "stat", "reasonCode": ["I71.0"] },
   "assignment": { "radiologistId": null, "assignedAt": null },
   "meta": {
-    "traceId": "trc_aorta000000001",
-    "spanId": "spn_aorta0001",
+    "traceId": "a047a1c000000000000000000000dd05",
+    "spanId": "a047a1c0000000d5",
     "emittedAt": "2026-06-27T10:00:00Z",
     "source": "mocks.fixtures",
     "schemaRef": "studycontext@1.0.0"

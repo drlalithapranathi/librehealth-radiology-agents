@@ -55,6 +55,22 @@ def test_enabled_by_env(monkeypatch):
     assert tracing_enabled() is False
 
 
+def test_new_ids_follow_the_active_trace(monkeypatch):
+    """Enabled + a span active -> new_trace_id/new_span_id ARE the current trace/span ids, so
+    meta.traceId correlates the envelope with the study's distributed trace (#28). Uses a LOCAL
+    provider (never set as global) so it leaks no exporter into the rest of the suite."""
+    from radagent_common.tracing import new_span_id, new_trace_id
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", "console")
+    assert tracing_enabled() is True
+    tracer = TracerProvider().get_tracer("test")
+    with tracer.start_as_current_span("study") as span:
+        sctx = span.get_span_context()
+        assert new_trace_id() == trace.format_trace_id(sctx.trace_id)
+        assert new_span_id() == trace.format_span_id(sctx.span_id)
+
+
 def test_configured_but_extra_missing_degrades_to_off(monkeypatch, caplog):
     """Tracing is observability, never a dependency of the pipeline. If an image is built without
     the [otel] extra but the env asks for tracing, the gate must return False -- every call site

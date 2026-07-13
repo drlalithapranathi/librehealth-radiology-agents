@@ -13,8 +13,8 @@
   "order": { "fhirServiceRequestId": "ServiceRequest/demo-brain", "priority": "routine", "reasonCode": ["G35"] },
   "assignment": { "radiologistId": null, "assignedAt": null },
   "meta": {
-    "traceId": "trc_brain000000001",
-    "spanId": "spn_brain0001",
+    "traceId": "b7a10000000000000000000000000002",
+    "spanId": "b7a1000000000002",
     "emittedAt": "2026-06-27T11:00:00Z",
     "source": "mocks.fixtures",
     "schemaRef": "studycontext@1.0.0"

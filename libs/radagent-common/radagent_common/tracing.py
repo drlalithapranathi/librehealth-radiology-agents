@@ -1,10 +1,11 @@
 """Correlation helpers + OpenTelemetry bootstrap (#28).
 
-The `new_trace_id`/`new_span_id`/`now_iso` helpers stay as-is (the opaque `trc_`/`spn_` ids the
-StudyContext envelope carries today); redefining `meta.traceId` as W3C is a separate, contract-gated
-slice. `init_tracing` is the OTel seam: it is OPT-IN and imports OpenTelemetry LAZILY, so importing
-this module never pulls in the SDK and code paths that don't call it (all tests) keep the API's
-no-op tracer at zero cost."""
+`new_trace_id`/`new_span_id` emit W3C trace-context ids (32/16 lowercase hex, per
+`contracts/studycontext.schema.json`). When tracing is enabled they return the CURRENT trace/span
+ids, so the envelope's `meta.traceId` is the same id as the study's distributed trace and logs
+correlate with spans; otherwise they mint a fresh random W3C id. `init_tracing` is the OTel seam: it
+is OPT-IN and imports OpenTelemetry LAZILY, so importing this module never pulls in the SDK and code
+paths that don't call it (all tests) keep the API's no-op tracer at zero cost."""
 from __future__ import annotations
 import importlib.util
 import logging
@@ -38,11 +39,37 @@ def now_iso() -> str:
 
 
 def new_trace_id() -> str:
-    return "trc_" + uuid.uuid4().hex[:16]
+    """A W3C trace-id (32 lowercase hex). The id of the CURRENT trace when OTel tracing is active
+    (so `meta.traceId` ties the envelope to the study's distributed trace, #28), else a fresh
+    random id. `uuid4().hex` is exactly 32 hex chars and never all-zero (a valid W3C trace-id)."""
+    ctx = _current_span_context()
+    if ctx is not None and ctx.is_valid:
+        from opentelemetry import trace
+        return trace.format_trace_id(ctx.trace_id)
+    return uuid.uuid4().hex
 
 
 def new_span_id() -> str:
-    return "spn_" + uuid.uuid4().hex[:12]
+    """A W3C span-id (16 lowercase hex): the current span's id when tracing is active, else random."""
+    ctx = _current_span_context()
+    if ctx is not None and ctx.is_valid:
+        from opentelemetry import trace
+        return trace.format_span_id(ctx.span_id)
+    return uuid.uuid4().hex[:16]
+
+
+def _current_span_context():
+    """The active OpenTelemetry SpanContext, or None when tracing is off or the SDK is absent. The
+    import is lazy and guarded by `tracing_enabled()`, so non-tracing runs never import OpenTelemetry
+    and correlation-id minting never depends on the [otel] extra. A failure here degrades to a random
+    id -- correlation must never break the pipeline."""
+    if not tracing_enabled():
+        return None
+    try:
+        from opentelemetry import trace
+        return trace.get_current_span().get_span_context()
+    except Exception:  # noqa: BLE001 - observability must never be load-bearing
+        return None
 
 
 def _otel_configured() -> bool:

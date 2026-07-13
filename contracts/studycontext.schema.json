@@ -56,8 +56,16 @@
       "additionalProperties": false,
       "required": ["traceId", "emittedAt", "source"],
       "properties": {
-        "traceId": { "type": "string" },
-        "spanId": { "type": "string" },
+        "traceId": {
+          "type": "string",
+          "description": "W3C trace-context trace-id: 32 lowercase hex chars (#28). When OpenTelemetry is enabled this is the id of the study's distributed trace, so logs and spans correlate.",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "spanId": {
+          "type": "string",
+          "description": "W3C trace-context span-id: 16 lowercase hex chars (#28).",
+          "pattern": "^[0-9a-f]{16}$"
+        },
         "emittedAt": { "type": "string", "format": "date-time" },
         "source": { "type": "string" },
         "schemaRef": { "type": "string" }
