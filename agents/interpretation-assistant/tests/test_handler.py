@@ -60,3 +60,45 @@ def test_ct_multi_region_collects_all_matching_regions():
 def test_ct_no_region_match_falls_back_to_star():
     tools = select_tools("CT", "CT MISC PROTOCOL")
     assert tools == ["generic-ct-screen"]
+
+
+# Real first slice (#27): pneumothorax-detect cross-checks the referral reason code.
+CXR_CONTEXT = {
+    "schemaVersion": "1.0.0",
+    "workflowId": "wf_cxr_test",
+    "study": {
+        "studyInstanceUID": "1.2.3.4",
+        "orthancStudyId": "cxr-study-001",
+        "modality": "CR",
+        "studyDescription": "CHEST AP",
+    },
+    "patient": {"fhirPatientId": "Patient/2"},
+    "order": {"priority": "stat", "reasonCode": ["J93.1"]},
+    "meta": {"traceId": "trc_y", "emittedAt": "2026-06-26T00:00:00Z", "source": "test"},
+}
+
+
+async def test_pneumothorax_reason_code_yields_complete_finding():
+    out = await handle("interpretation.runTools", {"studyContext": CXR_CONTEXT})
+    validate_skill_output("interpretation.runTools", out)
+    ptx = next(f for f in out["findings"] if f["toolId"] == "pneumothorax-detect")
+    assert ptx["status"] == "COMPLETE"
+    assert "J93.1" in ptx["label"]
+    assert ptx["evidenceRef"] == "order.reasonCode=J93.1"
+    assert out["overallStatus"] == "PARTIAL"  # cxr-screen stays STUBBED alongside it
+
+
+async def test_pneumothorax_without_matching_reason_code_stays_stubbed():
+    ctx = {**CXR_CONTEXT, "order": {"priority": "stat", "reasonCode": ["R05"]}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    ptx = next(f for f in out["findings"] if f["toolId"] == "pneumothorax-detect")
+    assert ptx["status"] == "STUBBED"
+    assert ptx["evidenceRef"] is None
+    assert out["overallStatus"] == "STUBBED"
+
+
+async def test_no_reason_code_at_all_stays_stubbed():
+    ctx = {**CXR_CONTEXT, "order": {"priority": "stat"}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    ptx = next(f for f in out["findings"] if f["toolId"] == "pneumothorax-detect")
+    assert ptx["status"] == "STUBBED"
