@@ -39,7 +39,15 @@ def _pneumothorax_reason_finding(reason_codes: list[str]) -> Optional[dict]:
         # (#27). evidenceRef is `["string", "null"]` in the contract, so a plain-text locator is
         # a legitimate value here, not a placeholder for the M3 image-based ref.
         "evidenceRef": f"order.reasonCode={hit}",
-        "status": "COMPLETE",
+        # `status` stays STUBBED even though label/evidenceRef are populated: COMPLETE is reserved
+        # for real pixel-level results, because it gates the pre-sign fhir2 write
+        # (orchestrator/workflow.py:_has_complete_finding -> _presign_impression, before
+        # AWAITING_RADIOLOGIST). A referral reason the ordering clinician typed is not imaging
+        # evidence for pneumothorax any more than a non-matching code is evidence against it (see
+        # the comment above on absence-of-match) -- so it must not trip a pre-read critical-finding
+        # chart write. Do not flip this to COMPLETE without also addressing the fhir2 write-back
+        # security/PHI review (#30).
+        "status": "STUBBED",
     }
 
 

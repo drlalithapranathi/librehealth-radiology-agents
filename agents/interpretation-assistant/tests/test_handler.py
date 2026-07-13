@@ -78,14 +78,16 @@ CXR_CONTEXT = {
 }
 
 
-async def test_pneumothorax_reason_code_yields_complete_finding():
+async def test_pneumothorax_reason_code_records_evidence_but_stays_stubbed():
     out = await handle("interpretation.runTools", {"studyContext": CXR_CONTEXT})
     validate_skill_output("interpretation.runTools", out)
     ptx = next(f for f in out["findings"] if f["toolId"] == "pneumothorax-detect")
-    assert ptx["status"] == "COMPLETE"
+    # STUBBED, not COMPLETE: a referral reason code is not pixel-level evidence, and COMPLETE
+    # gates the pre-sign fhir2 chart write -- see the comment in handler.py.
+    assert ptx["status"] == "STUBBED"
     assert "J93.1" in ptx["label"]
     assert ptx["evidenceRef"] == "order.reasonCode=J93.1"
-    assert out["overallStatus"] == "PARTIAL"  # cxr-screen stays STUBBED alongside it
+    assert out["overallStatus"] == "STUBBED"
 
 
 async def test_pneumothorax_without_matching_reason_code_stays_stubbed():
