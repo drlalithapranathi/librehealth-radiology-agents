@@ -27,6 +27,7 @@ from .state import (
     ACT_LOAD_ESCALATION_POLICY,
     ACT_WRITE_PRESIGN_IMPRESSION,
     ACT_RECORD_POLICY_FAILURE,
+    ACT_RECORD_SIGNOFF_ABANDONED,
 )
 
 # Tunables (could be moved to a config activity later).
@@ -44,7 +45,8 @@ SIGNOFF_GATE_TIMEOUTS = {
 SIGNOFF_GATE_TIMEOUT_DEFAULT = timedelta(hours=4)  # unknown/missing tier -> most lenient
 # Backstop on a repeating final rung (#29): stop re-paging after this many fires of that rung so
 # an abandoned study cannot grow workflow history without bound. A history-size guard, NOT policy
-# (cadence/audience live in escalation-policy.yaml); the gate itself keeps holding for the ack.
+# (cadence/audience live in escalation-policy.yaml). Since #57 it also ENDS the gate: the ladder
+# running out is a terminal, recorded outcome (GATE_ABANDONED), not a silent hold.
 ESCALATION_REPEAT_CAP = 50
 # Push-mode skill re-runs (#24): the SDK's push sender POSTs each callback exactly once (no
 # retry), so a lost callback times out the wait and we re-run the whole skill — bounded, because
@@ -75,9 +77,10 @@ PATCH_POLICY_DEAD_LETTER = "policy-dead-letter-v1"
 #
 # Bounded, deliberately. Each escalation opens a FRESH loop on a new person, so an uncapped chase
 # would page forever and grow history without bound; after the cap the study archives with
-# ackStatus recorded rather than hanging (see the sign-off gate, which does hang -- that is a known
-# hole, not a pattern to copy). ACK_GRACE absorbs clock skew between us and the ledger: without it,
-# waking exactly ON the deadline can find the Task not-yet-overdue and spin.
+# ackStatus recorded rather than hanging. #57 made the sign-off gate follow this same shape --
+# bounded chase, honest recorded terminal state -- so it is now the house pattern, not the
+# exception. ACK_GRACE absorbs clock skew between us and the ledger: without it, waking exactly ON
+# the deadline can find the Task not-yet-overdue and spin.
 #
 # Guarded by a patch marker like the other two. The loop appends its commands at the very end of the
 # path, so an OPEN study replays fine without it -- but a CLOSED one does not, and closed histories
@@ -86,6 +89,16 @@ PATCH_POLICY_DEAD_LETTER = "policy-dead-letter-v1"
 # now schedules comms.checkAck. That is a command/event mismatch on every study we have already
 # archived. Retire the marker (-> workflow.deprecate_patch) once no pre-#52 history is queried.
 PATCH_ACK_LOOP = "critcom-ack-loop-v1"
+# The sign-off override (#57, implementing #56's decision (b)). Marks BOTH halves of the change:
+# the gate becomes bounded (it used to end in an unbounded wait for a signal nothing sent), and the
+# verify loop stops re-verifying after the gate. Both alter commands on a path that studies parked
+# at the gate have already walked, so an in-flight study must keep replaying the OLD shape.
+PATCH_SIGNOFF_OVERRIDE = "signoff-override-v1"
+# How a sign-off gate ended. ACKNOWLEDGED: a radiologist released it (via the #57 override endpoint,
+# or -- at M2 -- the addendum flow). ABANDONED: the ladder ran out with nobody acknowledging; the
+# study is released anyway, with the FAIL and the non-acknowledgement both recorded.
+GATE_ACKNOWLEDGED = "ACKNOWLEDGED"
+GATE_ABANDONED = "ABANDONED"
 ACK_ESCALATION_CAP = 3
 ACK_GRACE = timedelta(minutes=1)
 # Total loop iterations, counting re-checks that found the Task not yet overdue. A backstop against
@@ -111,6 +124,9 @@ class StudyWorkflow:
         self._state: State = State.RECEIVED
         self._report_event: Optional[dict] = None
         self._signoff_ack: Optional[dict] = None
+        # How the sign-off gate ended, and who released it (#57). Stays empty for a study that
+        # passed verification -- the gate never opened, so there is nothing to acknowledge.
+        self._signoff: dict = {}
         # Derived results (pass-forward; see WorkflowState in state.py).
         self._triage: Optional[dict] = None
         self._ehr: Optional[dict] = None
@@ -377,19 +393,51 @@ class StudyWorkflow:
         )
         return {"ackStatus": "UNACKNOWLEDGED", "taskId": task_id, "escalations": escalations}
 
-    async def _hold_signoff_gate(self, wf_id: str) -> None:
-        """Hold AWAITING_SIGNOFF until the radiologist acks, escalating per the tier ladder (#29).
+    async def _record_signoff_abandoned(self, wf_id: str, tier: Optional[str], pages: int) -> None:
+        """Dead-letter a gate that ran out of ladder with nobody acknowledging (#57).
+
+        Best-effort, like the policy dead letter: if the store is unwritable we still release the
+        gate. The alert is observability; stranding the study is the harm we are removing.
+        """
+        try:
+            await workflow.execute_activity(
+                ACT_RECORD_SIGNOFF_ABANDONED,
+                args=[wf_id, tier, pages],
+                start_to_close_timeout=PRE_READ_TIMEOUT,
+                retry_policy=BOUNDED_ACTIVITY_RETRY,
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "could not dead-letter the abandoned sign-off gate for %s; releasing anyway", wf_id
+            )
+
+    async def _hold_signoff_gate(self, wf_id: str) -> str:
+        """Hold AWAITING_SIGNOFF until a radiologist acknowledges, escalating per the tier ladder
+        (#29). Returns how the gate ENDED -- GATE_ACKNOWLEDGED or GATE_ABANDONED.
 
         The orchestrator owns the durable escalation clock (the real comms agent has no
         self-firing timer): each rung of escalation-policy.yaml fires as its afterMinutes --
         anchored to gate entry, so a slow/failed page never delays later rungs -- elapses without
-        an ack, paging a widening audience. A repeating final rung keeps re-firing at its cadence
-        (capped by ESCALATION_REPEAT_CAP); either way the gate only opens on the ack signal, and
-        the verify loop then re-checks. If the policy itself cannot be loaded, fall back to the
-        legacy pre-#29 gate (single tier timeout, one flat page, back to the verify loop).
+        an ack, paging a widening audience. A repeating final rung keeps re-firing at its cadence,
+        capped by ESCALATION_REPEAT_CAP.
+
+        #57: the gate is now BOUNDED and always terminal. It used to end its ladder and then
+        `await self._ack_or_timeout(None)` -- an unbounded wait for a signal that, until #57, no
+        production code path could ever send. A study that failed verification with
+        requiresHumanReview therefore paged ESCALATION_REPEAT_CAP times and then waited forever, in
+        silence: it never reached COMMUNICATE, so the critical finding that made verification FAIL
+        was never dispatched, and it never archived. Now the chase is bounded and the terminal state
+        is recorded honestly (the !46 house pattern): the ack releases the gate, and if the ladder
+        runs out with nobody acknowledging, the gate is dead-lettered and released as ABANDONED so
+        the study proceeds to COMMUNICATE with the FAIL on the record. An unread page helps nobody;
+        a study nobody can page about helps less.
+
+        The pre-#57 unbounded hold is kept behind the patch marker for histories that recorded it.
         """
+        bounded = workflow.patched(PATCH_SIGNOFF_OVERRIDE)
         tier = (self._triage or {}).get("priorityTier")
         reason = "sign-off gate timed out awaiting radiologist"
+        pages = 0
         try:
             ladder: list = await workflow.execute_activity(
                 ACT_LOAD_ESCALATION_POLICY,
@@ -408,16 +456,27 @@ class StudyWorkflow:
             # about replay safety, not the write's own failure handling.
             if workflow.patched(PATCH_POLICY_DEAD_LETTER):
                 await self._record_policy_failure(wf_id, tier)
-            if not await self._ack_or_timeout(signoff_timeout_for(tier)):
+            if not bounded:  # pre-#57: one flat page, then the caller re-verifies and re-enters
+                if not await self._ack_or_timeout(signoff_timeout_for(tier)):
+                    await self._page(wf_id, reason, None)
+                return GATE_ACKNOWLEDGED
+            # The policy is broken, but the gate still must not be unbounded: page flatly on the
+            # tier timeout, up to the same cap, then give up honestly rather than hold forever.
+            for _ in range(ESCALATION_REPEAT_CAP):
+                if await self._ack_or_timeout(signoff_timeout_for(tier)):
+                    return GATE_ACKNOWLEDGED
                 await self._page(wf_id, reason, None)
-            return
+                pages += 1
+            await self._record_signoff_abandoned(wf_id, tier, pages)
+            return GATE_ABANDONED
 
         entered = workflow.now()
         for rung in ladder:
             target = entered + timedelta(minutes=rung["afterMinutes"])
             if await self._ack_or_timeout(target - workflow.now()):
-                return
+                return GATE_ACKNOWLEDGED
             await self._page(wf_id, reason, rung)
+            pages += 1
 
         last = ladder[-1]
         if last.get("repeat"):
@@ -428,13 +487,20 @@ class StudyWorkflow:
             cadence = timedelta(minutes=last["repeatEveryMinutes"])
             for attempt in range(2, ESCALATION_REPEAT_CAP + 1):
                 if await self._ack_or_timeout(base + (attempt - 1) * cadence - workflow.now()):
-                    return
+                    return GATE_ACKNOWLEDGED
                 await self._page(wf_id, reason, {**last, "attempt": attempt})
-            workflow.logger.warning(
-                "escalation repeat cap (%d) reached for %s; gate holds without further paging",
-                ESCALATION_REPEAT_CAP, wf_id,
-            )
-        await self._ack_or_timeout(None)
+                pages += 1
+
+        if not bounded:
+            await self._ack_or_timeout(None)   # pre-#57: the unbounded hold, for old histories
+            return GATE_ACKNOWLEDGED
+
+        workflow.logger.error(
+            "sign-off gate for %s exhausted its ladder after %d page(s) with no acknowledgement; "
+            "releasing to COMMUNICATE with the verification FAIL on the record", wf_id, pages,
+        )
+        await self._record_signoff_abandoned(wf_id, tier, pages)
+        return GATE_ABANDONED
 
     # ---- main run ----------------------------------------------------------------
     @workflow.run
@@ -487,7 +553,7 @@ class StudyWorkflow:
             ),
         )
 
-        # --- VERIFY: loop until PASS or a human ack resolves it -------------------
+        # --- VERIFY: loop until PASS or a human resolves it -----------------------
         while True:
             self._state = State.VERIFY
             self._verification = await self._call(
@@ -505,12 +571,27 @@ class StudyWorkflow:
             if status == "PASS" or not self._verification.get("requiresHumanReview"):
                 break
 
-            # AWAITING_SIGNOFF: hold for the radiologist addendum/ack, climbing the tier's
-            # escalation ladder (#29) while the report sits unsigned.
+            # AWAITING_SIGNOFF: hold for the radiologist's acknowledgement, climbing the tier's
+            # escalation ladder (#29) while the report sits unresolved.
             self._state = State.AWAITING_SIGNOFF
             self._signoff_ack = None
-            await self._hold_signoff_gate(wf_id)
-            # Loop re-verifies; in M2 an addendum updates self._report_event first.
+            outcome = await self._hold_signoff_gate(wf_id)
+
+            # #57 (#56 decision (b)): the gate is terminal -- do NOT re-verify. Re-running
+            # report.verify on the UNCHANGED report just re-derives the same FAIL and drops the
+            # study back into the gate, which is the loop that made this state inescapable. The
+            # study proceeds to COMMUNICATE carrying the FAIL *and* the acknowledgement (or the
+            # non-acknowledgement) on the record -- the studies this gate stranded are exactly the
+            # ones that most need COMMUNICATE to run.
+            # TODO(M2, #56 (a)): the addendum flow updates self._report_event with the CORRECTED
+            # report; only then is a re-verify meaningful, and it re-enters this loop.
+            if workflow.patched(PATCH_SIGNOFF_OVERRIDE):
+                self._signoff = {
+                    "status": outcome,
+                    **(self._signoff_ack or {}),
+                }
+                break
+            # Pre-#57 histories: fall through and re-verify, as they recorded.
 
         # --- COMMUNICATE: hand off to the existing Communications Agent (A2A) -----
         self._state = State.COMMUNICATE
@@ -540,6 +621,9 @@ class StudyWorkflow:
             "verification": self._verification,
             "comms": comms,
             "ack": ack,
+            # How the sign-off gate ended, and who released it (#57). Empty when the report passed
+            # verification and the gate never opened -- the normal case.
+            "signoff": self._signoff,
         }
 
     # ---- signals & queries -------------------------------------------------------
@@ -549,6 +633,17 @@ class StudyWorkflow:
 
     @workflow.signal
     def signoff_acknowledged(self, ack: dict) -> None:
+        """A radiologist acknowledged the verification finding and released the gate (#57).
+
+        Until #57 nothing in production sent this signal -- it existed only in tests -- which is why
+        a FAILed study could never leave AWAITING_SIGNOFF. The producer is the authenticated ingress
+        endpoint (POST /signoff/{workflowId}/override); at M2 the addendum flow becomes the main
+        path and this stays the escape hatch.
+
+        The payload is the audit record of WHO released a safety gate and WHY, so it is kept whole
+        and returned in the workflow result. Ingress validates and normalises it -- a signal handler
+        cannot reject one.
+        """
         self._signoff_ack = ack
 
     @workflow.signal

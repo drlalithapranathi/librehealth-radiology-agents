@@ -77,6 +77,11 @@ async def mock_escalate(workflow_id: str, reason: str, escalation: dict | None =
     _STATE["escalations"].append((workflow_id, reason, escalation))
 
 
+@activity.defn(name="record_signoff_abandoned_activity")
+async def mock_record_signoff_abandoned(workflow_id: str, tier: str | None, pages: int) -> None:
+    _STATE.setdefault("abandoned", []).append((workflow_id, tier, pages))
+
+
 @activity.defn(name="load_escalation_policy_activity")
 async def mock_load_policy(tier: str | None) -> list[dict]:
     return _LADDER
@@ -131,13 +136,19 @@ async def _wait_escalations(count: int, tries: int = 600) -> None:
 
 def test_unsigned_report_climbs_ladder_until_ack_releases_the_gate():
     """Escalation (#29): the sign-off gate holds while unsigned, climbing the ladder — rung 1,
-    rung 2, then the repeating final rung — and the ack releases it; the loop re-verifies to PASS.
+    rung 2, then the repeating final rung — until a radiologist acknowledges (#57's override
+    endpoint is what sends that signal in production; here it is sent directly).
+
+    #57: the ack releases the study to COMMUNICATE and it does NOT re-verify. Re-running
+    report.verify against the unchanged report would just re-derive the same FAIL and drop the
+    study back into the gate — the loop that made this state inescapable (#56). The FAIL and the
+    acknowledgement both ride out on the record.
 
     Time skipping is locked except inside env.sleep()/result-await, so each advance fires
     exactly the rung it targets and the escalation sequence is deterministic.
     """
     async def scenario():
-        # First verify needs human review (-> sign-off gate); after the ack, re-verify PASSes.
+        # A second (PASS) result is scripted but must NOT be consumed: #57 does not re-verify.
         _reset([("FAIL", True), ("PASS", False)])
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with _worker(env):
@@ -153,7 +164,10 @@ def test_unsigned_report_climbs_ladder_until_ack_releases_the_gate():
                 await _wait_escalations(2)
                 await env.sleep(timedelta(minutes=121))   # past the repeat cadence (120m)
                 await _wait_escalations(3)
-                await handle.signal(StudyWorkflow.signoff_acknowledged, {"ackBy": "Practitioner/9"})
+                await handle.signal(
+                    StudyWorkflow.signoff_acknowledged,
+                    {"acknowledgedBy": "Practitioner/9", "reason": "reviewed; finding is known",
+                     "acknowledgedAt": "2026-07-13T04:00:00Z"})
                 result = await handle.result()
         assert result["finalState"] == "ARCHIVED"
         rungs = [esc for (_, _, esc) in _STATE["escalations"]]
@@ -161,6 +175,19 @@ def test_unsigned_report_climbs_ladder_until_ack_releases_the_gate():
         assert [r["targetRole"] for r in rungs] == [
             "reading-radiologist", "on-call-radiologist", "on-call-radiologist"]  # widening audience
         assert rungs[2]["attempt"] == 2                                 # the re-fire is marked
+
+        # #57: WHO released the safety gate, and WHY, ride out in the workflow record -- that is the
+        # entire audit trail for a human waiving a verification FAIL.
+        assert result["signoff"] == {
+            "status": "ACKNOWLEDGED",
+            "acknowledgedBy": "Practitioner/9",
+            "reason": "reviewed; finding is known",
+            "acknowledgedAt": "2026-07-13T04:00:00Z",
+        }
+        # The FAIL is not erased by the acknowledgement -- it is carried forward beside it.
+        assert result["verification"]["verificationStatus"] == "FAIL"
+        # ...and the unchanged report was never re-verified.
+        assert _STATE["verify_i"] == 1, "the gate re-verified an unchanged report (#56's loop)"
     asyncio.run(scenario())
 
 
@@ -176,20 +203,29 @@ async def mock_load_repeat_policy(tier: str | None) -> list[dict]:
     return _REPEAT_LADDER
 
 
-def test_repeating_rung_stops_at_the_cap_and_the_ack_still_opens_the_gate():
-    """Backstop (#29): a repeating final rung re-fires exactly ESCALATION_REPEAT_CAP times (a
-    history-growth guard), then the gate holds with no further paging and the ack still releases
-    it. A 1-minute cadence lets one time-skip fire the whole ladder+repeat sequence; the exact
-    count and the post-cap hold are what a regression in the loop bound or the terminal wait breaks.
+def test_repeating_rung_stops_at_the_cap_and_then_RELEASES_the_study():
+    """Backstop (#29) + the escape hatch (#57): a repeating final rung re-fires exactly
+    ESCALATION_REPEAT_CAP times (a history-growth guard) -- and then the gate ENDS.
+
+    This test used to assert the opposite: that after the cap the workflow stayed parked at
+    AWAITING_SIGNOFF until an ack arrived. That was the bug (#56). Nothing in production could send
+    that ack, so "parked until acked" meant parked forever: the study never reached COMMUNICATE, so
+    the critical finding that made verification FAIL was never dispatched, and it never archived --
+    silently, because the cap had already stopped the paging.
+
+    Now the chase is bounded and its ending is recorded: the gate releases the study to COMMUNICATE
+    with the verification FAIL and the non-acknowledgement both on the record, and dead-letters it.
     """
     from orchestrator.workflow import ESCALATION_REPEAT_CAP
 
     async def scenario():
+        # Two verify results are scripted, but only ONE may be consumed: #57 must not re-verify.
         _reset([("FAIL", True), ("PASS", False)])
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
                               activities=[mock_call_agent, mock_publish, mock_escalate,
-                                          mock_load_repeat_policy], max_cached_workflows=0):
+                                          mock_load_repeat_policy, mock_record_signoff_abandoned],
+                              max_cached_workflows=0):
                 handle = await env.client.start_workflow(
                     StudyWorkflow.run, STUDY_CONTEXT, id="wf-gate-cap", task_queue=TASK_QUEUE
                 )
@@ -198,15 +234,19 @@ def test_repeating_rung_stops_at_the_cap_and_the_ack_still_opens_the_gate():
                 await _wait_state(handle, "AWAITING_SIGNOFF")
                 # One skip past the last re-fire (~cap minutes from entry) fires every rung.
                 await env.sleep(timedelta(minutes=ESCALATION_REPEAT_CAP + 30))
-                await _wait_escalations(ESCALATION_REPEAT_CAP)
-                # Cap reached: still parked at the gate (terminal hold), no (cap+1)th page fired.
-                assert await handle.query(StudyWorkflow.current_state) == "AWAITING_SIGNOFF"
-                await handle.signal(StudyWorkflow.signoff_acknowledged, {"ackBy": "Practitioner/9"})
+                # No ack is ever sent -- and the study must still finish. Before #57 this hung.
                 result = await handle.result()
         assert result["finalState"] == "ARCHIVED"
         rungs = [esc for (_, _, esc) in _STATE["escalations"]]
         assert len(rungs) == ESCALATION_REPEAT_CAP            # exactly the cap, not one more
         assert rungs[-1]["attempt"] == ESCALATION_REPEAT_CAP  # the final re-fire is the cap-th
+
+        # The ending is honest, not a pass: FAIL stands, nobody acknowledged, and it is dead-lettered.
+        assert result["signoff"] == {"status": "ABANDONED"}
+        assert result["verification"]["verificationStatus"] == "FAIL"
+        assert _STATE["abandoned"] == [("wf_gate_test", "ROUTINE", ESCALATION_REPEAT_CAP)]
+        # ...and the unchanged report was NOT re-verified: the scripted PASS is still unconsumed.
+        assert _STATE["verify_i"] == 1, "the gate re-verified an unchanged report (#56's loop)"
     asyncio.run(scenario())
 
 
