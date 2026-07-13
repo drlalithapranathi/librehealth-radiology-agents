@@ -100,13 +100,14 @@ services:
     # up are logged and dropped. StableAge (60s default) makes an early race unlikely.
 
   # --- Viewer -------------------------------------------------------------------
-  # OHIF viewer with our custom extension + reading mode baked in (issue #21).
+  # OHIF viewer with our worklist extension baked in (issue #21).
   # Built from integrations/ohif-extension/Dockerfile: multi-stage build that
-  # clones OHIF Viewers @ v3.6.5, drops our workspace packages under
-  # extensions/ and modes/, registers them in pluginConfig.json, runs the OHIF
-  # webpack build, then serves the dist/ from nginx. NOT a fork -- we consume
-  # OHIF at a pinned tag and add our plugin alongside; version bumps are a
-  # single-line change to the Dockerfile's OHIF_REF arg.
+  # fetches OHIF Viewers at the exact commit pinned by OHIF_REF (there is no
+  # v3.6.5 git tag upstream, so we pin a release/3.6 commit), drops our
+  # extension package under extensions/, registers it in pluginConfig.json,
+  # runs the OHIF webpack build, then serves the dist/ from nginx. NOT a
+  # fork -- we consume OHIF at a pinned commit and add our plugin alongside;
+  # version bumps are a single-line change to the Dockerfile's OHIF_REF arg.
   #
   # nginx also proxies /reading-api/* -> worklist-api and /orchestrator-api/*
   # -> ingress so the browser stays same-origin (no CORS on either service).

@@ -46,17 +46,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /work
 
-# Pin the OHIF release. OHIF publishes the docker image as `ohif/app:v3.6.5`
-# which corresponds to the `v3.6.5` git tag in OHIF/Viewers. When we bump this
-# to (say) v3.7.x, this is the ONE line to change -- no lockfile to rebase, no
-# extension code to touch. If the tag turns out not to exist under that exact
-# name (OHIF has flipped between `v3.6.5` and `3.6.5`), the fallback branch
-# `release/3.6` is a compatible near-neighbor.
-ARG OHIF_REF=v3.6.5
-RUN git clone --depth 1 --branch "${OHIF_REF}" \
-      https://github.com/OHIF/Viewers.git . \
-    || git clone --depth 1 --branch "release/3.6" \
-      https://github.com/OHIF/Viewers.git .
+# Pin the OHIF source to an exact commit. There is NO v3.6.5 git tag in
+# OHIF/Viewers (v-prefixed tags stop at v3.6.0), even though Docker Hub has an
+# ohif/app:v3.6.5 image, so cloning a tag with a branch fallback would quietly
+# build whatever release/3.6 pointed at that day. We fetch the commit itself
+# and a bad ref FAILS the build instead of falling back. Bumping OHIF is still
+# a one line change: point OHIF_REF at a new commit or any fetchable ref.
+# 72ec0bf is the release/3.6 HEAD this image was validated against.
+ARG OHIF_REF=72ec0bffb533f883aac3b76d0ed9559c70fe5838
+RUN git init -q . \
+    && git remote add origin https://github.com/OHIF/Viewers.git \
+    && git fetch --depth 1 origin "${OHIF_REF}" \
+    && git checkout -q FETCH_HEAD
 
 # Drop our extension into the workspace. Copying into extensions/ means Yarn
 # workspaces picks it up automatically as `@lhrad/extension-worklist`. This

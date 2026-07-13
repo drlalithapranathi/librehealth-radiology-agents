@@ -386,3 +386,23 @@ list:
 
 Approach B still stands as the R2 decision; this addendum only corrects
 HOW the WorkList reaches the URL, not what gets built.
+## Third addendum (merge review): the v3.6.5 pin was not a pin
+
+Found while verifying the MR before merge: OHIF/Viewers has NO `v3.6.5` git
+tag. The v-prefixed tags stop at `v3.6.0` and the `@ohif/viewer@*` tags stop
+at 3.6.3; the `ohif/app:v3.6.5` Docker Hub tag has no git twin. So the
+Dockerfile's `git clone --branch v3.6.5 || git clone --branch release/3.6`
+took the fallback on every single build and quietly built whatever
+`release/3.6` pointed at that day. The old compose setup pinned the stock
+image by digest for exactly this reason, so this was a step backwards in
+reproducibility, and the `||` fallback would also have masked any future
+typo in `OHIF_REF` forever.
+
+Fixed at merge time:
+
+- `OHIF_REF` now pins the exact commit the stack was validated against
+  (`72ec0bf`, the `release/3.6` HEAD at review time), fetched directly via
+  `git fetch --depth 1 origin "$OHIF_REF"`.
+- A bad ref now FAILS the build instead of silently falling back.
+- Version bumps stay a one line change: point `OHIF_REF` at a new commit or
+  any fetchable ref (tag or branch name both work).
