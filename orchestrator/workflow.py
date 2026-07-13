@@ -340,9 +340,12 @@ class StudyWorkflow:
             if not state.get("overdue"):
                 # Not actually late: the ledger's clock trails ours, or the deadline moved. Re-read
                 # it and wait again -- escalating a result that is not overdue pages a human early
-                # and, worse, teaches them the pages are noise.
+                # and, worse, teaches them the pages are noise. Floor the next check at one grace
+                # period from now: a ledger that keeps reporting the SAME stale deadline would
+                # otherwise make every wait non-positive and burn the loop cap in a sleepless spin.
                 moved = self._deadline(state.get("deadline") or "")
-                deadline = moved if moved is not None else deadline + ACK_GRACE
+                floor = workflow.now() + ACK_GRACE
+                deadline = max(moved, floor) if moved is not None else floor
                 continue
 
             if escalations >= ACK_ESCALATION_CAP:

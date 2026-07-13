@@ -24,7 +24,12 @@ from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
 from orchestrator.state import TASK_QUEUE  # noqa: E402
-from orchestrator.workflow import ACK_ESCALATION_CAP, ACK_GRACE, StudyWorkflow  # noqa: E402
+from orchestrator.workflow import (  # noqa: E402
+    ACK_ESCALATION_CAP,
+    ACK_GRACE,
+    ACK_LOOP_CAP,
+    StudyWorkflow,
+)
 
 STUDY_CONTEXT = {
     "schemaVersion": "1.0.0", "workflowId": "wf_ack",
@@ -64,13 +69,19 @@ async def _mock_call(agent: str, skill_id: str, payload: dict) -> dict:
         # case, and the loop must not run at all.
         if not script.get("critical"):
             return {"dispatchStatus": "SENT", "channelResults": []}
+        _STATE["dispatch_deadline"] = _deadline_in(ACK_MINUTES)
         return {"dispatchStatus": "SENT", "acrCategory": "Cat1", "communicationId": "c1",
-                "taskId": "t1", "deadline": _deadline_in(ACK_MINUTES),
+                "taskId": "t1", "deadline": _STATE["dispatch_deadline"],
                 "recipient": "Practitioner/ordering"}
 
     if skill_id == "comms.checkAck":
         task_id = payload["taskId"]
         _STATE["calls"].append(("comms.checkAck", task_id))
+        if script.get("never_overdue"):
+            # A ledger whose clock trails ours far enough that the Task never reads overdue, and
+            # whose re-read reports the SAME deadline every time.
+            return {"taskId": task_id, "ackStatus": "REQUESTED",
+                    "deadline": _STATE["dispatch_deadline"], "overdue": False}
         escalations = sum(1 for s, _ in _STATE["calls"] if s == "comms.escalate")
         if _STATE["acked"] is not None and escalations >= _STATE["acked"]:
             return {"taskId": task_id, "ackStatus": "COMPLETED",
@@ -209,6 +220,27 @@ def test_the_wait_is_a_durable_temporal_timer_not_a_poll():
     # window+grace, and comfortably above the window itself.
     window = timedelta(minutes=ACK_MINUTES)
     assert window < timedelta(seconds=timers[0]) <= window + ACK_GRACE
+
+
+def test_a_ledger_stuck_on_a_stale_deadline_still_gets_a_timer_between_rechecks():
+    """The skew branch trusts the ledger's re-read deadline -- but a ledger whose clock trails ours
+    can report the SAME stale deadline forever, making every computed wait non-positive. Without the
+    grace floor the loop would burn ACK_LOOP_CAP re-checks back-to-back with no sleep and bound out
+    within a second. So assert the mechanism again: the loop still archives honestly, and EVERY
+    re-check is separated by a real Temporal timer of at least the grace period."""
+    result, history = asyncio.run(
+        _run({"critical": True, "never_overdue": True}, "wf-ack-stale", want_history=True))
+
+    assert result["ack"]["ackStatus"] == "UNACKNOWLEDGED"
+    assert result["ack"]["escalations"] == 0              # never overdue, so never escalated
+    assert _skills().count("comms.checkAck") == ACK_LOOP_CAP
+    assert _skills().count("comms.escalate") == 0
+
+    timers = [e.timer_started_event_attributes.start_to_fire_timeout.seconds
+              for e in history.events if e.HasField("timer_started_event_attributes")]
+    assert len(timers) == ACK_LOOP_CAP, "a re-check ran without a timer: the sleepless spin is back"
+    grace = ACK_GRACE.total_seconds()
+    assert all(t >= grace for t in timers[1:]), "re-check waits shrank below the grace floor"
 
 
 def test_a_routine_result_opens_no_clock_and_is_never_checked():
