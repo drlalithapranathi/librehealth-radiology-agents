@@ -19,6 +19,8 @@ from temporalio.testing import WorkflowEnvironment  # noqa: E402
 from temporalio.worker import Worker  # noqa: E402
 
 ingress = pytest.importorskip("orchestrator.ingress", reason="orchestrator deps not installed")
+from radagent_common import paths, validate_against  # noqa: E402
+
 from orchestrator.state import TASK_QUEUE  # noqa: E402
 from orchestrator.workflow import StudyWorkflow  # noqa: E402
 
@@ -112,6 +114,42 @@ def test_build_context_falls_back_on_miss():
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["patient"] == {"fhirPatientId": "Patient/UNRESOLVED"}
     assert ctx["order"] == {}
+
+
+# --- the seam: the context ingress BUILDS must carry what triage SCORES on (issue #61) ------
+#
+# The bug this guards was invisible because it lived in the seam. Triage has 38 tests and they all
+# pass; every one of them scores a hand-written fixture whose `order` already carries `priority` and
+# `reasonCode`. Ingress -- the only thing that builds an `order` in production -- carried neither, so
+# every real study reached triage with no urgency, scored the base 50, and came out ROUTINE. Both
+# sides were green and the join between them was broken.
+RESOLVED_STAT = {
+    "fhirPatientId": "Patient/pat-1",
+    "fhirServiceRequestId": "ServiceRequest/sr-dup",
+    "priority": "stat",
+    "reasonCode": ["J93.1"],  # pneumothorax
+}
+
+
+def test_build_context_carries_the_signals_triage_scores_on():
+    ingress._FHIR = _FakeFhir(result=RESOLVED_STAT)
+    ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
+    assert ctx["order"] == {
+        "fhirServiceRequestId": "ServiceRequest/sr-dup",
+        "priority": "stat",
+        "reasonCode": ["J93.1"],
+    }
+    # And the envelope carrying them is still schema-valid: `order` is additionalProperties:false,
+    # so a field that reaches it must be one the contract already declares.
+    validate_against(ctx, paths.contracts_dir() / "studycontext.schema.json")
+
+
+def test_build_context_omits_signals_an_order_does_not_have():
+    ingress._FHIR = _FakeFhir(result={k: RESOLVED_STAT[k]
+                                      for k in ("fhirPatientId", "fhirServiceRequestId")})
+    ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
+    assert ctx["order"] == {"fhirServiceRequestId": "ServiceRequest/sr-dup"}
+    validate_against(ctx, paths.contracts_dir() / "studycontext.schema.json")
 
 
 # --- integration: a re-fire repairs the ServiceRequest join without a restart ---

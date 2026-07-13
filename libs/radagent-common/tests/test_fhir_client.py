@@ -159,6 +159,57 @@ def test_resolve_by_accession_empty_accession_makes_no_call():
     assert called is False  # empty accession short-circuits, no fhir2 round-trip
 
 
+# --- the order's triage signals ride along with the refs (issue #61) --------
+def _resolve(resource: dict):
+    client = Fhir2Client()
+
+    async def fake_get(path, params=None):
+        return _bundle(resource)
+
+    client._get = fake_get  # type: ignore[assignment]
+    return asyncio.run(client.resolve_order_by_accession("ACC-9"))
+
+
+def test_resolve_carries_priority_and_reason_codes():
+    resolved = _resolve({**_SR, "priority": "stat", "reasonCode": [
+        {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10", "code": "J93.1"}]}]})
+    # Without these two the study reaches triage with no urgency at all and scores ROUTINE (#61).
+    assert resolved["priority"] == "stat"
+    assert resolved["reasonCode"] == ["J93.1"]
+
+
+def test_resolve_omits_the_signals_the_order_does_not_carry():
+    # An order with neither is not an error -- it resolves to the join ref alone, as before #61.
+    assert _resolve(_SR) == {"fhirPatientId": "Patient/pat-9",
+                             "fhirServiceRequestId": "ServiceRequest/sr-9"}
+
+
+def test_resolve_drops_a_priority_outside_the_envelope_enum():
+    # order.priority is a schema ENUM. A fhir2 answering "emergency" must yield no priority rather
+    # than a value that fails StudyContext validation and drops the study on the floor.
+    resolved = _resolve({**_SR, "priority": "emergency"})
+    assert "priority" not in resolved
+
+
+def test_resolve_takes_every_coding_and_dedupes():
+    resolved = _resolve({**_SR, "reasonCode": [
+        {"coding": [{"system": "http://hl7.org/fhir/sid/icd-10", "code": "J93.1"},
+                    {"system": "http://snomed.info/sct", "code": "36118008"}]},
+        {"coding": [{"code": "J93.1"}]},          # same code again, different concept
+        {"coding": [{"code": "R07.9"}]},
+    ]})
+    assert resolved["reasonCode"] == ["J93.1", "36118008", "R07.9"]
+
+
+def test_resolve_never_carries_a_reason_narrative():
+    # `text` on a reason is where a clinician's free-text ends up -- PHI's front door. A concept
+    # with no coding contributes NOTHING, and the narrative never reaches the wire (Golden rule 2).
+    resolved = _resolve({**_SR, "reasonCode": [
+        {"text": "Mrs Patel, ?tension pneumothorax, deteriorating on the ward"}]})
+    assert "reasonCode" not in resolved
+    assert "Patel" not in str(resolved)
+
+
 # --- get_report_conclusion (issue #16) -------------------------------------
 def test_get_report_conclusion_reads_the_typed_ref():
     client = Fhir2Client()

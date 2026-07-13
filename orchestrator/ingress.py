@@ -122,9 +122,21 @@ async def _build_study_context(event: dict) -> dict:
     }
 
 
+# The order fields beyond the join ref that the StudyContext carries. `triage.score` scores on both
+# and can do nothing without them, so dropping them here silently demotes every study to ROUTINE --
+# which is exactly what ingress did until #61.
+_ORDER_SIGNALS = ("priority", "reasonCode")
+
+
 async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
-    """(patient, order) blocks for the StudyContext. Resolve real refs from fhir2 by accession; on a
-    miss or ANY fhir2 failure, return the UNRESOLVED placeholder -- never fail ingestion (#11)."""
+    """(patient, order) blocks for the StudyContext. Resolve the real refs -- and the order's
+    urgency signals, which triage scores on (#61) -- from fhir2 by accession; on a miss or ANY fhir2
+    failure, return the UNRESOLVED placeholder -- never fail ingestion (#11).
+
+    An order that carries no priority and no reason code resolves to the join ref alone; triage
+    treats an absent priority as neutral, which is honest. What is NOT honest is dropping the ones
+    that were there.
+    """
     if accession:
         try:
             resolved = await _fhir().resolve_order_by_accession(accession)
@@ -132,8 +144,11 @@ async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
             _log.warning("fhir2 resolution failed for accession %s; starting Patient/UNRESOLVED", accession)
             resolved = None
         if resolved:
-            return ({"fhirPatientId": resolved["fhirPatientId"]},
-                    {"fhirServiceRequestId": resolved["fhirServiceRequestId"]})
+            order = {"fhirServiceRequestId": resolved["fhirServiceRequestId"]}
+            # Copy by allow-list: `order` is additionalProperties:false, so an unexpected key from
+            # a future resolver would fail StudyContext validation and drop the study.
+            order.update({k: resolved[k] for k in _ORDER_SIGNALS if resolved.get(k)})
+            return {"fhirPatientId": resolved["fhirPatientId"]}, order
     return {"fhirPatientId": "Patient/UNRESOLVED"}, {}
 
 
