@@ -172,6 +172,20 @@ orchestrator-e2e-it:
     - pip install -e "libs/radagent-common[a2a]" uvicorn "temporalio==1.29.0" pytest
     - python -m pytest orchestrator/tests/test_e2e_temporal.py -q
 
+ohif-extension-tests:
+  # Issue #21: the OHIF worklist extension's vitest suite + typecheck. Runs against the
+  # extension's own lockfile, no OHIF monorepo needed. Without this lane the extension's
+  # 30 tests never run in CI, and a guard CI never runs is not a guard. The Docker image
+  # build (which pulls the OHIF monorepo) stays a local/deploy concern.
+  extends: .default-rules
+  stage: test
+  image: node:20-bookworm-slim
+  script:
+    - cd integrations/ohif-extension
+    - npm ci
+    - npm test
+    - npm run typecheck
+
 # The managed SAST/Secret-Detection templates default to branch pipelines only, so with the
 # workflow block above (which suppresses the push pipeline on MR branches) they would run on
 # NO merge request at all. Opt the concrete analyzer jobs into MR pipelines by overriding

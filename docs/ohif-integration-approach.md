@@ -164,3 +164,245 @@ Approach B path is what R2 was implicitly pointing at as the sane middle.
   confirms the built-in Study List sorts by `StudyDate` desc under 100
   results and defers to server order otherwise; there is no config knob
   to inject external priority.
+
+---
+
+## Addendum (issue #21 kickoff): the "just edit app-config.js" reading was wrong
+
+Owner: Parvati. Status: **execution correction, does not change the decision.**
+Prompted by [group chat with Saptarshi during #21 kickoff].
+
+The original doc above said (in "Consequences for #21"): *"Registration in
+`docker/ohif/app-config.js` deferred to the #21 MR itself so the extension
+is only registered once it exists (avoids a broken viewer on the intermediate
+merge)."* That sentence is materially wrong — it implied our extension could
+be registered with an edit to `app-config.js` at runtime. OHIF v3 does not
+work that way. `window.config.extensions = [...]` references modules that
+must be **baked into the viewer bundle at build time**. Overriding
+`app-config.js` handles runtime configuration (URLs, sort order, feature
+flags); it cannot add new JavaScript modules to the running viewer.
+
+The correct wording — folded into the #21 MR: registration requires our
+**own OHIF image build**, not just an `app-config.js` edit. Concretely: a
+Dockerfile in `integrations/ohif-extension/` runs a multi-stage build that
+consumes OHIF at a pinned version (v3.6.5 today) plus our extension/mode
+packages, produces a viewer bundle with everything compiled in, and nginx
+serves it. `docker-compose.yml` switches `image:` → `build:` on the ohif
+service. This is Saptarshi's clarification and it is what #21 ships.
+
+### Why "thin-app" — build a small package consuming `@ohif/*` from npm — is not a viable middle path
+
+Saptarshi's message suggested trying a thin-app spike *first*, with a
+monorepo clone as the fallback. During #21 kickoff I checked; the thin-app
+path does not exist as a real option. Documenting the reasoning so the
+question doesn't get relitigated.
+
+**A thin-app would need three things to be true simultaneously.**
+
+1. **A consumable OHIF app-shell package on npm** — something like
+   `@ohif/app` you can `npm install`, containing the webpack config, entry
+   HTML, runtime bootstrap, extension-registration mechanism, and
+   Cornerstone3D/WASM asset handling.
+2. **A version reachable on npm** matching our Docker target.
+3. **A compatible peer-dep tree** — React version, TypeScript version, and
+   webpack version aligned.
+
+**What I actually found in npm:**
+
+`@ohif/core`, `@ohif/ui`, `@ohif/extension-default`, `@ohif/extension-cornerstone`
+and friends are published as **libraries** — building blocks other projects
+can consume. But `@ohif/app` is not on npm at all. `platform/app` inside
+the Viewers monorepo is the *application itself* (webpack config, HTML
+entry, bootstrap, service worker, i18n setup, extension registration
+plumbing). It is not packaged for external consumption because it is not
+a library.
+
+To make thin-app work, we would have to **reimplement OHIF's application
+shell** from scratch: our own webpack config that handles Cornerstone3D's
+WASM assets, dynamic imports, CSS, and i18n; our own HTML entry; our own
+bootstrap that mirrors what `platform/app` does when it registers
+extensions and mounts the router. That is not "consuming a library." It
+is a fork of the application layer, worse than the monorepo-clone path
+because it detaches us from OHIF's upstream evolution while giving nothing
+back.
+
+Requirements 2 and 3 also had problems in isolation (npm skips patch
+versions, so `3.6.5` isn't published — the nearest is `3.6.0`; and the
+current `@ohif/*` tree above 3.11 requires React 18 while v3.6.x is
+React 17). But those are the sort of small mismatches you'd normally
+work around. The blocker is requirement 1: **there is no OHIF app
+package to consume.**
+
+**Conclusion recorded here so a future contributor doesn't re-run the
+spike:** the monorepo-clone path in the Dockerfile is not a fallback
+after thin-app fails; it is the only reasonable route. Approach B (custom
+mode + WorkList component + panel) still stands — this addendum only
+corrects HOW it gets built and shipped, not what gets built.
+
+### Bonus workarounds we can now drop
+
+Owning the image build lets us drop two workarounds carried today for the
+stock `ohif/app:v3.6.5` image:
+
+* The `__filename`/`__dirname` WASM shim at the top of
+  `docker/ohif/app-config.js` — needed today because a codec worker chunk
+  in the stock image was Emscripten-compiled with Node globals referenced
+  unconditionally. Once we control the build, we can patch the codec at
+  compile time (or upgrade past the buggy version) and drop the shim.
+* The `gzip_static on;` dance in `docker/ohif/default.conf` — needed today
+  because the stock image ships JS/CSS as 0-byte placeholders with content
+  in matching `.gz` files. Our build can emit uncompressed bundles (nginx
+  can gzip on the fly) and drop the pre-compression step.
+
+**Not in the #21 MR.** Both workarounds stay in this MR to keep scope
+tight and let us verify the custom image is otherwise identical to the
+stock one before subtracting anything. Small follow-up MR after #21
+lands.
+
+### Consequences for #21 — corrected
+
+- Skeleton lives at `integrations/ohif-extension/` (this MR fills it).
+- **Extension packaged as npm workspace packages inside the OHIF Viewers
+  monorepo at build time** via `integrations/ohif-extension/Dockerfile`.
+  Our source tree is one package for local dev ergonomics; the Dockerfile
+  splits it into `extensions/lhrad-extension-worklist/` and
+  `modes/lhrad-mode-reading/` inside the workspace so OHIF's
+  `pluginConfig.json` can list them as distinct packages per convention.
+- `docker/ohif/app-config.js` gets updated in this MR to register
+  `@lhrad/extension-worklist` in `extensions[]` and `@lhrad/mode-reading`
+  in `modes[]`.
+- `docker-compose.yml` swaps `image: ohif/app@sha256:...` → `build:` on
+  the `ohif` service in this MR.
+- `docker/ohif/default.conf` adds `/reading-api/*` and
+  `/orchestrator-api/*` reverse proxies so browser calls stay same-origin.
+- `/worklist` response shape is stable as documented in
+  `integrations/worklist-api/main.py`; #21 consumes it via `WorklistItem`
+  TS types in `integrations/ohif-extension/src/types.ts`.
+- `contracts/events/ohif-opened.schema.json` shape verified against
+  the emitter; ingest surface (`POST /orchestrator-api/events/ohif-opened`
+  → `orchestrator/ingress.py`) is a small follow-up (~10 lines parallel
+  to `orthanc_webhook`).
+- Workaround cleanup deferred to a follow-up MR after #21 lands.
+
+
+---
+
+## Second addendum (issue #21 execution): pivot from custom mode to `customizationService.customRoutes`
+
+Owner: Parvati. Status: **execution correction, does not change the R2
+decision.** Prompted by empirical testing during #21 build-and-run.
+
+### What we tried and why it didn't work
+
+The first-addendum plan shipped Approach B as "custom mode + custom
+WorkList component" packaged as two workspace packages
+(`extensions/lhrad-extension-worklist/` and `modes/lhrad-mode-reading/`),
+both compiled into the OHIF bundle via `pluginConfig.json`. The mode
+registered a route at `/reading` whose `layoutTemplate` returned our
+WorkList component. On paper this matched the OHIF Modes documentation.
+
+On a live build, `/reading` rendered a blank dark page — no console
+errors, no `onModeEnter` log firing, but React had mounted and OHIF's
+services had all registered. Cross-testing against OHIF's own built-in
+`/viewer` route (with no `?StudyInstanceUIDs=...` param) reproduced the
+same blank dark page. The empirical finding: **OHIF v3 modes are
+study-viewer wrappers by contract, not general-purpose routes.** Every
+mode route is nested under OHIF's `DataSourceWrapper` (see
+`platform/app/src/routes/index.tsx` and
+`platform/app/src/routes/Mode/Mode.tsx`), which gates rendering on
+study UIDs being present in the URL and silently renders null otherwise.
+A worklist screen has no study UIDs by definition, so it renders
+nothing.
+
+The OHIF Modes docs describe the mode API as "OHIF-v3 shines… simply add
+a new layoutTemplate," but the `DataSourceWrapper` gate isn't called out
+there. It only surfaces when you actually load a mode without study UIDs
+and see nothing. A future OHIF release may relax the gate (there is an
+open feature request along these lines) but v3.6.5 does not.
+
+### What we did instead
+
+The R2 doc's own Reference-material section had already flagged the
+alternative: OHIF's [Customization Service — Custom Routes](https://docs.ohif.org/platform/services/customization-service/customroutes/).
+At R2 time we'd noted it as "considered but not chosen because a mode is
+a cleaner fit for the read-time hooks we need"; the empirical evidence
+above inverts that ranking.
+
+`platform/app/src/routes/index.tsx` (line ~55) reads
+`customizationService.getGlobalCustomization('customRoutes')` at
+router-build time and spreads `customRoutes.routes` into `allRoutes`
+**outside** the `DataSourceWrapper` gate. That's the extension point
+we now use:
+
+- The extension's `preRegistration` hook calls
+  `customizationService.setGlobalCustomization('customRoutes', { routes: [{ path: '/reading', children: WorkList }] })`.
+- OHIF's router wires `/reading` → WorkList directly. No mode, no
+  DataSourceWrapper, no study-UID gate.
+- `StudyOpenedEvent` still fires on row click inside the WorkList
+  (unchanged from the original design).
+- The read-time hooks the R2 note mentioned as reasons to prefer a mode
+  (`onModeEnter` / `onModeExit`) are not needed on `/reading` itself,
+  because `/reading` is the *worklist* screen. Those hooks fire when a
+  radiologist opens a *study*, which happens on OHIF's built-in
+  `/viewer/...` route — which we're not overriding. The mode-vs-route
+  tradeoff at R2 time misidentified where those hooks would fire.
+
+### Consequences for #21 — corrected again
+
+Changes from the first-addendum's "Consequences for #21 — corrected"
+list:
+
+- **One workspace package, not two.** The extension packages as
+  `extensions/lhrad-extension-worklist/` only. No
+  `modes/lhrad-mode-reading/`, no mode source file, no mode-package
+  synthesis in the Dockerfile.
+- **`pluginConfig.json` registers extensions only.** The Dockerfile's
+  registration step no longer pushes into `cfg.modes`.
+- **`docker/ohif/app-config.js` keeps `extensions: []` and `modes: []`
+  both empty**, and the comment there is updated to reflect that
+  `/reading` is a `customizationService.customRoutes` injection rather
+  than a compiled-in mode.
+- **`docker-compose.yml` swap** (`image:` → `build:` on the ohif
+  service) is unchanged.
+- **`docker/ohif/default.conf`** reverse-proxy additions are unchanged
+  (`/reading-api/*` → worklist-api; `/orchestrator-api/*` still
+  commented out pending the ingress endpoint).
+- **`contracts/events/ohif-opened.schema.json`** unchanged; ingest
+  surface still a small follow-up.
+- **Bonus workarounds section** unchanged and still deferred to a
+  follow-up MR.
+
+### Why this is strictly better than the mode path we originally chose
+
+- No OHIF source is patched. The R2 doc's "compose OHIF at a pinned
+  tag" framing is now accurate again, which it wouldn't have been if we
+  had reached for `sed`-editing the router (the escape hatch we briefly
+  considered before rediscovering `customRoutes`).
+- Uses an OHIF-documented public API surface, so version-bump risk is
+  bounded to `customizationService.setGlobalCustomization` staying
+  stable — cheaper than tracking mode-contract or router shape changes.
+- The extension package is smaller by one whole workspace, which is
+  fewer moving pieces to reason about at review time.
+
+Approach B still stands as the R2 decision; this addendum only corrects
+HOW the WorkList reaches the URL, not what gets built.
+## Third addendum (merge review): the v3.6.5 pin was not a pin
+
+Found while verifying the MR before merge: OHIF/Viewers has NO `v3.6.5` git
+tag. The v-prefixed tags stop at `v3.6.0` and the `@ohif/viewer@*` tags stop
+at 3.6.3; the `ohif/app:v3.6.5` Docker Hub tag has no git twin. So the
+Dockerfile's `git clone --branch v3.6.5 || git clone --branch release/3.6`
+took the fallback on every single build and quietly built whatever
+`release/3.6` pointed at that day. The old compose setup pinned the stock
+image by digest for exactly this reason, so this was a step backwards in
+reproducibility, and the `||` fallback would also have masked any future
+typo in `OHIF_REF` forever.
+
+Fixed at merge time:
+
+- `OHIF_REF` now pins the exact commit the stack was validated against
+  (`72ec0bf`, the `release/3.6` HEAD at review time), fetched directly via
+  `git fetch --depth 1 origin "$OHIF_REF"`.
+- A bad ref now FAILS the build instead of silently falling back.
+- Version bumps stay a one line change: point `OHIF_REF` at a new commit or
+  any fetchable ref (tag or branch name both work).
