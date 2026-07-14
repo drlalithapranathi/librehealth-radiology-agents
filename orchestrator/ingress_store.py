@@ -28,6 +28,7 @@ from radagent_common import paths
 # reconcile by hand; the kind says which surface degraded.
 KIND_SIGNOFF_DROP = "signoff-drop"                          # a sign-off the poller gave up on (#29)
 KIND_POLICY_LOAD_FAILURE = "escalation-policy-load-failure"  # the ladder collapsed to one page (#54)
+KIND_SIGNOFF_ABANDONED = "signoff-abandoned"                 # gate ran out of ladder, nobody acked (#57)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS workflow_index (
@@ -217,6 +218,31 @@ class IngressStore:
             reason=f"{reason} (tier={tier or 'unknown'})",
             at_iso=at_iso,
             kind=KIND_POLICY_LOAD_FAILURE,
+        )
+
+    def add_signoff_abandoned(self, workflow_id: str, tier: Optional[str], pages: int,
+                              at_iso: str) -> None:
+        """Record a sign-off gate that ran out of ladder with nobody acknowledging (#57).
+
+        This is the LOUD half of removing the silent hold. Before #57 such a study paged its way up
+        the ladder, hit the repeat cap, and then waited forever for a signal nothing could send:
+        invisible, un-archivable, and -- because it never reached COMMUNICATE -- its critical
+        finding never dispatched. Now the gate releases the study and says so here. The report still
+        carries a verification FAIL that no human ever acknowledged, so this row is not
+        informational: it is a study a human must go and look at.
+
+        Keyed per workflow (one row per study, not per page). `report_id` carries a synthetic key —
+        read `kind` to tell the dead-letter surfaces apart.
+        """
+        self.add_dead_letter(
+            report_id=f"{KIND_SIGNOFF_ABANDONED}:{workflow_id}",
+            workflow_id=workflow_id,
+            attempts=pages,
+            reason=(f"sign-off gate exhausted its escalation ladder after {pages} page(s) with no "
+                    f"acknowledgement (tier={tier or 'unknown'}); released to COMMUNICATE with the "
+                    f"verification FAIL unacknowledged"),
+            at_iso=at_iso,
+            kind=KIND_SIGNOFF_ABANDONED,
         )
 
     def dead_letters(self) -> list[dict]:

@@ -26,6 +26,7 @@ ACT_ESCALATE = "escalate_activity"
 ACT_LOAD_ESCALATION_POLICY = "load_escalation_policy_activity"
 ACT_WRITE_PRESIGN_IMPRESSION = "write_presign_impression_activity"
 ACT_RECORD_POLICY_FAILURE = "record_policy_failure_activity"
+ACT_RECORD_SIGNOFF_ABANDONED = "record_signoff_abandoned_activity"
 
 
 def callback_base_url() -> str:

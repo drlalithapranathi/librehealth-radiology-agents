@@ -44,7 +44,8 @@
         "channels": { "$ref": "#/$defs/level/properties/channels" },
         "urgency": { "$ref": "#/$defs/level/properties/urgency" },
         "attempt": { "type": "integer", "minimum": 1, "description": "1-based fire count of this rung; >1 only when a repeating final rung re-fires." },
-        "reason": { "type": "string", "description": "Human-readable cause, e.g. 'sign-off gate timed out awaiting radiologist'." }
+        "reason": { "type": "string", "description": "Human-readable cause, e.g. 'sign-off gate timed out awaiting radiologist'." },
+        "overrideUrl": { "type": "string", "description": "Where the paged human releases this study's sign-off gate (#57): the authenticated override endpoint, workflowId already substituted. Optional -- omitted when SIGNOFF_OVERRIDE_URL is unset (the dev/compose default). A page that says 'act' without saying HOW is how a study sits at the gate until its ladder runs out." }
       }
     },
     "level": {
