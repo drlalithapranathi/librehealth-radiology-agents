@@ -165,6 +165,7 @@ ris-poller-tests:
       libs/radagent-common/tests/test_comms_ledger.py
       libs/radagent-common/tests/test_orthanc_client.py
       libs/radagent-common/tests/test_tracing.py
+      libs/radagent-common/tests/test_presign_concept_drift.py
       orchestrator/tests -q
 
 orchestrator-e2e-it:
