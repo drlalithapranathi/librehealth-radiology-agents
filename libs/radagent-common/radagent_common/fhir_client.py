@@ -86,17 +86,31 @@ def _write_transport_is_secure(base_url: str) -> bool:
     return os.environ.get("FHIR2_ALLOW_INSECURE_WRITE", "").strip().lower() in {"1", "true", "yes"}
 
 
-# TODO(M3): read-transport TLS. The guard above covers writes only. The read methods on
+# TODO(M3, #67): read-transport TLS. The guard above covers writes only. The read methods on
 # Fhir2Client return PHI -- demographics, conditions, allergies, medications, labs, and the
 # radiologist's narrative (get_report_conclusion) -- through `_get` over the SAME plaintext-capable
 # base URL and Basic credentials, ungated. The RIS poller reads every 30s, so a write-inert
 # deployment is exposed continuously. #30 is scoped to the write; refusing (or requiring TLS for)
-# plaintext reads to a remote host is its own item and is not in the #30 N1/N3 follow-ups.
+# plaintext reads to a remote host is tracked in #67 (not in the #30 N1/N3 follow-ups).
+
+
+class InsecureWriteTransportError(RuntimeError):
+    """A fhir2 write refused because the transport is plaintext to a non-loopback host and the
+    insecure opt-in is not set (#30).
+
+    Subclass of RuntimeError so existing `except RuntimeError` paths still catch it. It is NAMED so
+    the orchestrator can mark it non-retryable BY TYPE without string-matching the message:
+    temporalio converts a raised exception to an ApplicationError whose `type` is
+    `exception.__class__.__name__`, so `non_retryable_error_types=["InsecureWriteTransportError"]` at
+    the activity call site keys off this name -- and the shared lib still never imports temporalio. A
+    misconfigured transport is a config error, not a transient fault; retrying it only burns the
+    bounded retry budget before the same skip.
+    """
 
 
 def _guard_write_transport(base_url: str) -> None:
     if not _write_transport_is_secure(base_url):
-        raise RuntimeError(
+        raise InsecureWriteTransportError(
             "refusing a fhir2 write over plaintext HTTP to a non-loopback host: the pre-sign "
             "impression (PHI) and the HTTP Basic credentials would travel in cleartext. Use an "
             "https base URL, or set FHIR2_ALLOW_INSECURE_WRITE=1 for a trusted internal network."
@@ -360,6 +374,12 @@ class Fhir2Client:
 
         Returns the written DiagnosticReport's bare id.
         """
+        # Guard the transport UP FRONT, before the idempotency lookup -- not only inside _post/_put.
+        # `_find_presign_draft` issues a credentialed GET; on the exact deployment this guard refuses
+        # (plaintext to a remote host, no opt-in) that GET's `Authorization: Basic` header would go out
+        # before the write is ever refused. Raising here means a refused write leaks nothing. The guard
+        # stays in _post/_put as a backstop for any other write path.
+        _guard_write_transport(self.base_url)
         existing_id = await self._find_presign_draft(service_request_ref, patient_ref)
         resource = {
             "resourceType": "DiagnosticReport",
