@@ -76,6 +76,36 @@ services:
       retries: 12
     volumes: ["mariadb-data:/var/lib/mysql"]
 
+  # --- One-shot: provision the AI pre-sign impression draft concept in o3 --------
+  # Ensures the "AI pre-sign impression draft" concept exists at its stable UUID
+  # in the OpenMRS concept dictionary before any workflow tries to write a pre-sign
+  # DiagnosticReport via fhir2 (#55). Idempotent -- runs on every `compose up`, but
+  # only inserts if the concept isn't already there.
+  #
+  # Runs against mariadb via direct SQL rather than the OpenMRS REST endpoint
+  # because REST auto-assigns UUIDs on POST and won't honour the caller-supplied
+  # UUID we need to be stable across deployments. See docker/openmrs/README.md
+  # and docs/presign-concept.md for the full rationale.
+  presign-concept-bootstrap:
+    image: python:3.11-slim
+    depends_on:
+      openmrs:
+        condition: service_healthy
+      mariadb:
+        condition: service_healthy
+    environment:
+      OMRS_DB_HOSTNAME: mariadb
+      OMRS_DB_NAME: openmrs
+      OMRS_DB_USERNAME: openmrs
+      OMRS_DB_PASSWORD: openmrs
+    volumes:
+      - ./docker/openmrs/bootstrap_presign_concept.py:/opt/bootstrap.py:ro
+    command:
+      - sh
+      - -c
+      - "pip install --quiet --no-cache-dir pymysql==1.1.0 && python /opt/bootstrap.py"
+    restart: "no"
+
   # --- PACS ---------------------------------------------------------------------
   # SQLite-backed Orthanc with DICOMweb enabled for OHIF, and the OnStableStudy
   # Python plugin wired at /etc/orthanc/orthanc_stable_study.py. The orthancteam
@@ -218,9 +248,13 @@ services:
       FHIR2_BASIC_USER: admin
       FHIR2_BASIC_PASS: Admin123
       # Pre-sign impression draft (#26) codes its DiagnosticReport with a real OpenMRS Concept
-      # (fhir2 rejects a text-only code with codeRequired). Defaults in-code to the CIEL
-      # "Provisional diagnosis" concept; set FHIR2_PRESIGN_REPORT_CONCEPT to a deployment's own
-      # radiology-report concept UUID to override.
+      # (fhir2 rejects a text-only code with codeRequired). Default is the LH-Radiology "AI pre-sign
+      # impression draft" concept, provisioned into the o3 concept dictionary at stack startup by
+      # the presign-concept-bootstrap service defined below (#55). Set FHIR2_PRESIGN_REPORT_CONCEPT
+      # explicitly here so the intended UUID is visible in this file rather than only in the
+      # in-code default (libs/radagent-common/radagent_common/fhir_client.py). A deployment
+      # provisioning the concept at a different UUID overrides this value.
+      FHIR2_PRESIGN_REPORT_CONCEPT: e3641471-3f25-57b4-ab27-a3ebc66e481e
       ORTHANC_BASE_URL: http://orthanc:8042
       # Worklist API where publish_priority_activity sends triage priority (issue #20 follow-up).
       # Best-effort: a Worklist API outage does not fail the workflow (see worklist_client.py).

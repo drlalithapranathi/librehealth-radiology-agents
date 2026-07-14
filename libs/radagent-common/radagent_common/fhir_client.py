@@ -37,11 +37,15 @@ def _basic_auth_from_env() -> Optional[tuple[str, str]]:
 
 # OpenMRS fhir2 requires a DiagnosticReport.code that resolves to a real Concept: a text-only code
 # (or an unmapped LOINC) maps to code=null and the create 500s (codeRequired). This is the concept
-# the pre-sign draft (#26) is coded with, overridable per deployment. The default is the CIEL
-# "Provisional diagnosis" concept, which ships with the reference dictionary and reads as a
-# preliminary, non-final AI impression. A deployment with a dedicated radiology-report concept sets
-# FHIR2_PRESIGN_REPORT_CONCEPT to that concept's UUID.
-_DEFAULT_PRESIGN_REPORT_CONCEPT = "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+# the pre-sign draft (#26) is coded with, overridable per deployment. The default is the LH-Radiology
+# "AI pre-sign impression draft" concept -- a dedicated authorship stamp we provision in every
+# deployment via docker/openmrs/bootstrap_presign_concept.py. See docs/presign-concept.md for the
+# rationale (why NOT CIEL "Provisional diagnosis": authorship-collision risk with a RIS drafting its
+# own preliminary reports on the same concept, and honesty about what the resource is -- coding an
+# AI draft as "Provisional diagnosis" implies the AI made a diagnosis). A deployment that provisions
+# the concept at a different UUID sets FHIR2_PRESIGN_REPORT_CONCEPT to that UUID; a deployment using
+# our bootstrap script leaves the default alone.
+_DEFAULT_PRESIGN_REPORT_CONCEPT = "e3641471-3f25-57b4-ab27-a3ebc66e481e"
 
 
 def _presign_report_concept() -> str:
