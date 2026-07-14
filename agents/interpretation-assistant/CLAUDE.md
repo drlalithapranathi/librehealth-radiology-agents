@@ -13,8 +13,10 @@ with `evidenceRef`, `overallStatus` STUBBED|COMPLETE|PARTIAL|ERROR).
 ## v1 vs later
 - **v1:** `registry.select_tools(modality, description)` picks tool names; results are
   `STUBBED`. The registry interface is the contract — keep it stable.
-- **First real slice (#27):** `pneumothorax-detect` cross-checks the referral reason code
-  (order.reasonCode) rather than reading pixels. Its `evidenceRef` is plain text (e.g.
+- **Real slices so far (#27):** `pneumothorax-detect` and `pe-detect` each cross-check the
+  referral reason code (order.reasonCode) rather than reading pixels. Both run through the
+  same table-driven `_reason_finding` rule (`_REASON_CODE_RULES` in `handler.py`) instead of
+  one hand-copied function per tool. `evidenceRef` is plain text (e.g.
   `"order.reasonCode=J93.1"`), not an image ref. Every other tool stays `STUBBED` until it
   gets its own real implementation.
 - **DICOM SC/overlay evidenceRef is deferred, not v1/M3 scope here.** Writing AI-made
