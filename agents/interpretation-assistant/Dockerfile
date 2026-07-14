@@ -17,7 +17,14 @@ RUN pip install --no-cache-dir -e "libs/radagent-common[a2a,otel,imaging]" uvico
 #
 # Its own layer, before the agent code is copied, so that editing handler.py does not re-download
 # torch on every rebuild.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+# torch AND torchvision must come from the SAME index, in one resolve. torchxrayvision depends on
+# torchvision, so installing only torch here lets pip satisfy that dep from PyPI -- and a torchvision
+# wheel built against a different torch fails at IMPORT with
+#   RuntimeError: operator torchvision::nms does not exist
+# which is an ABI mismatch, not a missing package, and no amount of reinstalling torch fixes it.
+# Pinning both to the cpu index up front means the later torchxrayvision install finds torchvision
+# already satisfied and leaves it alone.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
  && pip install --no-cache-dir torchxrayvision
 
 # BAKE THE WEIGHTS. torchxrayvision lazily downloads to ~/.torchxrayvision on first use -- which
