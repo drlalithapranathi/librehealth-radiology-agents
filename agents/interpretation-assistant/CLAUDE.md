@@ -16,9 +16,11 @@ with `evidenceRef`, `overallStatus` STUBBED|COMPLETE|PARTIAL|ERROR).
 - **Real slices so far (#27):** `pneumothorax-detect` and `pe-detect` each cross-check the
   referral reason code (order.reasonCode) rather than reading pixels. Both run through the
   same table-driven `_reason_finding` rule (`_REASON_CODE_RULES` in `handler.py`) instead of
-  one hand-copied function per tool. `evidenceRef` is plain text (e.g.
-  `"order.reasonCode=J93.1"`), not an image ref. Every other tool stays `STUBBED` until it
-  gets its own real implementation.
+  one hand-copied function per tool. Matching is by ICD-10 family **prefix** (dot-stripped,
+  e.g. `"I26"`, `"J93"`), the same normalisation `worklist-triage` uses on the same field —
+  an earlier exact-code-list version silently disagreed with triage on codes like bare `I26`
+  or `I2699`. `evidenceRef` is plain text (e.g. `"order.reasonCode=J93.1"`), not an image ref.
+  Every other tool stays `STUBBED` until it gets its own real implementation.
 - **DICOM SC/overlay evidenceRef is deferred, not v1/M3 scope here.** Writing AI-made
   images/overlays into the patient record needs a safety review that hasn't happened yet, and
   it's a shared-lib (`orthanc_client.py`) change — **do not touch that file from this agent.**
