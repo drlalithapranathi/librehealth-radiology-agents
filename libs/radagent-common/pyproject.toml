@@ -24,6 +24,13 @@ a2a = ["a2a-sdk[http-server]==1.0.3"]
 # worker/ingress entrypoints (and the compose stack) install this. tracing.init_tracing imports it
 # lazily. The Temporal TracingInterceptor lives in temporalio.contrib.opentelemetry and only needs
 # opentelemetry-api (pulled here); no separate temporalio[opentelemetry] pin required.
+# DICOM pixel decoding (radagent_common.imaging, #27). Optional: only agents that actually run a
+# CAD model read pixels; every other agent and the core lib stay free of numpy/pydicom. The module
+# raises a named ImportError when the extra is missing, so a misconfigured image fails loudly.
+imaging = [
+  "pydicom>=2.4",
+  "numpy>=1.24",
+]
 otel = [
   "opentelemetry-api>=1.20",
   "opentelemetry-sdk>=1.20",
