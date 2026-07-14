@@ -1,4 +1,6 @@
 """Contract test + selection tests for interpretation assistant."""
+import pytest
+
 from handler import handle
 from registry import select_tools
 from radagent_common.validation import validate_skill_output
@@ -179,3 +181,111 @@ async def test_pe_without_matching_reason_code_stays_stubbed():
     assert pe["status"] == "STUBBED"
     assert pe["evidenceRef"] is None
     assert out["overallStatus"] == "STUBBED"
+
+# --- selection on the descriptions departments ACTUALLY send (#63) -----------------------------
+#
+# The tests above all feed a description that spells the anatomy out ("CT CHEST", "CT HEAD"), which
+# is what let the registry look correct while selecting the generic screen on half of real traffic:
+# a DICOM StudyDescription carries the PROTOCOL name, not the anatomy. Every row below returned the
+# modality's generic screen before the alias table went in.
+@pytest.mark.parametrize("modality,description,expected", [
+    # the tool is literally named after the study, and the study did not select it
+    ("CT", "CTPA",                       ["lung-nodule-detect", "pe-detect"]),
+    ("CT", "CT PULMONARY ANGIOGRAM",     ["lung-nodule-detect", "pe-detect"]),
+    ("CT", "CTA PULMONARY ARTERIES",     ["lung-nodule-detect", "pe-detect"]),
+    ("CT", "CT THORAX WITH CONTRAST",    ["lung-nodule-detect", "pe-detect"]),
+    ("CT", "CT LUNG CANCER SCREENING",   ["lung-nodule-detect", "pe-detect"]),
+    # CT says "head", MR says "brain" -- so each is the other's alias, or both fall through
+    ("CT", "CT BRAIN",                   ["ich-detect", "stroke-detect"]),
+    ("CT", "NCCT BRAIN",                 ["ich-detect", "stroke-detect"]),
+    ("CT", "CT ANGIO CIRCLE OF WILLIS",  ["ich-detect", "stroke-detect"]),
+    ("MR", "MRI HEAD WITHOUT CONTRAST",  ["brain-tumor-screen", "ms-lesion-detect"]),
+    ("MR", "MR CEREBRAL ANGIOGRAM",      ["brain-tumor-screen", "ms-lesion-detect"]),
+    # abbreviations
+    ("CT", "CT ABD PELVIS",              ["liver-lesion-detect"]),
+    ("CT", "CT ANGIO AORTIC ARCH",       ["aortic-dissection-detect"]),
+    ("CR", "CXR",                        ["cxr-screen", "pneumothorax-detect"]),
+    ("CR", "CXR PORTABLE",               ["cxr-screen", "pneumothorax-detect"]),
+    ("DX", "THORAX PA",                  ["cxr-screen", "pneumothorax-detect"]),
+    ("US", "RUQ ULTRASOUND",             ["gallstone-detect"]),
+    ("US", "US LIVER",                   ["gallstone-detect"]),
+])
+def test_real_study_descriptions_select_their_body_region_tools(modality, description, expected):
+    assert select_tools(modality, description) == expected
+
+
+@pytest.mark.parametrize("description", [
+    "US OB DELIVERY PLANNING",
+    "US OBSTETRIC 3RD TRIMESTER DELIVERY",
+])
+def test_an_alias_does_not_match_inside_another_word(description):
+    """The word boundary on aliases is load-bearing, not stylistic.
+
+    "liver" (an abdomen alias) sits inside "deLIVERy". Match aliases as plain substrings and an
+    obstetric ultrasound picks up the abdomen region and runs `gallstone-detect` on a delivery scan.
+    Widening the match must not also loosen it -- take `\\b` out of registry._ALIAS_RE and this
+    fails."""
+    assert select_tools("US", description) == ["generic-us-screen"]
+
+
+def test_thoracic_spine_is_a_spine_study_not_a_chest_study():
+    """A T-spine CT gets the spine tool and NOT the lung tools.
+
+    This is why "thoracic" is not an alias of chest. (The word boundary is not what saves this one
+    -- "thorax" is not a substring of "thoracic" either way; the alias table simply must not grow a
+    "thoracic" entry, and this pins that.)"""
+    assert select_tools("CT", "CT THORACIC SPINE") == ["vertebral-fracture-detect"]
+
+
+def test_an_unrelated_study_still_falls_back_to_the_generic_screen():
+    """Aliases must widen the match, not dissolve it: a study that names no region we know still
+    belongs on the generic screen, not on a body-region tool it never earned."""
+    assert select_tools("CT", "CT MISC PROTOCOL") == ["generic-ct-screen"]
+    assert select_tools("MR", "MR RESEARCH SEQUENCE") == ["generic-mr-screen"]
+
+
+# --- a region can be NAMED without being the study's subject (#63, review) ---------------------
+#
+# The mirror image of the misses above: a description that says "head" or "vertebral" and means
+# something else entirely. These are inert while every tool is STUBBED -- a wrong selection is a
+# stubbed finding with a wrong toolId, and the pre-sign fhir2 write gates on a COMPLETE finding a
+# stub never reaches -- but they become real the moment live CAD wires in behind this registry, and
+# that is the expensive time to find them.
+@pytest.mark.parametrize("modality,description,expected", [
+    # a bone's "head" is a joint, not a brain. `CT FEMORAL HEAD` selects ich-detect on main TODAY:
+    # the `head` key is a plain substring, so this predates the alias table.
+    ("CT", "CT FEMORAL HEAD",              ["generic-ct-screen"]),
+    ("CT", "CT HIP FEMORAL HEAD AVN",      ["generic-ct-screen"]),
+    ("MR", "MR FEMORAL HEAD",              ["generic-mr-screen"]),
+    ("MR", "MR HUMERAL HEAD",              ["generic-mr-screen"]),
+    # requiring a leading modality token (`MRI HEAD`) would NOT catch this one -- the bone does
+    ("MR", "MRI HEAD OF FEMUR",            ["generic-mr-screen"]),
+    # and the plural must behave the same: `\bhead\b` does not match "heads", so before the
+    # exclusion the same study selected different tools depending on how the tech typed it
+    ("MR", "MR FEMORAL HEADS",             ["generic-mr-screen"]),
+    # the vertebral ARTERY is a neck vessel, not a spine fracture
+    ("CT", "CT ANGIO VERTEBRAL ARTERIES",  ["generic-ct-screen"]),
+    ("CT", "CTA VERTEBRAL ARTERY",         ["generic-ct-screen"]),
+    ("MR", "MRA VERTEBRAL ARTERIES",       ["generic-mr-screen"]),
+    # the uterine cervix is not the cervical spine
+    ("MR", "MR CERVICAL CANCER STAGING",   ["generic-mr-screen"]),
+    ("CT", "CT CERVICAL CANCER",           ["generic-ct-screen"]),
+])
+def test_a_region_named_but_not_the_subject_does_not_select_its_tools(modality, description, expected):
+    assert select_tools(modality, description) == expected
+
+
+@pytest.mark.parametrize("modality,description,expected", [
+    ("CT", "CT HEAD",                    ["ich-detect", "stroke-detect"]),
+    ("CT", "CT BRAIN",                   ["ich-detect", "stroke-detect"]),
+    ("CT", "CT HEAD WITHOUT CONTRAST",   ["ich-detect", "stroke-detect"]),
+    ("MR", "MRI HEAD WITHOUT CONTRAST",  ["brain-tumor-screen", "ms-lesion-detect"]),
+    ("MR", "MRI BRAIN WITH CONTRAST",    ["brain-tumor-screen", "ms-lesion-detect"]),
+    ("MR", "MRI CERVICAL SPINE",         ["cord-compression-detect"]),
+    ("MR", "MRI C-SPINE",                ["cord-compression-detect"]),
+    ("CT", "CT LUMBAR SPINE",            ["vertebral-fracture-detect"]),
+    ("MR", "MRI LUMBAR",                 ["cord-compression-detect"]),
+])
+def test_the_exclusions_do_not_cost_the_real_studies(modality, description, expected):
+    """The exclusion refuses a region; it must not refuse the studies the region exists for."""
+    assert select_tools(modality, description) == expected
