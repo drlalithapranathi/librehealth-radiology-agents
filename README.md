@@ -33,6 +33,8 @@ cd agents/worklist-triage && python -m pytest -q
 ```
 
 To run the full dev stack (Orthanc, OHIF, OpenMRS, Temporal), see `docker-compose.yml`.
+The OpenMRS o3 backend has a slow first boot and a clean-boot-only recipe. See
+[`docs/o3-dev-stack.md`](docs/o3-dev-stack.md).
 For the live A2A + Temporal wiring, install the app extras and pin the SDKs:
 `pip install -e . ` (see `pyproject.toml`; **pin `a2a-sdk` and `temporalio`**).
 
