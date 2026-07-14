@@ -8,6 +8,7 @@ entries. Each report is projected to a lean, PHI-free record.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from unittest import mock
 
@@ -17,6 +18,7 @@ from radagent_common.fhir_client import (
     Fhir2Client,
     finalized_report_record,
     _write_transport_is_secure,
+    _guard_write_transport,
 )
 
 _FINAL = {
@@ -811,6 +813,24 @@ def test_write_transport_insecure_rejects_plaintext_to_a_remote_host():
         os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
         assert not _write_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
         assert not _write_transport_is_secure("http://fhir.hospital.example:8080/fhir2/R4")
+
+
+def test_insecure_optin_write_leaves_an_audit_line(caplog):
+    # When the opt-in lets a plaintext-remote write through, that accepted risk must be recorded:
+    # PHI + credentials are on the wire in cleartext. The audit names the host, never the impression.
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_WRITE": "1"}):
+        with caplog.at_level(logging.WARNING, logger="radagent_common.fhir_client"):
+            _guard_write_transport("http://openmrs:8080/openmrs/ws/fhir2/R4")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("PLAINTEXT" in m and "openmrs" in m for m in warnings), warnings
+
+
+def test_secure_transport_writes_are_not_audited(caplog):
+    # No warning noise on the paths that are actually safe -- https or loopback.
+    with caplog.at_level(logging.WARNING, logger="radagent_common.fhir_client"):
+        _guard_write_transport("https://openmrs.example.org/openmrs/ws/fhir2/R4")
+        _guard_write_transport("http://localhost:8080/openmrs/ws/fhir2/R4")
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 def test_write_refuses_a_plaintext_remote_transport_at_the_wire():

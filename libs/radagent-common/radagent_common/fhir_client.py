@@ -9,6 +9,7 @@ clinical data uses THIS client (lean-reference: fetch from source, do not pass P
 """
 from __future__ import annotations
 from typing import Any, Optional
+import logging
 import os
 from urllib.parse import urlparse
 import httpx
@@ -53,7 +54,17 @@ def _presign_report_concept() -> str:
     return os.environ.get("FHIR2_PRESIGN_REPORT_CONCEPT", _DEFAULT_PRESIGN_REPORT_CONCEPT)
 
 
+_log = logging.getLogger(__name__)
+
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_plaintext_remote(base_url: str) -> bool:
+    """Plaintext `http` to a non-loopback host: the transport that exposes anything sent on it. It
+    is the shape a write only takes with the insecure opt-in set, and the shape whose reads get no
+    protection from the write guard (see the read-transport TODO below)."""
+    parsed = urlparse(base_url)
+    return parsed.scheme != "https" and (parsed.hostname or "").lower() not in _LOOPBACK_HOSTS
 
 
 def _write_transport_is_secure(base_url: str) -> bool:
@@ -63,15 +74,24 @@ def _write_transport_is_secure(base_url: str) -> bool:
     credentials in every request. Over plaintext `http` to a remote host, both are exposed on the
     wire to anyone on the path. We therefore refuse a plaintext write UNLESS the target is loopback
     (local dev / unit tests) or the deployment has explicitly accepted the risk on a trusted
-    internal network via FHIR2_ALLOW_INSECURE_WRITE. `https` is always fine. Reads are not gated
-    here, but the same base URL serves them, so requiring TLS for the write secures reads too.
+    internal network via FHIR2_ALLOW_INSECURE_WRITE. `https` is always fine.
+
+    This guards the WRITE only. Reads use the same base URL and the same HTTP Basic credentials but
+    are NOT gated here, so a read-heavy, write-inert deployment gets no transport protection from
+    this check -- securing the write does not secure the reads. Read-transport TLS is a separate
+    concern, outside #30's write-scoped review; see the TODO(M3) below.
     """
-    parsed = urlparse(base_url)
-    if parsed.scheme == "https":
-        return True
-    if (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
-        return True
+    if not _is_plaintext_remote(base_url):
+        return True  # https, or a loopback host
     return os.environ.get("FHIR2_ALLOW_INSECURE_WRITE", "").strip().lower() in {"1", "true", "yes"}
+
+
+# TODO(M3): read-transport TLS. The guard above covers writes only. The read methods on
+# Fhir2Client return PHI -- demographics, conditions, allergies, medications, labs, and the
+# radiologist's narrative (get_report_conclusion) -- through `_get` over the SAME plaintext-capable
+# base URL and Basic credentials, ungated. The RIS poller reads every 30s, so a write-inert
+# deployment is exposed continuously. #30 is scoped to the write; refusing (or requiring TLS for)
+# plaintext reads to a remote host is its own item and is not in the #30 N1/N3 follow-ups.
 
 
 def _guard_write_transport(base_url: str) -> None:
@@ -80,6 +100,15 @@ def _guard_write_transport(base_url: str) -> None:
             "refusing a fhir2 write over plaintext HTTP to a non-loopback host: the pre-sign "
             "impression (PHI) and the HTTP Basic credentials would travel in cleartext. Use an "
             "https base URL, or set FHIR2_ALLOW_INSECURE_WRITE=1 for a trusted internal network."
+        )
+    # The write is proceeding. If it is only allowed because of the insecure opt-in (the guard
+    # passed but the transport is still plaintext-to-remote), leave an audit trail that PHI plus
+    # credentials went out in cleartext on this hop. Host only -- never the impression text.
+    if _is_plaintext_remote(base_url):
+        _log.warning(
+            "fhir2 write proceeding over PLAINTEXT http to %s under FHIR2_ALLOW_INSECURE_WRITE: the "
+            "pre-sign impression (PHI) and HTTP Basic credentials are in cleartext on this hop",
+            urlparse(base_url).hostname,
         )
 
 
