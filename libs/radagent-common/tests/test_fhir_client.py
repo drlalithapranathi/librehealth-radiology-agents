@@ -299,7 +299,7 @@ def test_write_presign_impression_creates_when_no_existing_draft():
     assert posted["basedOn"] == [{"reference": "ServiceRequest/sr-1"}]
     assert posted["conclusion"] == "No acute findings identified."
     # code must resolve to a real Concept (coding.code = a concept UUID); text-only 500s on fhir2.
-    assert posted["code"]["coding"][0]["code"] == "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    assert posted["code"]["coding"][0]["code"] == "e3641471-3f25-57b4-ab27-a3ebc66e481e"
     assert posted["code"]["text"] == "AI pre-sign impression draft"
     assert "id" not in posted  # a create, not an update
     assert report_id == "new-draft-1"
@@ -685,7 +685,7 @@ def test_collect_treats_404_as_empty():
 
 # --- #26: the pre-sign draft only ever overwrites ITS OWN draft ----------------------
 
-_OUR_CONCEPT = "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"   # _DEFAULT_PRESIGN_REPORT_CONCEPT
+_OUR_CONCEPT = "e3641471-3f25-57b4-ab27-a3ebc66e481e"   # _DEFAULT_PRESIGN_REPORT_CONCEPT
 
 
 def _draft(report_id, *, concept, status="preliminary", order="ServiceRequest/sr-1"):

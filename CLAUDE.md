@@ -95,6 +95,8 @@ Orthanc->start, RIS polling->report pipeline), and M2 (Worklist API + OHIF data 
 tier-dependent sign-off escalation, A2A push-notifications, pre-sign impression assist, the
 verification rule library with report-body parsing, and opt-in OpenTelemetry tracing) are all
 merged. AI models stay stubbed behind the Interpretation tool registry. **M3 is in progress:** real
-AI/CAD tools (#27), the security/PHI review of the fhir2 write-back (#30), and provisioning the
-dedicated pre-sign impression-draft concept (#55). Search `TODO(M3)` for next steps; the full plan
+AI/CAD tools (#27) and the security/PHI review of the fhir2 write-back (#30). Provisioning the
+dedicated pre-sign impression-draft concept (#55) has landed -- the concept is now provisioned into
+o3 at stack startup by `docker/openmrs/bootstrap_presign_concept.py`, unblocking pre-sign write
+turn-on. Search `TODO(M3)` for next steps; the full plan
 is the GitLab issue backlog.
