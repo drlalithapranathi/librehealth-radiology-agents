@@ -1,25 +1,27 @@
 /**
  * OHIF viewer runtime config for the LH-Radiology dev stack.
- * The stock image ships a 0-byte app-config.js; this points OHIF at Orthanc's DICOMweb
- * through the same-origin nginx proxy (/dicom-web, /wado -> orthanc:8042), so there is
- * no cross-origin request and no Orthanc CORS to configure.
+ * Points OHIF at Orthanc's DICOMweb through the same-origin nginx proxy
+ * (/dicom-web, /wado -> orthanc:8042), so there is no cross-origin request
+ * and no Orthanc CORS to configure.
+ *
+ * Since #21 we build the OHIF image ourselves (integrations/ohif-extension/
+ * Dockerfile) rather than using the stock ohif/app image. The
+ * __filename/__dirname WASM shim that used to live at the top of this file
+ * was dropped in the #21 follow-up MR: every WASM codec OHIF's platform/app
+ * pulls in at the pinned commit (@cornerstonejs/codec-charls,
+ * codec-libjpeg-turbo-8bit, codec-openjpeg, codec-openjph, dicom-image-loader)
+ * guards its __filename reference with `if (typeof __filename !== 'undefined')`
+ * before evaluating it, so the ReferenceError the shim was preventing cannot
+ * occur in our build. If a codec is ever upgraded to a version that reintroduces
+ * a bare __filename reference, the shim is easy to reinstate here.
  */
-
-// The ohif/app image bundles a WASM DICOM codec whose Emscripten glue is mis-compiled for the
-// browser: it evaluates the Node globals __filename/__dirname unconditionally. When that chunk
-// lazy-loads (codec worker init) it throws `ReferenceError: __filename is not defined` and the
-// viewer goes blank. app-config.js runs before any lazy chunk, so defining these globals here
-// (empty is fine — the loader already prefers document.currentScript.src for the real path)
-// prevents the crash. Do NOT define `global` — that would flip other libs into their Node path.
-window.__filename = window.__filename || '';
-window.__dirname = window.__dirname || '/';
 
 window.config = {
   routerBasename: '/',
   // Our @lhrad/extension-worklist is compiled into the OHIF bundle at build
   // time via pluginConfig.json (see integrations/ohif-extension/Dockerfile).
   // The /reading route is injected by the extension's preRegistration hook
-  // via customizationService.setGlobalCustomization('customRoutes', ...) —
+  // via customizationService.setGlobalCustomization('customRoutes', ...) --
   // no custom mode is registered (see the R2 doc addendum). These arrays are
   // for RUNTIME dynamic registration of additional plugins loaded from URLs.
   extensions: [],
