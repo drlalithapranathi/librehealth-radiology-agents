@@ -55,8 +55,32 @@ _REGION_ALIASES: dict[str, tuple[str, ...]] = {
     "head":    ("brain", "cerebral", "cranial", "circle of willis"),
     "brain":   ("head", "cerebral", "cranial"),
     "abdomen": ("abd", "ruq", "luq", "liver", "hepatic", "gallbladder", "biliary"),
-    "spine":   ("lumbar", "cervical", "vertebral"),
+    # "vertebral" and "cervical" are deliberately NOT spine aliases. A `CT ANGIO VERTEBRAL ARTERIES`
+    # is a neck-vessel study and a `CT CERVICAL CANCER` is a uterine-cervix study; neither is a
+    # spine study, and both matched the spine tools when those words were aliases. They also buy
+    # nothing: a real spine study says so (`CT LUMBAR SPINE`, `MRI C-SPINE`), which the `spine` key
+    # already catches.
+    "spine":   ("lumbar",),
     "aorta":   ("aortic",),
+}
+
+# A region can be NAMED in a description and still not be the study's subject.
+#
+# "Head" is the case that bites: a `CT FEMORAL HEAD`, `MRI HEAD OF FEMUR` or `MR HUMERAL HEAD` is a
+# joint, not a brain. The `head` key is matched as a plain substring, so `CT FEMORAL HEAD` selects
+# `ich-detect` on main TODAY -- this predates the alias table, which merely extends the same flaw to
+# MR through the head<->brain cross-alias.
+#
+# Requiring a leading modality token (`CT HEAD`, `MRI HEAD`) does not fix it: `MRI HEAD OF FEMUR` is
+# a real way to name the study and still matches "MRI HEAD". What actually separates the two is the
+# BONE, so the region is refused whenever the description names one. This also makes the plural
+# consistent -- `MR FEMORAL HEADS` used to fall through by accident, because `\bhead\b` does not
+# match "heads", so the same study behaved differently depending on how the tech typed it.
+_MSK_JOINT = re.compile(r"\b(?:femoral|femur|humeral|humerus|radial|ulnar|hip|shoulder)\b")
+
+_REGION_EXCLUSIONS: dict[str, re.Pattern[str]] = {
+    "head":  _MSK_JOINT,
+    "brain": _MSK_JOINT,
 }
 
 # Aliases match on WORD BOUNDARIES, unlike the plain-substring match on the key itself.
@@ -80,10 +104,14 @@ _ALIAS_RE: dict[str, re.Pattern[str]] = {
 def _matches_region(desc: str, key: str) -> bool:
     """Does this study description name the given body region — under any of its names?
 
-    Strictly ADDITIVE over the old `key in desc` test: every description that matched a region
-    before still matches it. So this can only ever hand a study MORE regional tools, never fewer,
-    and no study that was already selecting correctly can regress onto the generic screen.
+    Additive over the old `key in desc` test in every case EXCEPT an excluded one: a description
+    that matched a region before still matches it unless the exclusion says the region is not what
+    the study is about. That single subtraction is deliberate and is the point of `_REGION_EXCLUSIONS`
+    -- `CT FEMORAL HEAD` selects `ich-detect` today and should not.
     """
+    excluded = _REGION_EXCLUSIONS.get(key)
+    if excluded and excluded.search(desc):
+        return False
     if key in desc:
         return True
     pattern = _ALIAS_RE.get(key)
