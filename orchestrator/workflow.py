@@ -94,6 +94,31 @@ PATCH_ACK_LOOP = "critcom-ack-loop-v1"
 # verify loop stops re-verifying after the gate. Both alter commands on a path that studies parked
 # at the gate have already walked, so an in-flight study must keep replaying the OLD shape.
 PATCH_SIGNOFF_OVERRIDE = "signoff-override-v1"
+# The SAME change, guarded a SECOND time -- because one marker cannot answer both questions.
+#
+# `workflow.patched()` memoizes per execution, not per call site: whatever the FIRST read of a given
+# id returns is what every later read of that id returns, for the life of the execution. The gate and
+# the caller need OPPOSITE answers for one population, so they cannot share an id:
+#
+#   * INSIDE the gate, the marker must read False while replaying a parked study. The pre-#57 gate
+#     ended in an UNBOUNDED wait, which records no timer; the bounded #57 wait records one. Replaying
+#     an old history down the bounded branch would issue a timer command its history does not have.
+#     So a still-replaying study MUST take the old branch. That read is correct as it stands.
+#
+#   * In the CALLER, the same study needs the NEW answer. By the time its gate unblocks it is live,
+#     and nothing past that edge was ever recorded, so breaking out is a safe continuation.
+#
+# A study parked in the gate's TERMINAL unbounded wait reads the marker on the line just above that
+# wait -- a line the resume REPLAYS -- so it memoizes False, and the caller's read then returned the
+# memoized False and sent the study back to re-verify the unchanged report: the #56 loop, now with a
+# 202 on top. It is the oldest and worst-stranded population, and the one #56 is literally about.
+# (A study parked mid-ladder never reaches that line, which is why it was rescued and this was not
+# caught -- see test_signoff_override_deploy.py.)
+#
+# So the caller reads its OWN id. First read for a parked study happens after its gate unblocks
+# LIVE -> True -> release. First read for a genuinely old history that RECORDED a re-verify happens
+# while still replaying -> False -> re-verify, exactly as recorded.
+PATCH_SIGNOFF_GATE_TERMINAL = "signoff-gate-terminal-v1"
 # How a sign-off gate ended. ACKNOWLEDGED: a radiologist released it (via the #57 override endpoint,
 # or -- at M2 -- the addendum flow). ABANDONED: the ladder ran out with nobody acknowledging; the
 # study is released anyway, with the FAIL and the non-acknowledgement both recorded.
@@ -444,10 +469,22 @@ class StudyWorkflow:
         test_signoff_override_deploy.py, which fails on the entry-read.)
 
         So the marker is read LAZILY, at each point the code actually diverges, and always AFTER an
-        await. By then a parked study has caught up with its history and is running live, so it reads
-        True and takes the new path -- a safe continuation, because nothing past the live edge was
-        ever recorded. A genuinely old, still-replaying history reads False at that same point and
-        keeps the shape it recorded.
+        await. A study parked on a rung timer has caught up with its history by then and is running
+        live, so it reads True and takes the new path -- a safe continuation, because nothing past the
+        live edge was ever recorded. A genuinely old, still-replaying history reads False at that same
+        point and keeps the shape it recorded.
+
+        That is not the whole story, and the missing half is why the CALLER reads a different marker.
+        A study whose ladder is EXHAUSTED is parked one line further on, in the terminal
+        `_ack_or_timeout(None)` below -- and it reaches the read ABOVE that wait while still replaying,
+        so it reads False. That read is CORRECT and must stay False: the pre-#57 gate ended in an
+        unbounded wait, which records no timer, and sending an old history down the bounded branch
+        would issue a timer command its history does not have.
+
+        But `patched()` memoizes per execution, so that False then followed the study out of the gate
+        and into `run()`, which read the same id and sent it back to re-verify an untouched report --
+        re-deriving the same FAIL and re-parking it. The #56 loop, on the studies #56 is about. The
+        caller therefore reads PATCH_SIGNOFF_GATE_TERMINAL instead; see the comment on that constant.
         """
         tier = (self._triage or {}).get("priorityTier")
         reason = "sign-off gate timed out awaiting radiologist"
@@ -612,7 +649,15 @@ class StudyWorkflow:
             # ones that most need COMMUNICATE to run.
             # TODO(M2, #56 (a)): the addendum flow updates self._report_event with the CORRECTED
             # report; only then is a re-verify meaningful, and it re-enters this loop.
-            if workflow.patched(PATCH_SIGNOFF_OVERRIDE):
+            #
+            # PATCH_SIGNOFF_GATE_TERMINAL, not PATCH_SIGNOFF_OVERRIDE -- see the comment on the
+            # marker. Reading the gate's own id here returns whatever the gate memoized, and a study
+            # parked in the gate's terminal unbounded wait memoized False on the way in. It would be
+            # sent back to re-verify a report nobody has touched, re-derive the same FAIL, and
+            # re-park: the exact loop #56 filed, for the exact studies it filed it about. This read
+            # is the first of ITS id, and for a parked study it happens after the gate unblocked --
+            # live, so True, so released.
+            if workflow.patched(PATCH_SIGNOFF_GATE_TERMINAL):
                 self._signoff = {
                     "status": outcome,
                     **(self._signoff_ack or {}),
