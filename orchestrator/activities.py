@@ -79,6 +79,24 @@ async def publish_priority_activity(workflow_id: str, study_instance_uid: str, t
     )
 
 
+# The kill switch on the one fhir2 WRITE path (#26/#27/#30).
+#
+# #26's locked decision gates the pre-sign chart write on "at least one COMPLETE finding", which
+# kept it inert for as long as every Interpretation tool was a stub. #27 lands the first REAL model,
+# so that gate now opens by itself -- which is exactly what #26 designed, and also means a model
+# going live silently turns on a PHI write to a patient chart. Those are two different decisions and
+# they now need two different switches.
+#
+# Default "1" = ON, preserving #26's PI+lead decision byte-for-byte: nobody's behaviour changes
+# without a human choosing it. Set PRESIGN_WRITE_ENABLED=0 to run the model WITHOUT the chart write
+# -- the draft is still generated and logged, it is simply not offered into the RIS. That is the
+# posture to use until #30 (the security/PHI review of this write-back) closes.
+#
+# Read HERE, in the I/O layer, not in the workflow: the workflow may not read env (golden rule 5),
+# and an activity's result is recorded in history, so this is replay-safe with no patch marker.
+PRESIGN_WRITE_ENABLED = os.environ.get("PRESIGN_WRITE_ENABLED", "1") != "0"
+
+
 @activity.defn(name=state.ACT_WRITE_PRESIGN_IMPRESSION)
 async def write_presign_impression_activity(
     service_request_ref: str, patient_ref: str, impression_text: str,
@@ -89,8 +107,17 @@ async def write_presign_impression_activity(
     reuses the existing draft on a re-run. This is advisory and is the one fhir2 write path.
     Errors propagate so the workflow can retry with its bounded policy and then skip the draft on
     final failure, so a fhir2 outage never strands the human read (see workflow._presign_impression).
-    Returns the written DiagnosticReport id.
+    Returns the written DiagnosticReport id, or "" when the write is switched off.
     """
+    if not PRESIGN_WRITE_ENABLED:
+        # Loud, not silent: an operator who thinks drafts are being offered and finds nothing in the
+        # chart must be able to see WHY from the log, without reading the source.
+        activity.logger.warning(
+            "pre-sign chart write DISABLED (PRESIGN_WRITE_ENABLED=0); draft generated but NOT "
+            "offered into the RIS for order=%s", service_request_ref,
+        )
+        return ""
+
     report_id = await Fhir2Client().write_presign_impression(
         service_request_ref, patient_ref, impression_text,
     )

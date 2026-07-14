@@ -257,3 +257,68 @@ def test_a_complete_finding_lets_the_draft_through():
 
         assert len(_STATE["write_calls"]) == 1
     asyncio.run(scenario())
+
+
+# --- the chart-write kill switch (#27/#30) -----------------------------------------------------
+# #27 lands the first real model, so #26's "at least one COMPLETE finding" gate opens on its own and
+# the fhir2 write goes live. These pin that the write is separately switchable, so "the AI ran" and
+# "we wrote to a patient's chart" stay two decisions -- and that switching it off degrades honestly
+# rather than silently.
+
+import importlib
+
+import pytest
+
+from orchestrator import activities as acts
+
+
+@pytest.fixture
+def _restore_flag():
+    original = acts.PRESIGN_WRITE_ENABLED
+    yield
+    acts.PRESIGN_WRITE_ENABLED = original
+
+
+async def test_write_disabled_does_not_touch_fhir2_and_returns_no_report(monkeypatch, _restore_flag):
+    """PRESIGN_WRITE_ENABLED=0: the draft is still generated upstream, but nothing reaches the chart.
+    Fhir2Client must not even be constructed -- a 'disabled' write that still opens a session to the
+    EHR is not disabled."""
+    acts.PRESIGN_WRITE_ENABLED = False
+
+    def explode(*a, **k):
+        raise AssertionError("fhir2 was touched while the pre-sign write was disabled")
+
+    monkeypatch.setattr(acts, "Fhir2Client", explode)
+
+    out = await acts.write_presign_impression_activity(
+        "ServiceRequest/1", "Patient/1", "some impression",
+    )
+    assert out == ""
+
+
+async def test_write_enabled_is_the_default_preserving_the_26_decision(monkeypatch, _restore_flag):
+    """The default must NOT silently reverse #26's PI+lead decision. Landing a real model turns the
+    write on, exactly as #26 designed; turning it OFF is the deliberate act."""
+    monkeypatch.delenv("PRESIGN_WRITE_ENABLED", raising=False)
+    importlib.reload(acts)
+    try:
+        assert acts.PRESIGN_WRITE_ENABLED is True
+    finally:
+        importlib.reload(acts)
+
+
+async def test_write_enabled_offers_the_draft(monkeypatch, _restore_flag):
+    acts.PRESIGN_WRITE_ENABLED = True
+    written = {}
+
+    class FakeFhir:
+        async def write_presign_impression(self, sr, pat, text):
+            written.update(sr=sr, pat=pat, text=text)
+            return "DiagnosticReport/77"
+
+    monkeypatch.setattr(acts, "Fhir2Client", lambda: FakeFhir())
+    out = await acts.write_presign_impression_activity(
+        "ServiceRequest/1", "Patient/1", "some impression",
+    )
+    assert out == "DiagnosticReport/77"
+    assert written["sr"] == "ServiceRequest/1"

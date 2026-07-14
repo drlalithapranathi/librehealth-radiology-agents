@@ -1,21 +1,57 @@
 """Interpretation Assistant handler — owner: Chaitra.
 
-v1 = tool REGISTRY that selects by modality/study-type and returns STUBBED results.
-M3: wire real CAD/detection tools behind the same registry interface. Real slices so far (#27):
-pneumothorax-detect and pe-detect each cross-check the referral reason rather than image pixels --
-there is no pixel-read path (or imaging deps) yet, so this is a genuine but narrow interim signal,
-not a CAD model. Both run through the same table-driven _reason_finding rule rather than one
-hand-copied function per tool (per lead review). Every other tool stays STUBBED until it gets its
-own real implementation.
+The tool REGISTRY selects by modality/study-type; each selected tool then reports at one of three
+levels of reality, and the level is visible in the output rather than implied:
+
+  * PIXELS (#27) -- `cxr-screen` runs a real pretrained classifier over the study's image data
+    (cxr_model.py). This is the first tool in the system that actually looks at the image. It
+    reports COMPLETE, with a real confidence, and an evidenceRef naming the instance it scored.
+  * REFERRAL REASON (#27) -- `pneumothorax-detect` and `pe-detect` cross-check order.reasonCode
+    rather than pixels. A genuine but narrow interim signal, not a CAD model, so they stay STUBBED.
+  * STUBBED -- everything else, until it gets its own real implementation.
+
+A tool that cannot run degrades to STUBBED (or ERROR) and NEVER invents a negative: "nothing found"
+from a tool that never looked is the automation-bias trap the #26 COMPLETE-gate exists to prevent.
+
 Input  : { studyContext }
 Output : contracts/skills/interpretation.schema.json
 """
 from __future__ import annotations
+
+import asyncio
+import logging
 from typing import Optional
+
 from radagent_common.tracing import now_iso
 from registry import select_tools
 
-AGENT_VERSION = "0.3.0"
+log = logging.getLogger(__name__)
+
+AGENT_VERSION = "0.4.0"
+
+# Is this image built with the pixel/model extras? Decided ONCE, at import, by whether the imports
+# succeed -- not discovered over the network mid-study. cxr_model imports torch eagerly for exactly
+# this reason. The agent-tests CI lane installs neither extra, so PIXEL_TOOLING is False there and
+# cxr-screen stays STUBBED, which is why the pre-#27 suite still passes untouched.
+#
+# These are module-level names rather than function-local imports so a test can substitute a fake
+# Orthanc and a fake model and exercise the pixel path WITHOUT torch. A seam that only exists in
+# the presence of a 1.5GB dependency is a seam nobody tests.
+try:
+    from radagent_common.imaging import NotAnImage, dicom_to_greyscale
+    from radagent_common.orthanc_client import OrthancClient
+
+    from cxr_model import score, summarise
+
+    PIXEL_TOOLING = True
+except ImportError as _exc:  # pragma: no cover - covered by the import-guard test
+    log.info("interpretation: pixel/model extras absent (%s); pixel tools stay STUBBED", _exc)
+    PIXEL_TOOLING = False
+
+    class NotAnImage(Exception):  # type: ignore[no-redef]
+        """Placeholder so the except-clause below is always a valid type."""
+
+    OrthancClient = dicom_to_greyscale = score = summarise = None  # type: ignore[assignment]
 
 # Referral-reason ICD-10 codes per real-slice tool. A real, narrow signal: the ordering
 # clinician already named the suspicion, so the tool can act on it before any pixel-level model
@@ -74,6 +110,24 @@ def _reason_finding(tool_id: str, reason_codes: list[str]) -> Optional[dict]:
     }
 
 
+_MODEL_VERSION = "cxr-densenet121-res224-all"
+
+
+def _tool_version(finding: dict) -> str:
+    """What actually produced this finding. Visible in toolsSelected[].version so a consumer -- and
+    anyone auditing why a chart says what it says -- can tell a real model from a referral-code rule
+    from a stub. Three different things must not all report as "stub-0".
+
+    A cxr-screen that DEGRADED to STUBBED (extras absent, no instances) reports "stub-0", not the
+    model version: claiming a model that never ran is the same lie as inventing a finding.
+    """
+    if finding["toolId"] in _PIXEL_TOOLS and finding["status"] in ("COMPLETE", "ERROR"):
+        return _MODEL_VERSION
+    if finding["evidenceRef"]:
+        return "referral-rule-1"
+    return "stub-0"
+
+
 def _overall_status(statuses: list[str]) -> str:
     unique = set(statuses)
     if not unique or unique == {"STUBBED"}:
@@ -83,6 +137,75 @@ def _overall_status(statuses: list[str]) -> str:
     if unique == {"ERROR"}:
         return "ERROR"
     return "PARTIAL"
+
+
+# Tools that read PIXELS. Everything else in the registry either cross-checks the referral reason
+# (above) or is still a stub. cxr-screen is the first real model in the system (#27).
+_PIXEL_TOOLS = frozenset({"cxr-screen"})
+
+
+async def _pixel_finding(tool_id: str, ctx: dict) -> Optional[dict]:
+    """Run a real model over the study's pixels, or return None to leave the tool STUBBED.
+
+    DEGRADES, NEVER CRASHES. Three ways this legitimately does not run, and none of them may take
+    the study down -- interpretation is one leg of a pre-read fan-out, and a study that cannot be
+    screened still has to reach the radiologist:
+      * the imaging/model extras are not installed (the default agent-tests lane installs neither,
+        which is what keeps 65 existing tests green and torch out of CI) -> STUBBED;
+      * Orthanc has no instances for the study, or the instance carries no pixels -> STUBBED;
+      * the model itself throws -> ERROR, reported honestly.
+
+    What it must never do is invent a negative. A tool that cannot look at the image and reports
+    "nothing found" is the automation-bias trap the #26 COMPLETE-gate exists to prevent, and it is
+    worse here than in the stub, because this one carries a model's authority.
+    """
+    if tool_id not in _PIXEL_TOOLS or not PIXEL_TOOLING:
+        return None
+
+    orthanc_study_id = (ctx.get("study") or {}).get("orthancStudyId")
+    if not orthanc_study_id:
+        return None
+
+    try:
+        client = OrthancClient()
+        instances = await client.list_study_instances(orthanc_study_id)
+        if not instances:
+            log.warning("cxr-screen: study %s has no instances", orthanc_study_id)
+            return None
+
+        # The FIRST instance, in (SeriesNumber, InstanceNumber) order -- the frontal view of a
+        # frontal+lateral study. list_study_instances guarantees that order; an arbitrary pick
+        # would score the lateral on some studies and the frontal on others.
+        instance_id = instances[0]
+        pixels = dicom_to_greyscale(await client.get_instance_dicom(instance_id))
+
+        # Inference is CPU-bound and blocking; keep it off the event loop so one study being
+        # screened does not stall every other A2A request this agent is serving.
+        probs = await asyncio.to_thread(score, pixels)
+    except NotAnImage as exc:
+        log.warning("cxr-screen: %s carries no pixel data (%s)", orthanc_study_id, exc)
+        return None
+    except Exception as exc:  # model/transport failure -> ERROR, not a fabricated negative
+        log.exception("cxr-screen failed for %s", orthanc_study_id)
+        return {
+            "toolId": tool_id,
+            "label": f"screening model did not run: {type(exc).__name__}",
+            "confidence": None,
+            "evidenceRef": None,
+            "status": "ERROR",
+        }
+
+    label, confidence = summarise(probs)
+    return {
+        "toolId": tool_id,
+        "label": label,
+        "confidence": confidence,
+        # Text locator, same convention as the referral-reason slices: the instance the model
+        # actually scored, so a reader can pull up the exact frame. Not a DICOM SC/overlay ref --
+        # writing AI-made images into the record is deferred (#59) and needs its own safety review.
+        "evidenceRef": f"orthanc:instance/{instance_id}",
+        "status": "COMPLETE",
+    }
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
@@ -96,14 +219,15 @@ async def handle(skill_id: str, payload: dict) -> dict:
 
     findings = []
     for tool in tools:
-        real = _reason_finding(tool, reason_codes) if tool in _REASON_CODE_RULES else None
+        real = await _pixel_finding(tool, ctx)
+        if real is None and tool in _REASON_CODE_RULES:
+            real = _reason_finding(tool, reason_codes)
         findings.append(real or {
             "toolId": tool, "label": "", "confidence": None, "evidenceRef": None, "status": "STUBBED",
         })
 
     tools_selected = [
-        {"toolId": f["toolId"], "version": "referral-rule-1" if f["evidenceRef"] else "stub-0",
-         "status": f["status"]}
+        {"toolId": f["toolId"], "version": _tool_version(f), "status": f["status"]}
         for f in findings
     ]
 
