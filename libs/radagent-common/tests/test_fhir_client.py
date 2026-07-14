@@ -8,8 +8,16 @@ entries. Each report is projected to a lean, PHI-free record.
 from __future__ import annotations
 
 import asyncio
+import os
+from unittest import mock
 
-from radagent_common.fhir_client import Fhir2Client, finalized_report_record
+import pytest
+
+from radagent_common.fhir_client import (
+    Fhir2Client,
+    finalized_report_record,
+    _write_transport_is_secure,
+)
 
 _FINAL = {
     "resourceType": "DiagnosticReport", "id": "rep-1", "status": "final",
@@ -782,6 +790,68 @@ def test_presign_draft_lookup_ignores_a_FINAL_report():
     client._get, client._post, client._put = fake_get, fake_post, fake_put  # type: ignore[assignment]
     assert asyncio.run(client.write_presign_impression(
         "ServiceRequest/sr-1", "Patient/p1", "text")) == "our-new-draft"
+
+
+# --- #30 security review: write-transport secrecy -------------------------------------------------
+#
+# A DiagnosticReport write carries PHI (the impression) and rides HTTP Basic credentials. Over
+# plaintext http to a remote host both are exposed. The guard lives in _post/_put, so a real write
+# refuses an insecure transport while the transport-mocking tests above are unaffected.
+
+def test_write_transport_secure_allows_https_and_loopback_and_optin():
+    assert _write_transport_is_secure("https://openmrs.example.org/openmrs/ws/fhir2/R4")
+    assert _write_transport_is_secure("http://localhost:8080/openmrs/ws/fhir2/R4")
+    assert _write_transport_is_secure("http://127.0.0.1:8080/fhir2/R4")
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_WRITE": "1"}):
+        assert _write_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+
+
+def test_write_transport_insecure_rejects_plaintext_to_a_remote_host():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        assert not _write_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+        assert not _write_transport_is_secure("http://fhir.hospital.example:8080/fhir2/R4")
+
+
+def test_write_refuses_a_plaintext_remote_transport_at_the_wire():
+    """The guard is in _post/_put, so an actual write to a plaintext remote host raises before any
+    PHI or credential leaves the process. Propagates as a failed activity -> bounded retry -> skip,
+    so it never strands the read, but it never leaks either."""
+    client = Fhir2Client(base_url="http://openmrs:8080/openmrs/ws/fhir2/R4")
+
+    async def only_our_lookup(path, params=None):
+        return _bundle()  # no existing draft -> the write would POST
+
+    client._get = only_our_lookup  # type: ignore[assignment]
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with pytest.raises(RuntimeError, match="plaintext HTTP"):
+            asyncio.run(client.write_presign_impression(
+                "ServiceRequest/sr-1", "Patient/p1", "Findings consistent with pneumothorax."))
+
+
+def test_authorship_guard_collides_when_the_concept_is_shared():
+    """WHY the deployed concept MUST be dedicated (#30 -> #55).
+
+    The authorship discriminator is the `code` concept: _find_presign_draft treats a preliminary
+    report on this order as OURS iff it carries our concept. If the deployment's concept is a SHARED
+    one (the CIEL "Provisional diagnosis" default on `main` today), a radiologist's own provisional
+    draft coded with that same concept matches as ours -- and write_presign_impression would PUT the
+    AI text over it. This is inert now (the write is gated on a COMPLETE finding, and no stub tool
+    emits one), but it is why enabling the write requires a dedicated concept nobody else emits.
+    """
+    client = Fhir2Client()
+    shared_concept = "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # the CIEL stand-in a RIS may also use
+
+    async def fake_get(path, params=None):
+        return _bundle(_draft("radiologist-own-draft", concept=shared_concept))
+
+    client._get = fake_get  # type: ignore[assignment]
+    with mock.patch.dict(os.environ, {"FHIR2_PRESIGN_REPORT_CONCEPT": shared_concept}):
+        hit = asyncio.run(client._find_presign_draft("ServiceRequest/sr-1", "Patient/p1"))
+    # The collision: a human's draft is matched as ours. A dedicated concept (#55) is what prevents
+    # this -- with a distinct concept the same lookup returns None (see the tests above).
+    assert hit == "radiologist-own-draft"
 
 
 # --- typed clinical reads for the Communications Agent (#52) -------------------------

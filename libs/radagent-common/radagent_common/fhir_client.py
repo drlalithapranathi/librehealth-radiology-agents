@@ -10,6 +10,7 @@ clinical data uses THIS client (lean-reference: fetch from source, do not pass P
 from __future__ import annotations
 from typing import Any, Optional
 import os
+from urllib.parse import urlparse
 import httpx
 
 from .fhir_models import DiagnosticReport, ServiceRequest
@@ -52,6 +53,36 @@ def _presign_report_concept() -> str:
     return os.environ.get("FHIR2_PRESIGN_REPORT_CONCEPT", _DEFAULT_PRESIGN_REPORT_CONCEPT)
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _write_transport_is_secure(base_url: str) -> bool:
+    """Is it safe to send a fhir2 WRITE to this base URL (#30)?
+
+    A DiagnosticReport write carries PHI -- the pre-sign impression text -- and rides HTTP Basic
+    credentials in every request. Over plaintext `http` to a remote host, both are exposed on the
+    wire to anyone on the path. We therefore refuse a plaintext write UNLESS the target is loopback
+    (local dev / unit tests) or the deployment has explicitly accepted the risk on a trusted
+    internal network via FHIR2_ALLOW_INSECURE_WRITE. `https` is always fine. Reads are not gated
+    here, but the same base URL serves them, so requiring TLS for the write secures reads too.
+    """
+    parsed = urlparse(base_url)
+    if parsed.scheme == "https":
+        return True
+    if (parsed.hostname or "").lower() in _LOOPBACK_HOSTS:
+        return True
+    return os.environ.get("FHIR2_ALLOW_INSECURE_WRITE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _guard_write_transport(base_url: str) -> None:
+    if not _write_transport_is_secure(base_url):
+        raise RuntimeError(
+            "refusing a fhir2 write over plaintext HTTP to a non-loopback host: the pre-sign "
+            "impression (PHI) and the HTTP Basic credentials would travel in cleartext. Use an "
+            "https base URL, or set FHIR2_ALLOW_INSECURE_WRITE=1 for a trusted internal network."
+        )
+
+
 class Fhir2Client:
     def __init__(self, base_url: Optional[str] = None, timeout: float = 15.0):
         self.base_url = (base_url or os.environ.get("FHIR2_BASE_URL", "http://openmrs:8080/openmrs/ws/fhir2/R4")).rstrip("/")
@@ -67,12 +98,14 @@ class Fhir2Client:
             return r.json()
 
     async def _post(self, path: str, resource: dict) -> dict:
+        _guard_write_transport(self.base_url)  # no PHI/credentials over plaintext to a remote host (#30)
         async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
             r = await c.post(f"{self.base_url}/{path.lstrip('/')}", json=resource)
             r.raise_for_status()
             return r.json()
 
     async def _put(self, path: str, resource: dict) -> dict:
+        _guard_write_transport(self.base_url)  # no PHI/credentials over plaintext to a remote host (#30)
         async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
             r = await c.put(f"{self.base_url}/{path.lstrip('/')}", json=resource)
             r.raise_for_status()
