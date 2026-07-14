@@ -23,11 +23,12 @@ AGENT_VERSION = "0.3.0"
 # disagreed with triage on the same order: triage escalated "I26" or "I2699" as urgent PE while
 # this tool stayed silent on the identical code (#27 follow-up, Saptarshi/Pranathi). Prefixes
 # confirmed with Pranathi (lead review):
-#   - pneumothorax-detect: "J93" (spontaneous pneumothorax + air leak -- the whole family is
-#     pneumothorax, so the prefix can't over-match). S27.0XXA (traumatic) and J95.811
-#     (postprocedural, e.g. r/o PTX post-line film) stay explicit full codes because their
-#     families -- S27 intrathoracic injury generally, J95 postprocedural respiratory
-#     complications generally -- are NOT all pneumothorax.
+#   - pneumothorax-detect: "J93" (spontaneous pneumothorax *and other air leak*, e.g. J93.82 --
+#     that code already matched under the old exact-code list on main, so staying matched here
+#     is not a widening; it's a chest study and the finding stays STUBBED regardless). S27.0XXA
+#     (traumatic) and J95.811 (postprocedural, e.g. r/o PTX post-line film) stay explicit full
+#     codes because their families -- S27 intrathoracic injury generally, J95 postprocedural
+#     respiratory complications generally -- are NOT all pneumothorax.
 #   - pe-detect: "I26" (parent + all billable children, with/without acute cor pulmonale --
 #     all of I26 is pulmonary embolism, so the prefix can't over-match). "O882" (dot-normalised
 #     O88.2, obstetric thromboembolism) stays a 4-char prefix rather than the 3-char "O88"

@@ -209,6 +209,17 @@ async def test_pe_other_obstetric_embolism_code_stays_unmatched():
     assert pe["evidenceRef"] is None
 
 
+# Pins "O882" as a PREFIX, not an exact match: the billable obstetric-PE children (O88.211,
+# O88.219, O88.22, O88.23) must keep matching. Without this, the O88.0-stays-unmatched test above
+# alone would pass just as well if O882 were tightened to an exact match -- and every billable
+# child would go silent while the suite stayed green (Pranathi, MR review).
+async def test_pe_obstetric_embolism_child_code_records_evidence():
+    ctx = {**CTPA_CONTEXT, "order": {"priority": "stat", "reasonCode": ["O88.211"]}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    pe = next(f for f in out["findings"] if f["toolId"] == "pe-detect")
+    assert pe["evidenceRef"] == "order.reasonCode=O88.211"
+
+
 async def test_pneumothorax_other_intrathoracic_injury_code_stays_unmatched():
     # S27.1 (traumatic hemothorax) sits in the same S27 family as S27.0XXA (traumatic
     # pneumothorax) but is not pneumothorax -- S27.0XXA must stay an explicit full code.
