@@ -854,11 +854,14 @@ def test_authorship_guard_collides_when_the_concept_is_shared():
     """WHY the deployed concept MUST be dedicated (#30 -> #55).
 
     The authorship discriminator is the `code` concept: _find_presign_draft treats a preliminary
-    report on this order as OURS iff it carries our concept. If the deployment's concept is a SHARED
-    one (the CIEL "Provisional diagnosis" default on `main` today), a radiologist's own provisional
-    draft coded with that same concept matches as ours -- and write_presign_impression would PUT the
-    AI text over it. This is inert now (the write is gated on a COMPLETE finding, and no stub tool
-    emits one), but it is why enabling the write requires a dedicated concept nobody else emits.
+    report on this order as OURS iff it carries our concept. If a deployment points at a SHARED
+    concept -- e.g. the CIEL "Provisional diagnosis" a RIS may reuse for its own preliminary reports
+    -- a radiologist's own provisional draft coded with that concept matches as ours, and
+    write_presign_impression would PUT the AI text over it. #55 is precisely the fix: it moved
+    `main`'s default OFF that shared CIEL concept onto a dedicated "AI pre-sign impression draft"
+    concept nobody else emits. This test pins the collision that default now prevents, by forcing the
+    shared concept back on via FHIR2_PRESIGN_REPORT_CONCEPT. Inert regardless today (the write is
+    gated on a COMPLETE finding, and no stub tool emits one).
     """
     client = Fhir2Client()
     shared_concept = "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # the CIEL stand-in a RIS may also use
@@ -869,8 +872,8 @@ def test_authorship_guard_collides_when_the_concept_is_shared():
     client._get = fake_get  # type: ignore[assignment]
     with mock.patch.dict(os.environ, {"FHIR2_PRESIGN_REPORT_CONCEPT": shared_concept}):
         hit = asyncio.run(client._find_presign_draft("ServiceRequest/sr-1", "Patient/p1"))
-    # The collision: a human's draft is matched as ours. A dedicated concept (#55) is what prevents
-    # this -- with a distinct concept the same lookup returns None (see the tests above).
+    # The collision: a human's draft is matched as ours. Main's dedicated default (#55) is what
+    # prevents this -- with a distinct concept the same lookup returns None (see the tests above).
     assert hit == "radiologist-own-draft"
 
 
