@@ -59,6 +59,21 @@ class _FakeFhir:
         return self.result
 
 
+class _FakeOrthanc:
+    """Stand-in for OrthancClient: `description` is returned by get_study_description; `error`, if
+    set, is raised (simulates Orthanc being down)."""
+    def __init__(self, description: str = "", error=None):
+        self.description = description
+        self.error = error
+        self.calls: list[str] = []
+
+    async def get_study_description(self, orthanc_study_id: str) -> str:
+        self.calls.append(orthanc_study_id)
+        if self.error is not None:
+            raise self.error
+        return self.description
+
+
 EVENT = {
     "schemaVersion": "1.0.0",
     "eventType": "orthanc.study.stable",
@@ -83,6 +98,7 @@ def _reset_ingress_globals():
         ingress._STORE = None
     ingress._client = None
     ingress._FHIR = None
+    ingress._ORTHANC = None
 
 
 async def _await_state(handle, target: str, tries: int = 400) -> None:
@@ -96,6 +112,7 @@ async def _await_state(handle, target: str, tries: int = 400) -> None:
 # --- unit: resolution and its fallbacks ------------------------------------
 def test_build_context_populates_real_patient_and_order():
     ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._ORTHANC = _FakeOrthanc()
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["patient"] == {"fhirPatientId": "Patient/pat-1"}
     assert ctx["order"] == {"fhirServiceRequestId": "ServiceRequest/sr-dup"}
@@ -103,6 +120,7 @@ def test_build_context_populates_real_patient_and_order():
 
 def test_build_context_falls_back_when_fhir2_down():
     ingress._FHIR = _FakeFhir(error=RuntimeError("fhir2 unreachable"))
+    ingress._ORTHANC = _FakeOrthanc()
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     # Never fail the PACS: still a valid StudyContext, just the UNRESOLVED placeholder.
     assert ctx["patient"] == {"fhirPatientId": "Patient/UNRESOLVED"}
@@ -111,6 +129,7 @@ def test_build_context_falls_back_when_fhir2_down():
 
 def test_build_context_falls_back_on_miss():
     ingress._FHIR = _FakeFhir(result=None)
+    ingress._ORTHANC = _FakeOrthanc()
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["patient"] == {"fhirPatientId": "Patient/UNRESOLVED"}
     assert ctx["order"] == {}
@@ -165,6 +184,7 @@ def test_refire_repairs_serviceRequest_join(tmp_path):
 
                 # Event 1: fhir2 is DOWN -> UNRESOLVED, accession-only index.
                 ingress._FHIR = _FakeFhir(error=RuntimeError("fhir2 down"))
+                ingress._ORTHANC = _FakeOrthanc()
                 assert await ingress.orthanc_webhook(dict(EVENT)) == {"started": WF_ID}
                 # The robust ServiceRequest join does NOT exist yet...
                 assert ingress._workflow_id_for_report(
@@ -183,3 +203,40 @@ def test_refire_repairs_serviceRequest_join(tmp_path):
                     {"serviceRequestRef": "ServiceRequest/sr-dup"}) == WF_ID
 
     asyncio.run(scenario())
+
+
+# --- the seam: the context ingress BUILDS must carry the field the registry SELECTS on (#62) ---
+#
+# Same shape of bug as #61, one field over. `select_tools(modality, studyDescription)` picks the
+# body-region tools almost entirely on the description -- `ich-detect`/`stroke-detect` for a CT HEAD,
+# `cxr-screen`/`pneumothorax-detect` for a chest film -- and falls through to the modality's generic
+# screen without one. The Orthanc stable event does not carry the description, ingress never read it
+# back, and so every live study reached the registry with "" and got the generic tool. The
+# interpretation agent's tests were green throughout: every fixture hand-writes a studyDescription.
+def test_build_context_carries_the_description_the_registry_selects_on():
+    ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._ORTHANC = _FakeOrthanc(description="CT HEAD WITHOUT CONTRAST")
+    ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
+    assert ctx["study"]["studyDescription"] == "CT HEAD WITHOUT CONTRAST"
+    assert ingress._ORTHANC.calls == ["dup1"]  # looked it up by the event's orthancStudyId
+    validate_against(ctx, paths.contracts_dir() / "studycontext.schema.json")
+
+
+def test_build_context_omits_the_description_when_orthanc_has_none():
+    ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._ORTHANC = _FakeOrthanc(description="")
+    ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
+    # Absent, not "": the key says "unknown", an empty string would assert "no description".
+    assert "studyDescription" not in ctx["study"]
+    validate_against(ctx, paths.contracts_dir() / "studycontext.schema.json")
+
+
+def test_build_context_still_starts_when_orthanc_is_down():
+    # Orthanc down costs the study its body-region tools. Failing the webhook would cost it the
+    # whole workflow -- ingestion must never fail the PACS (#11).
+    ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._ORTHANC = _FakeOrthanc(error=RuntimeError("orthanc unreachable"))
+    ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
+    assert "studyDescription" not in ctx["study"]
+    assert ctx["patient"] == {"fhirPatientId": "Patient/pat-1"}  # the rest of the context survives
+    validate_against(ctx, paths.contracts_dir() / "studycontext.schema.json")

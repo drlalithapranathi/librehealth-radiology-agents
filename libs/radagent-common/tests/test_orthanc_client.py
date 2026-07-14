@@ -114,3 +114,43 @@ def test_get_study_fetches_by_orthanc_id():
     got = asyncio.run(client.get_study("abc"))
     assert calls == ["studies/abc"]
     assert got["ID"] == "abc"
+
+
+# --- get_study_description (issue #62) --------------------------------------
+# The field the interpretation tool registry selects on. The Orthanc stable event does not carry it,
+# so ingress reads it back from here; without it every study falls through to the generic tool.
+def _client_returning(raw):
+    client = OrthancClient()
+    calls = []
+
+    async def fake_get(path, params=None):
+        calls.append(path)
+        return raw
+
+    client._get = fake_get  # type: ignore[assignment]
+    return client, calls
+
+
+def test_get_study_description_reads_the_dicom_tag():
+    client, calls = _client_returning(
+        {"ID": "s1", "MainDicomTags": {"StudyDescription": "CT HEAD WITHOUT CONTRAST"}})
+    assert asyncio.run(client.get_study_description("s1")) == "CT HEAD WITHOUT CONTRAST"
+    assert calls == ["studies/s1"]
+
+
+def test_get_study_description_empty_when_the_tag_is_missing():
+    # A partial Orthanc record degrades to "" rather than raising -- the study still gets a workflow,
+    # it just gets the registry's generic tool. Same tolerance as _lean_study.
+    client, _ = _client_returning({"ID": "s1", "MainDicomTags": {}})
+    assert asyncio.run(client.get_study_description("s1")) == ""
+    client, _ = _client_returning({"ID": "s1"})
+    assert asyncio.run(client.get_study_description("s1")) == ""
+    client, _ = _client_returning({})
+    assert asyncio.run(client.get_study_description("s1")) == ""
+
+
+def test_get_study_description_strips_padding():
+    # DICOM string values are padded to an even length; a trailing space would defeat the registry's
+    # keyword match and is not a description.
+    client, _ = _client_returning({"MainDicomTags": {"StudyDescription": "  CHEST AP  "}})
+    assert asyncio.run(client.get_study_description("s1")) == "CHEST AP"

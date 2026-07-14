@@ -62,6 +62,20 @@ class _FakeFhir:
         return self.result
 
 
+class _FakeOrthanc:
+    """Stand-in for OrthancClient in ingress tests (no live Orthanc). Ingress reads the study's
+    description back from Orthanc (#62); without this stand-in these tests would reach for a real
+    server."""
+    def __init__(self, description: str = "", error=None):
+        self.description = description
+        self.error = error
+
+    async def get_study_description(self, orthanc_study_id: str) -> str:
+        if self.error is not None:
+            raise self.error
+        return self.description
+
+
 # A schema-valid OrthancStableStudyEvent (contracts/events/orthanc-stable.schema.json).
 EVENT = {
     "schemaVersion": "1.0.0",
@@ -86,6 +100,7 @@ def _reset_ingress_globals():
         ingress._STORE = None
     ingress._client = None  # don't leak the test env's client into another test
     ingress._FHIR = None    # ditto the injected fhir2 client
+    ingress._ORTHANC = None  # ditto the injected Orthanc client (#62)
 
 
 async def _await_state(handle, target: str, tries: int = 400) -> None:
@@ -107,6 +122,7 @@ def test_duplicate_stable_event_is_idempotent(tmp_path):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client  # so _temporal() returns the test client, no real connect
                 ingress._FHIR = _FakeFhir(result=None)  # unresolved: keep this test purely about idempotency
+                ingress._ORTHANC = _FakeOrthanc()
 
                 # First event: starts the workflow normally.
                 first = await ingress.orthanc_webhook(dict(EVENT))
@@ -135,6 +151,7 @@ def test_duplicate_after_completion_starts_fresh(tmp_path):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client
                 ingress._FHIR = _FakeFhir(result=None)
+                ingress._ORTHANC = _FakeOrthanc()
 
                 first = await ingress.orthanc_webhook(dict(EVENT))
                 assert first == {"started": WF_ID}

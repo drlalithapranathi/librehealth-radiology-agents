@@ -19,6 +19,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from radagent_common import validate_against, paths
 from radagent_common.client import parse_push_callback
 from radagent_common.fhir_client import Fhir2Client
+from radagent_common.orthanc_client import OrthancClient
 from radagent_common.validation import validate_skill_output
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id, init_tracing, tracing_enabled
 from .state import TASK_QUEUE
@@ -79,6 +80,17 @@ def _fhir() -> Fhir2Client:
     return _FHIR
 
 
+# Read-only Orthanc client for the study's DICOM description (#62). Same lazy shape as _FHIR.
+_ORTHANC: OrthancClient | None = None
+
+
+def _orthanc() -> OrthancClient:
+    global _ORTHANC
+    if _ORTHANC is None:
+        _ORTHANC = OrthancClient()
+    return _ORTHANC
+
+
 async def _temporal() -> Client:
     global _client
     if _client is None:
@@ -93,24 +105,37 @@ async def _temporal() -> Client:
 
 
 async def _build_study_context(event: dict) -> dict:
-    """Map an Orthanc event to a (schema-valid) StudyContext, resolving the patient + order from the
-    accession via fhir2 (#11).
+    """Map an Orthanc event to a (schema-valid) StudyContext: the patient + order resolved from the
+    accession via fhir2 (#11), the study's description read back from Orthanc (#62).
 
-    Resolution is best-effort: on any fhir2 error or a miss we fall back to the `Patient/UNRESOLVED`
-    placeholder so the workflow always starts -- ingestion must never fail the PACS. A later stable
-    re-fire (see orthanc_webhook) repairs an UNRESOLVED first pass without a restart.
+    Both lookups are best-effort. A fhir2 error or miss falls back to the `Patient/UNRESOLVED`
+    placeholder; an Orthanc error leaves the description unset. The workflow always starts --
+    ingestion must never fail the PACS. A later stable re-fire (see orthanc_webhook) repairs an
+    UNRESOLVED first pass without a restart.
+
+    The two lookups hit different servers and neither needs the other's answer, so they run
+    concurrently: the PACS is blocked on this webhook, and there is no reason to make it wait for
+    fhir2 and Orthanc in series.
     """
     wf_id = f"wf_{event['orthancStudyId']}"
-    patient, order = await _resolve_patient_order(event.get("accessionNumber"))
+    (patient, order), description = await asyncio.gather(
+        _resolve_patient_order(event.get("accessionNumber")),
+        _study_description(event["orthancStudyId"]),
+    )
+    study = {
+        "studyInstanceUID": event["studyInstanceUID"],
+        "accessionNumber": event.get("accessionNumber"),
+        "orthancStudyId": event["orthancStudyId"],
+        "modality": event["modality"],
+    }
+    # Omitted rather than set to "" when Orthanc has no description: the schema types it as a
+    # string, and an absent key says "unknown" where an empty one would assert "no description".
+    if description:
+        study["studyDescription"] = description
     return {
         "schemaVersion": "1.0.0",
         "workflowId": wf_id,
-        "study": {
-            "studyInstanceUID": event["studyInstanceUID"],
-            "accessionNumber": event.get("accessionNumber"),
-            "orthancStudyId": event["orthancStudyId"],
-            "modality": event["modality"],
-        },
+        "study": study,
         "patient": patient,
         "order": order,
         "meta": {
@@ -150,6 +175,26 @@ async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
             order.update({k: resolved[k] for k in _ORDER_SIGNALS if resolved.get(k)})
             return {"fhirPatientId": resolved["fhirPatientId"]}, order
     return {"fhirPatientId": "Patient/UNRESOLVED"}, {}
+
+
+async def _study_description(orthanc_study_id: str) -> str:
+    """The study's DICOM StudyDescription, read back from Orthanc (#62).
+
+    This is what the interpretation tool registry selects on -- `select_tools(modality,
+    studyDescription)` picks `ich-detect`/`stroke-detect` for a CT HEAD and falls through to
+    `generic-ct-screen` without it -- and what triage's description keywords scan. The Orthanc
+    stable event does not carry it, so ingress reads it from the source.
+
+    Best-effort, like the fhir2 resolve above: Orthanc being unreachable costs the study its
+    body-region tools, which is bad, but failing the webhook would cost it the whole workflow.
+    """
+    try:
+        return await _orthanc().get_study_description(orthanc_study_id)
+    except Exception:  # noqa: BLE001 - Orthanc down/unreachable must not fail the webhook
+        _log.warning("Orthanc description lookup failed for study %s; starting without one "
+                     "(the interpretation registry will fall back to its generic tool)",
+                     orthanc_study_id)
+        return ""
 
 
 def _index_workflow(ctx: dict) -> None:

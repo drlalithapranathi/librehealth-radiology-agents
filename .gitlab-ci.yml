@@ -151,12 +151,19 @@ ris-poller-tests:
     # [otel] too (#28): test_worker_tracing.py pins the tracing wiring — the double-span
     # interceptor and the silently-unexported ingress spans. Without the extra the whole module
     # importorskips, and CI would go green on exactly the bugs it exists to catch.
+    #
+    # test_orthanc_client.py is listed for the same reason (#62). Ingress now reads the study
+    # description back from Orthanc, but the ingress seam test injects a fake client — so these
+    # are the ONLY tests that exercise the real get_study_description, and without them CI would
+    # stay green if the method were deleted. (Needs no extra deps: httpx is a core dep and the
+    # file drives async via asyncio.run, not pytest-asyncio.)
     - pip install -e "libs/radagent-common[a2a,otel]" "temporalio==1.29.0" fastapi pytest
     - >
       python -m pytest
       libs/radagent-common/tests/test_fhir_client.py
       libs/radagent-common/tests/test_fhir_models.py
       libs/radagent-common/tests/test_comms_ledger.py
+      libs/radagent-common/tests/test_orthanc_client.py
       libs/radagent-common/tests/test_tracing.py
       orchestrator/tests -q
 
