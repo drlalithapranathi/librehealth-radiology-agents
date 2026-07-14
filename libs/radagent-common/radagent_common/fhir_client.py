@@ -183,13 +183,20 @@ class Fhir2Client:
         return collected
 
     async def resolve_order_by_accession(self, accession: str) -> Optional[dict]:
-        """Resolve a DICOM accession to its patient + order refs (issue #11).
+        """Resolve a DICOM accession to its patient + order refs and triage signals (#11, #61).
 
-        Searches ServiceRequest by its accession identifier and returns the lean join refs the
-        ingress needs to replace the `Patient/UNRESOLVED` placeholder:
-            {"fhirPatientId": "Patient/<id>", "fhirServiceRequestId": "ServiceRequest/<id>"}
-        Returns None when nothing matches. Read-only (a search GET); the refs are the only data
-        that leave fhir2 -- no name or clinical content (lean-reference).
+        Searches ServiceRequest by its accession identifier and returns what the ingress needs to
+        build the StudyContext `patient` and `order` blocks:
+            {"fhirPatientId": "Patient/<id>", "fhirServiceRequestId": "ServiceRequest/<id>",
+             "priority": "stat", "reasonCode": ["J93.1"]}
+        `priority` and `reasonCode` are omitted when the order carries none. Returns None when
+        nothing matches. Read-only (a search GET).
+
+        The two optional keys are how the order's urgency reaches triage (#61). They are the only
+        clinical content in the envelope, and they are there because `triage.score` scores on them
+        and cannot do its job without them -- lean-reference means the minimum a downstream agent
+        needs, not nothing at all. `studycontext.schema.json` has always declared both. No name, no
+        narrative, no free text (see `_order_reason_codes`).
 
         NOTE: matches the accession as a bare FHIR `identifier` value (any system). If the live
         fhir2 needs the ACSN system pinned (`identifier=<system>|<value>`), narrow it here once the
@@ -205,8 +212,15 @@ class Fhir2Client:
             patient_ref = (resource.get("subject") or {}).get("reference")
             sr_id = resource.get("id")
             if patient_ref and sr_id:
-                return {"fhirPatientId": patient_ref,
-                        "fhirServiceRequestId": f"ServiceRequest/{sr_id}"}
+                resolved = {"fhirPatientId": patient_ref,
+                            "fhirServiceRequestId": f"ServiceRequest/{sr_id}"}
+                priority = _order_priority(resource)
+                if priority:
+                    resolved["priority"] = priority
+                reason_codes = _order_reason_codes(resource)
+                if reason_codes:
+                    resolved["reasonCode"] = reason_codes
+                return resolved
         return None
 
     async def get_report_conclusion(self, diagnostic_report_id: str) -> Optional[str]:
@@ -380,6 +394,38 @@ def _bundle_next_link(bundle: dict) -> Optional[str]:
         if isinstance(link, dict) and link.get("relation") == "next":
             return link.get("url")
     return None
+
+
+# FHIR ServiceRequest.priority and StudyContext order.priority are the same four values -- but the
+# envelope pins them as a schema ENUM, so anything else fhir2 might answer with has to become "no
+# priority" rather than a value that would fail StudyContext validation and kill the ingest.
+_ORDER_PRIORITIES = frozenset({"stat", "urgent", "asap", "routine"})
+
+
+def _order_priority(resource: dict) -> Optional[str]:
+    """ServiceRequest.priority -> `order.priority`, or None if absent/unrecognised (#61)."""
+    priority = str(resource.get("priority") or "").strip().lower()
+    return priority if priority in _ORDER_PRIORITIES else None
+
+
+def _order_reason_codes(resource: dict) -> list[str]:
+    """ServiceRequest.reasonCode (CodeableConcept[]) -> the bare code strings the envelope carries
+    (#61). Deduped, order preserved.
+
+    Takes every coding whatever its system: `order.reasonCode` is system-agnostic by schema, triage
+    matches ICD-10 prefixes and ignores what it doesn't recognise, so filtering by system here would
+    only risk dropping the codes a live OpenMRS actually sends.
+
+    A concept's `text` is deliberately NOT read. A code is a code; free text on a referral reason is
+    where a clinician's narrative -- and PHI -- ends up, and it has no business on the wire.
+    """
+    codes: list[str] = []
+    for concept in resource.get("reasonCode") or []:
+        for coding in (concept or {}).get("coding") or []:
+            code = (coding or {}).get("code")
+            if isinstance(code, str) and code and code not in codes:
+                codes.append(code)
+    return codes
 
 
 def finalized_report_record(report: dict) -> dict:
