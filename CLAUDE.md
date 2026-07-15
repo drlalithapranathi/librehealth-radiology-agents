@@ -90,16 +90,19 @@ uvicorn orchestrator.ingress:app --port 8090
 ```
 
 ## Status
-**M2 complete (v0.2.0).** M0 (contract freeze + harness), M1 (walking skeleton: agents on Temporal,
-Orthanc->start, RIS polling->report pipeline), and M2 (Worklist API + OHIF data source,
-tier-dependent sign-off escalation, A2A push-notifications, pre-sign impression assist, the
-verification rule library with report-body parsing, and opt-in OpenTelemetry tracing) are all
-merged. AI models stay stubbed behind the Interpretation tool registry. **M3 is in progress:** real
-AI/CAD tools (#27) remain open. On the #30 security review, the dedicated pre-sign draft concept
-(#55, done) is provisioned into o3 at stack startup by `docker/openmrs/bootstrap_presign_concept.py`,
-and the plaintext-write transport guard is merged (!57); what remains is TLS in production and the
-least-privilege fhir2 service account, both landing with #75. **M4 (added 2026-07-15) is the
+**M3 complete (v0.3.0, released 2026-07-15); milestones M0-M3 closed.** M0 froze the contracts and
+harness; M1 shipped the walking skeleton (agents on Temporal, Orthanc->start, RIS polling->report
+pipeline); M2 (v0.2.0) shipped the Worklist API + OHIF data source, tier-dependent sign-off
+escalation, A2A push-notifications, pre-sign impression assist, the verification rule library with
+report-body parsing, and opt-in OpenTelemetry tracing. M3 (v0.3.0) hardened interpretation-registry
+selection (real protocol aliases, ICD-10 family prefixes, bone-adjacency exclusions) and the fhir2
+write path: the dedicated pre-sign draft concept (#55) is provisioned into o3 at stack startup by
+`docker/openmrs/bootstrap_presign_concept.py`, and the plaintext-write transport guard is merged
+(!57). AI models stay stubbed behind the Interpretation tool registry. **M4 (in progress) is the
 MIMIC-CXR radiologist showcase:** a hosted demo where radiologists and referring physicians work a
-~100-study MIMIC-CXR cohort through the full pipeline (#66, #68-#79; critical path is #70, proving
-the RIS sign-off link, plus #68, the ETL). EMBED mammography (#31) is phase 2 after the demo.
-Search `TODO(M3)` for next steps; the full plan is the GitLab issue backlog.
+~100-study MIMIC-CXR cohort through the full pipeline. It carries #66, #68-#79 and the #27/#30
+umbrellas (real COMPLETE-emitting CAD in #71; TLS in production and the least-privilege fhir2
+account in #75); the critical path is #70 (prove the RIS sign-off link) plus #68 (the ETL). **M5 is
+the EMBED mammography flagship** after the demo (#31; mapping in
+`docs/embed-mammography-mapping.md`). Search `TODO(M3)` for open code markers; the full plan is the
+GitLab issue backlog.
