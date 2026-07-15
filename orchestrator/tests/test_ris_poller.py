@@ -98,6 +98,29 @@ def test_process_batch_routes_two_reports_to_two_workflows():
     assert {wf for wf, _sig, _arg in client.signals} == {"wf_a", "wf_b"}
 
 
+def test_process_batch_routes_addenda_to_report_addended_and_final_to_report_finalized():
+    """#56 (a) / #66: the poller routes on status. A `final` report is the radiologist's sign-off
+    (report_finalized); an `amended`/`corrected` report is an addendum to an already-signed report
+    (report_addended, which re-verifies against the correction at the gate). A report with no status
+    is treated as a finalization, as before."""
+    for wf, acc in (("wf_f", "ACC-F"), ("wf_a", "ACC-A"), ("wf_c", "ACC-C"), ("wf_n", "ACC-N")):
+        ingress._index_workflow(_ctx(wf, accession=acc))
+    final = {**_report("DiagnosticReport/rf", "t1", accession="ACC-F"), "status": "final"}
+    amended = {**_report("DiagnosticReport/ra", "t2", accession="ACC-A"), "status": "amended"}
+    corrected = {**_report("DiagnosticReport/rc", "t3", accession="ACC-C"), "status": "corrected"}
+    no_status = _report("DiagnosticReport/rn", "t4", accession="ACC-N")   # status absent
+    client = _FakeClient()
+    asyncio.run(ingress._process_batch(client, [final, amended, corrected, no_status], set()))
+
+    routed = {wf: sig for wf, sig, _arg in client.signals}
+    assert routed == {
+        "wf_f": ingress.StudyWorkflow.report_finalized,
+        "wf_a": ingress.StudyWorkflow.report_addended,
+        "wf_c": ingress.StudyWorkflow.report_addended,
+        "wf_n": ingress.StudyWorkflow.report_finalized,
+    }
+
+
 # ---- failed-signal retry: hold the cursor, never lose a sign-off (#29) ------------
 
 def test_advance_cursor_holds_at_failed_report_not_high_water():

@@ -273,8 +273,17 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
             else:
                 _log.warning("finalized report %s matched no waiting workflow (dropped)", report_id)
             continue
+        # Route on status: a `final` report is the radiologist's sign-off (report_finalized, leaves
+        # AWAITING_RADIOLOGIST); an `amended`/`corrected` report is an addendum to an already-signed
+        # report (report_addended, re-verifies against the correction at the sign-off gate, #56 (a)
+        # / #66). The poll (fhir_client._SIGNOFF_STATUSES) returns both; the record carries `status`.
+        signal = (
+            StudyWorkflow.report_addended
+            if report.get("status") in ("amended", "corrected")
+            else StudyWorkflow.report_finalized
+        )
         try:
-            await client.get_workflow_handle(wf_id).signal(StudyWorkflow.report_finalized, report)
+            await client.get_workflow_handle(wf_id).signal(signal, report)
             signalled.add(report_id)  # mapping is reclaimed on completion by _reconcile_index
             store.clear_failed_signal(report_id)  # delivered: retire any failure record
         except Exception:  # noqa: BLE001 - workflow gone/unreachable

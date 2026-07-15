@@ -6,7 +6,9 @@ Determinism rules (Temporal): no I/O, no wall-clock, no randomness in this file.
 
 Signals drive the two human gates:
 - report_finalized      -> leaves AWAITING_RADIOLOGIST (RIS poller sends this)
-- signoff_acknowledged  -> leaves AWAITING_SIGNOFF (radiologist addendum/ack)
+- signoff_acknowledged  -> leaves AWAITING_SIGNOFF by WAIVING an unchanged report (#57 override)
+- report_addended       -> leaves AWAITING_SIGNOFF by REPLACING the report with a corrected one,
+                           so the VERIFY loop re-verifies and can PASS (#56 (a) / #66)
 """
 from __future__ import annotations
 
@@ -149,8 +151,15 @@ class StudyWorkflow:
         self._state: State = State.RECEIVED
         self._report_event: Optional[dict] = None
         self._signoff_ack: Optional[dict] = None
+        # A CORRECTED report from the RIS addendum flow (#56 (a) / #66). Set by the report_addended
+        # signal while the study is parked at the sign-off gate; the gate wakes on it and the VERIFY
+        # loop adopts it and re-verifies. Distinct from _signoff_ack, which WAIVES an unchanged
+        # report (the #57 override); this REPLACES the report so a genuinely corrected one can PASS.
+        self._report_addendum: Optional[dict] = None
         # How the sign-off gate ended, and who released it (#57). Stays empty for a study that
-        # passed verification -- the gate never opened, so there is nothing to acknowledge.
+        # passed verification (the gate never opened) -- and ALSO for one released by an addendum
+        # whose re-verify passed (#66): the addendum branch re-enters the loop without recording an
+        # ack. A dedicated addendum audit field is a noted follow-up.
         self._signoff: dict = {}
         # Derived results (pass-forward; see WorkflowState in state.py).
         self._triage: Optional[dict] = None
@@ -280,12 +289,21 @@ class StudyWorkflow:
             )
 
     # ---- sign-off gate (#29) -------------------------------------------------------
+    def _gate_released(self) -> bool:
+        """The gate is released by EITHER a radiologist acknowledgement (#57 override, waives an
+        unchanged report) OR an addendum (#56 (a) / #66, a corrected report to re-verify). The
+        caller in run() reads self._report_addendum to tell which happened. For a replaying/parked
+        study self._report_addendum is always None (no pre-#66 history carries the report_addended
+        signal), so this reduces to the pre-existing ack condition and replay is unaffected."""
+        return self._signoff_ack is not None or self._report_addendum is not None
+
     async def _ack_or_timeout(self, timeout: timedelta | None) -> bool:
-        """True iff the radiologist ack arrived (already, or within `timeout`; None = wait)."""
+        """True iff the gate was released -- an ack or an addendum arrived (already, or within
+        `timeout`; None = wait). See _gate_released."""
         if timeout is not None and timeout <= timedelta(0):
-            return self._signoff_ack is not None
+            return self._gate_released()
         try:
-            await workflow.wait_condition(lambda: self._signoff_ack is not None, timeout=timeout)
+            await workflow.wait_condition(self._gate_released, timeout=timeout)
             return True
         except asyncio.TimeoutError:
             return False
@@ -437,8 +455,11 @@ class StudyWorkflow:
             )
 
     async def _hold_signoff_gate(self, wf_id: str) -> str:
-        """Hold AWAITING_SIGNOFF until a radiologist acknowledges, escalating per the tier ladder
-        (#29). Returns how the gate ENDED -- GATE_ACKNOWLEDGED or GATE_ABANDONED.
+        """Hold AWAITING_SIGNOFF until a radiologist acknowledges -- or a report_addended signal
+        lands (#66; the gate waits on _gate_released) -- escalating per the tier ladder (#29).
+        Returns how the gate ENDED -- GATE_ACKNOWLEDGED or GATE_ABANDONED. An addendum release also
+        reads GATE_ACKNOWLEDGED, which is fine only because the caller's addendum branch `continue`s
+        without consuming the outcome; the corrected report re-verifies instead.
 
         The orchestrator owns the durable escalation clock (the real comms agent has no
         self-firing timer): each rung of escalation-policy.yaml fires as its afterMinutes --
@@ -641,14 +662,49 @@ class StudyWorkflow:
             self._state = State.AWAITING_SIGNOFF
             outcome = await self._hold_signoff_gate(wf_id)
 
+            # --- ADDENDUM re-verify (#56 (a) / #66) ------------------------------------------
+            # A CORRECTED report arrived at the gate (the report_addended signal, from the RIS
+            # poller detecting an amended/corrected DiagnosticReport). Unlike the #57 override --
+            # which WAIVES an unchanged report -- the addendum REPLACES the report, so re-verifying
+            # is now meaningful and can legitimately PASS (or FAIL on the new content). Adopt it,
+            # re-structure the impression from the corrected report so verify sees a consistent
+            # pair, and re-enter the loop.
+            #
+            # Runtime-state gated on self._report_addendum, NOT a patch marker: only report_addended
+            # sets it, and no pre-#66 history carries that signal, so a replaying/parked study finds
+            # it None and never takes this branch -- its recorded command sequence is unchanged. A
+            # study parked at the gate when this deploys and then genuinely addended is LIVE past its
+            # recorded edge by the time the signal lands, so the new commands are a safe continuation
+            # (the same property #57's gate release relies on) -- and that is precisely #56's
+            # stranded population finally getting a real path back through verification.
+            if self._report_addendum is not None:
+                self._report_event = self._report_addendum
+                self._report_addendum = None
+                # Deliberate: an override that raced in alongside the addendum acknowledged the OLD
+                # report, so it is dropped -- the corrected report re-verifies on its own merits and,
+                # if it still FAILs, re-parks for a fresh decision about the report as it now reads.
+                self._signoff_ack = None
+                self._impression = await self._call(
+                    "impression-generation",
+                    "impression.generate",
+                    self._base_payload(
+                        ctx,
+                        report=self._report_event,
+                        ehrContext=self._ehr,
+                        aiFindings=self._ai,
+                    ),
+                )
+                continue  # re-verify against the corrected report
+
             # #57 (#56 decision (b)): the gate is terminal -- do NOT re-verify. Re-running
             # report.verify on the UNCHANGED report just re-derives the same FAIL and drops the
             # study back into the gate, which is the loop that made this state inescapable. The
             # study proceeds to COMMUNICATE carrying the FAIL *and* the acknowledgement (or the
             # non-acknowledgement) on the record -- the studies this gate stranded are exactly the
             # ones that most need COMMUNICATE to run.
-            # TODO(M2, #56 (a)): the addendum flow updates self._report_event with the CORRECTED
-            # report; only then is a re-verify meaningful, and it re-enters this loop.
+            # (#56 (a) / #66) is now implemented in the ADDENDUM branch above: an amended/corrected
+            # report updates self._report_event and re-enters this loop BEFORE we reach this terminal
+            # override path, so a genuinely corrected report re-verifies instead of being waived.
             #
             # PATCH_SIGNOFF_GATE_TERMINAL, not PATCH_SIGNOFF_OVERRIDE -- see the comment on the
             # marker. Reading the gate's own id here returns whatever the gate memoized, and a study
@@ -663,8 +719,9 @@ class StudyWorkflow:
                     **(self._signoff_ack or {}),
                 }
                 break
-            # Pre-#57 histories: fall through and re-verify, as they recorded -- and only THEY reset
-            # the ack, on their way back round to the gate. The reset used to sit at gate entry,
+            # Pre-#57 histories: fall through and re-verify, as they recorded -- and they reset the
+            # ack on their way back round to the gate (the ADDENDUM branch above also resets it, for
+            # its own reason: see the comment there). The reset used to sit at gate entry,
             # where it silently ate an override that landed in the moment between ingress accepting
             # it (202) and the gate opening: the radiologist was told the study was released, and it
             # then paged its whole ladder and abandoned. Signals are delivered whenever they arrive;
@@ -700,7 +757,9 @@ class StudyWorkflow:
             "comms": comms,
             "ack": ack,
             # How the sign-off gate ended, and who released it (#57). Empty when the report passed
-            # verification and the gate never opened -- the normal case.
+            # verification and the gate never opened -- the normal case -- and also when an
+            # addendum released the gate and its re-verify passed (#66; addendum audit field is a
+            # noted follow-up).
             "signoff": self._signoff,
         }
 
@@ -723,6 +782,20 @@ class StudyWorkflow:
         cannot reject one.
         """
         self._signoff_ack = ack
+
+    @workflow.signal
+    def report_addended(self, event: dict) -> None:
+        """A CORRECTED report arrived from the RIS addendum flow (#56 (a) / #66).
+
+        The producer is the RIS poller in ingress.py: it detects an amended/corrected
+        DiagnosticReport (status amended|corrected, as opposed to the final that report_finalized
+        carries) and signals the lean record here. The gate (via _ack_or_timeout -> _gate_released)
+        wakes on it, and the VERIFY loop adopts it as the report to re-verify. Unlike the #57
+        override, which waives an UNCHANGED report, this REPLACES the report, so a genuinely
+        corrected one can now legitimately PASS. The event is the same lean, PHI-free shape
+        report_finalized carries (see finalized_report_record); status distinguishes them.
+        """
+        self._report_addendum = event
 
     @workflow.signal
     def skill_completed(self, event: dict) -> None:
