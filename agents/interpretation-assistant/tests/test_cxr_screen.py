@@ -139,6 +139,40 @@ async def test_an_instance_without_pixels_stays_stubbed(monkeypatch):
     assert _cxr(out)["status"] == "STUBBED"
 
 
+async def test_skips_a_non_image_instance_and_scores_the_first_real_image(monkeypatch):
+    """A non-image object -- a Structured Report, a radiation-dose SR, a presentation state -- can
+    sort AHEAD of the frontal image by (SeriesNumber, InstanceNumber). The tool must SKIP it and
+    score the first real image, not abort the whole study on instances[0]. Regression for the bug
+    where one leading SR left a screenable study STUBBED with the frontal sitting right behind it."""
+    monkeypatch.setattr(handler, "PIXEL_TOOLING", True)
+
+    class _SRThenImage:
+        async def list_study_instances(self, study_id):
+            return ["inst-SR", "inst-frontal"]      # the SR sorts first
+
+        async def get_instance_dicom(self, instance_id):
+            return instance_id.encode()             # bytes just carry which instance this is
+
+    monkeypatch.setattr(handler, "OrthancClient", lambda: _SRThenImage())
+
+    def decode(b):
+        if b == b"inst-SR":
+            raise handler.NotAnImage("Structured Report, no PixelData")
+        return [[0, 1], [2, 3]]                     # the frontal decodes fine
+
+    monkeypatch.setattr(handler, "dicom_to_greyscale", decode)
+    monkeypatch.setattr(handler, "score", lambda arr: {"Effusion": 0.87, "Nodule": 0.12})
+    monkeypatch.setattr(
+        handler, "summarise",
+        lambda probs: ("Effusion p=0.87; screening signal only, not a read", 0.87),
+    )
+
+    out = await handle("interpretation.runTools", {"studyContext": CXR_CONTEXT})
+    f = _cxr(out)
+    assert f["status"] == "COMPLETE"                       # scored, not STUBBED
+    assert f["evidenceRef"] == "orthanc:instance/inst-frontal"  # the frontal, not the SR
+
+
 async def test_a_study_with_no_orthanc_id_stays_stubbed(pixels_on):
     ctx = {**CXR_CONTEXT, "study": {**CXR_CONTEXT["study"], "orthancStudyId": ""}}
     out = await handle("interpretation.runTools", {"studyContext": ctx})

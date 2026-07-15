@@ -170,18 +170,32 @@ async def _pixel_finding(tool_id: str, ctx: dict) -> Optional[dict]:
             log.warning("cxr-screen: study %s has no instances", orthanc_study_id)
             return None
 
-        # The FIRST instance, in (SeriesNumber, InstanceNumber) order -- the frontal view of a
-        # frontal+lateral study. list_study_instances guarantees that order; an arbitrary pick
-        # would score the lateral on some studies and the frontal on others.
-        instance_id = instances[0]
-        pixels = dicom_to_greyscale(await client.get_instance_dicom(instance_id))
+        # Score the FIRST SCOREABLE instance, in (SeriesNumber, InstanceNumber) order -- the frontal
+        # view of a frontal+lateral study (list_study_instances guarantees that order). A study can
+        # also carry non-image objects -- a Structured Report, a radiation-dose SR, a presentation
+        # state -- that sort AHEAD of the image; skip those and score the first real image rather than
+        # letting one of them fail the whole study. That is imaging.NotAnImage's contract: a caller
+        # SKIPS such an instance, it does not abort -- a tool that errors out because a study happens
+        # to contain an SR is a tool that never runs.
+        instance_id = None
+        pixels = None
+        for candidate in instances:
+            try:
+                pixels = dicom_to_greyscale(await client.get_instance_dicom(candidate))
+            except NotAnImage as exc:
+                log.warning("cxr-screen: %s skipping non-image instance %s (%s)",
+                            orthanc_study_id, candidate, exc)
+                continue
+            instance_id = candidate
+            break
+        if pixels is None:
+            # No scoreable pixels anywhere in the study -> STUBBED, never a fabricated negative.
+            log.warning("cxr-screen: study %s has no scoreable image instance", orthanc_study_id)
+            return None
 
         # Inference is CPU-bound and blocking; keep it off the event loop so one study being
         # screened does not stall every other A2A request this agent is serving.
         probs = await asyncio.to_thread(score, pixels)
-    except NotAnImage as exc:
-        log.warning("cxr-screen: %s carries no pixel data (%s)", orthanc_study_id, exc)
-        return None
     except Exception as exc:  # model/transport failure -> ERROR, not a fabricated negative
         log.exception("cxr-screen failed for %s", orthanc_study_id)
         return {
