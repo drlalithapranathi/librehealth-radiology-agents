@@ -39,25 +39,27 @@ for cf in sorted((CONTRACTS / "cards").glob("*.json")):
     except Exception as e:  # noqa: BLE001
         errors.append(f"[card invalid json] {cf.relative_to(ROOT)}: {e}")
 
-# 3. Fixtures validate against their schema (extend as fixtures are added).
+# 3. Fixtures validate against their schema. Add a family here when a new fixture
+#    filename prefix maps to a contract; individual fixtures are auto-discovered.
 _studycontext_schema = CONTRACTS / "studycontext.schema.json"
 _skills = CONTRACTS / "skills"
-fixture_checks = [
-    (ROOT / "mocks/fixtures/studycontext.sample.json", _studycontext_schema),
-    (ROOT / "mocks/fixtures/studycontext.ct_aortic_dissection.json", _studycontext_schema),
-    (ROOT / "mocks/fixtures/studycontext.cxr_pneumothorax.json", _studycontext_schema),
-    (ROOT / "mocks/fixtures/studycontext.mammo_routine.json", _studycontext_schema),
-    (ROOT / "mocks/fixtures/studycontext.mr_brain.json", _studycontext_schema),
+_fixtures = ROOT / "mocks" / "fixtures"
+fixture_families = {
+    "studycontext": _studycontext_schema,
     # CritCom comms-skill outputs (#52) validate against their per-skill schemas.
-    (ROOT / "mocks/fixtures/comms.dispatch.output.sample.json", _skills / "comms.dispatch.schema.json"),
-    (ROOT / "mocks/fixtures/comms.checkAck.output.sample.json", _skills / "comms.checkAck.schema.json"),
-]
-for fixture, schema in fixture_checks:
-    if not fixture.exists():
-        continue
+    "comms.dispatch.output": _skills / "comms.dispatch.schema.json",
+    "comms.checkAck.output": _skills / "comms.checkAck.schema.json",
+}
+fixture_count = 0
+for prefix, schema in fixture_families.items():
+    fixtures = sorted(_fixtures.glob(f"{prefix}.*.json"))
+    if not fixtures:
+        print(f"WARNING: no fixtures found for family '{prefix}'")
     v = Draft202012Validator(_load(schema))
-    for err in sorted(v.iter_errors(_load(fixture)), key=lambda e: e.path):
-        errors.append(f"[fixture invalid] {fixture.name}: {list(err.path)} {err.message}")
+    for fixture in fixtures:
+        fixture_count += 1
+        for err in sorted(v.iter_errors(_load(fixture)), key=lambda e: e.path):
+            errors.append(f"[fixture invalid] {fixture.name}: {list(err.path)} {err.message}")
 
 # 4. Escalation policy (#29): the YAML matrix validates against its schema -- structurally, and
 #    for the cross-field invariants JSON Schema can't express (ordering, single terminal repeat).
@@ -96,4 +98,7 @@ if errors:
     for e in errors:
         print("  -", e)
     sys.exit(1)
-print(f"OK: {len(schema_files)} schemas, cards, fixtures, and the escalation policy validated.")
+print(
+    f"OK: {len(schema_files)} schemas, cards, {fixture_count} fixtures, "
+    "and the escalation policy validated."
+)
