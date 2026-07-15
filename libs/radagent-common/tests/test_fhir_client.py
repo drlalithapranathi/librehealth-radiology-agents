@@ -8,8 +8,28 @@ entries. Each report is projected to a lean, PHI-free record.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+from pathlib import Path
+from unittest import mock
 
-from radagent_common.fhir_client import Fhir2Client, finalized_report_record
+import pytest
+import yaml
+
+from radagent_common.fhir_client import (
+    Fhir2Client,
+    finalized_report_record,
+    _write_transport_is_secure,
+    _guard_write_transport,
+    InsecureWriteTransportError,
+)
+
+# A loopback base URL the write-transport guard (#30) always permits. The pre-sign write LOGIC tests
+# below exercise idempotency and authorship, not transport, so they run over loopback rather than the
+# default plaintext-remote openmrs URL, which the hoisted guard now refuses without the opt-in. Using
+# loopback -- not FHIR2_ALLOW_INSECURE_WRITE -- keeps them independent of that env var, which the
+# transport tests mutate.
+_LOOPBACK_BASE = "http://localhost:8080/openmrs/ws/fhir2/R4"
 
 _FINAL = {
     "resourceType": "DiagnosticReport", "id": "rep-1", "status": "final",
@@ -273,7 +293,7 @@ def test_get_report_conclusion_empty_id_makes_no_call():
 # --- write_presign_impression (issue #26) ----------------------------------
 
 def test_write_presign_impression_creates_when_no_existing_draft():
-    client = Fhir2Client()
+    client = Fhir2Client(base_url=_LOOPBACK_BASE)
     get_calls = []
     post_calls = []
 
@@ -306,7 +326,7 @@ def test_write_presign_impression_creates_when_no_existing_draft():
 
 
 def test_write_presign_impression_updates_the_existing_draft():
-    client = Fhir2Client()
+    client = Fhir2Client(base_url=_LOOPBACK_BASE)
     put_calls = []
 
     async def fake_get(path, params=None):
@@ -697,7 +717,7 @@ def _draft(report_id, *, concept, status="preliminary", order="ServiceRequest/sr
 def test_presign_write_never_overwrites_a_radiologists_own_draft():
     """THE one that matters (#26). `preliminary` is also the status a RIS gives a radiologist's own
     unsigned draft. Matching on status alone would PUT the AI's text over the human's report."""
-    client = Fhir2Client()
+    client = Fhir2Client(base_url=_LOOPBACK_BASE)
     calls = []
 
     async def fake_get(path, params=None):
@@ -725,7 +745,7 @@ def test_presign_write_never_overwrites_a_radiologists_own_draft():
 
 def test_presign_write_updates_its_own_earlier_draft():
     """Idempotency still holds for OUR draft: same order, same concept -> update, don't duplicate."""
-    client = Fhir2Client()
+    client = Fhir2Client(base_url=_LOOPBACK_BASE)
     calls = []
 
     async def fake_get(path, params=None):
@@ -750,7 +770,7 @@ def test_presign_write_updates_its_own_earlier_draft():
 
 def test_presign_draft_lookup_ignores_our_draft_on_a_DIFFERENT_order():
     """Our own concept, but a different order -> not this study's draft. Don't touch it."""
-    client = Fhir2Client()
+    client = Fhir2Client(base_url=_LOOPBACK_BASE)
 
     async def fake_get(path, params=None):
         return _bundle(_draft("other-order", concept=_OUR_CONCEPT, order="ServiceRequest/sr-999"))
@@ -768,7 +788,7 @@ def test_presign_draft_lookup_ignores_our_draft_on_a_DIFFERENT_order():
 
 def test_presign_draft_lookup_ignores_a_FINAL_report():
     """A signed report is never our draft, whatever it is coded with."""
-    client = Fhir2Client()
+    client = Fhir2Client(base_url=_LOOPBACK_BASE)
 
     async def fake_get(path, params=None):
         return _bundle(_draft("signed", concept=_OUR_CONCEPT, status="final"))
@@ -782,6 +802,156 @@ def test_presign_draft_lookup_ignores_a_FINAL_report():
     client._get, client._post, client._put = fake_get, fake_post, fake_put  # type: ignore[assignment]
     assert asyncio.run(client.write_presign_impression(
         "ServiceRequest/sr-1", "Patient/p1", "text")) == "our-new-draft"
+
+
+# --- #30 security review: write-transport secrecy -------------------------------------------------
+#
+# A DiagnosticReport write carries PHI (the impression) and rides HTTP Basic credentials. Over
+# plaintext http to a remote host both are exposed. The guard is hoisted to the top of
+# write_presign_impression (so it refuses before the idempotency GET), and kept in _post/_put as a
+# backstop -- the transport-mocking tests above are unaffected because they run over loopback.
+
+def test_write_transport_secure_allows_https_and_loopback_and_optin():
+    # https and loopback must be allowed on their OWN merits, so clear the opt-in first. With an
+    # ambient FHIR2_ALLOW_INSECURE_WRITE=1 exported, a broken https/loopback bypass would still
+    # return True via the opt-in fallback -- the var would MASK the regression. That matters more
+    # now that this MR makes the var a normal thing to have set.
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        assert _write_transport_is_secure("https://openmrs.example.org/openmrs/ws/fhir2/R4")
+        assert _write_transport_is_secure("http://localhost:8080/openmrs/ws/fhir2/R4")
+        assert _write_transport_is_secure("http://127.0.0.1:8080/fhir2/R4")
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_WRITE": "1"}):
+        assert _write_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+
+
+def test_write_transport_insecure_rejects_plaintext_to_a_remote_host():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        assert not _write_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+        assert not _write_transport_is_secure("http://fhir.hospital.example:8080/fhir2/R4")
+
+
+def test_insecure_optin_write_leaves_an_audit_line(caplog):
+    # When the opt-in lets a plaintext-remote write through, that accepted risk must be recorded:
+    # PHI + credentials are on the wire in cleartext. The audit names the host, never the impression.
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_WRITE": "1"}):
+        with caplog.at_level(logging.WARNING, logger="radagent_common.fhir_client"):
+            _guard_write_transport("http://openmrs:8080/openmrs/ws/fhir2/R4")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("PLAINTEXT" in m and "openmrs" in m for m in warnings), warnings
+
+
+def test_secure_transport_writes_are_not_audited(caplog):
+    # No warning noise on the paths that are actually safe -- https or loopback. Cleared env for the
+    # same masking reason as the allow-test: an ambient opt-in must not change these outcomes.
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with caplog.at_level(logging.WARNING, logger="radagent_common.fhir_client"):
+            _guard_write_transport("https://openmrs.example.org/openmrs/ws/fhir2/R4")
+            _guard_write_transport("http://localhost:8080/openmrs/ws/fhir2/R4")
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_insecure_write_error_is_a_named_runtime_error_subclass():
+    # The guard raises a NAMED subclass so the orchestrator can mark it non-retryable by type
+    # (temporalio keys ApplicationError.type off __class__.__name__), while still being caught by
+    # any existing `except RuntimeError`. Both properties are load-bearing; pin them.
+    assert issubclass(InsecureWriteTransportError, RuntimeError)
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with pytest.raises(InsecureWriteTransportError) as ei:
+            _guard_write_transport("http://openmrs:8080/openmrs/ws/fhir2/R4")
+    assert ei.value.__class__.__name__ == "InsecureWriteTransportError"
+
+
+def test_post_backstop_refuses_an_insecure_transport():
+    # The guard is hoisted into write_presign_impression, but it stays in _post as a backstop for any
+    # other write path. Pin it directly, so deleting it from _post fails HERE (not silently green).
+    client = Fhir2Client(base_url="http://openmrs:8080/openmrs/ws/fhir2/R4")
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with pytest.raises(InsecureWriteTransportError, match="plaintext HTTP"):
+            asyncio.run(client._post("DiagnosticReport", {"resourceType": "DiagnosticReport"}))
+
+
+def test_put_backstop_refuses_an_insecure_transport():
+    # Same for _put, the idempotent re-run path. Without this, deleting the guard from _put (leaving
+    # it in _post) keeps the suite green -- only the create path would be covered.
+    client = Fhir2Client(base_url="http://openmrs:8080/openmrs/ws/fhir2/R4")
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with pytest.raises(InsecureWriteTransportError, match="plaintext HTTP"):
+            asyncio.run(client._put("DiagnosticReport/x", {"resourceType": "DiagnosticReport"}))
+
+
+def test_write_refuses_a_plaintext_remote_transport_before_the_idempotency_read():
+    """The guard is hoisted to the top of write_presign_impression (backstopped in _post/_put), so a
+    write to a plaintext remote host raises before ANY request leaves the process -- the credentialed
+    idempotency lookup (_find_presign_draft -> _get, carrying the Authorization header) included.
+    Propagates as a failed activity -> bounded retry -> skip, so it never strands the read, but it
+    never leaks either."""
+    client = Fhir2Client(base_url="http://openmrs:8080/openmrs/ws/fhir2/R4")
+    got = []
+
+    async def spy_get(path, params=None):
+        got.append(path)  # if this ever runs, a credentialed GET already went out
+        return _bundle()
+
+    client._get = spy_get  # type: ignore[assignment]
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with pytest.raises(InsecureWriteTransportError, match="plaintext HTTP"):
+            asyncio.run(client.write_presign_impression(
+                "ServiceRequest/sr-1", "Patient/p1", "Findings consistent with pneumothorax."))
+    assert got == [], "the idempotency lookup issued a credentialed GET before the guard refused"
+
+
+def test_compose_orchestrator_write_is_permitted_by_the_transport_guard():
+    """Drift guard (#30), same spirit as the #55 UUID-drift test. The HIGH review item was a
+    config/code mismatch no test caught: deleting FHIR2_ALLOW_INSECURE_WRITE from compose (while
+    FHIR2_BASE_URL stays plaintext-remote) silently makes every pre-sign write refuse, the draft
+    never appears, and CI stays green. Pin the coupling: under the compose orchestrator env exactly
+    as shipped, the guard must PERMIT the write. Delete the env line and this fails."""
+    compose = yaml.safe_load((Path(__file__).resolve().parents[3] / "docker-compose.yml").read_text())
+    env = compose["services"]["orchestrator"]["environment"]
+    base = env["FHIR2_BASE_URL"]
+    allow = str(env.get("FHIR2_ALLOW_INSECURE_WRITE", "")).strip()
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        if allow:
+            os.environ["FHIR2_ALLOW_INSECURE_WRITE"] = allow
+        assert _write_transport_is_secure(base), (
+            "the compose orchestrator would have its pre-sign fhir2 write refused by the transport "
+            "guard: FHIR2_BASE_URL is plaintext-remote but FHIR2_ALLOW_INSECURE_WRITE is not set "
+            "truthy on that service")
+
+
+def test_authorship_guard_collides_when_the_concept_is_shared():
+    """WHY the deployed concept MUST be dedicated (#30 -> #55).
+
+    The authorship discriminator is the `code` concept: _find_presign_draft treats a preliminary
+    report on this order as OURS iff it carries our concept. If a deployment points at a SHARED
+    concept -- e.g. the CIEL "Provisional diagnosis" a RIS may reuse for its own preliminary reports
+    -- a radiologist's own provisional draft coded with that concept matches as ours, and
+    write_presign_impression would PUT the AI text over it. #55 is precisely the fix: it moved
+    `main`'s default OFF that shared CIEL concept onto a dedicated "AI pre-sign impression draft"
+    concept nobody else emits. This test pins the collision that default now prevents, by forcing the
+    shared concept back on via FHIR2_PRESIGN_REPORT_CONCEPT. Inert regardless today (the write is
+    gated on a COMPLETE finding, and no stub tool emits one).
+    """
+    client = Fhir2Client()
+    shared_concept = "160249AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # the CIEL stand-in a RIS may also use
+
+    async def fake_get(path, params=None):
+        return _bundle(_draft("radiologist-own-draft", concept=shared_concept))
+
+    client._get = fake_get  # type: ignore[assignment]
+    with mock.patch.dict(os.environ, {"FHIR2_PRESIGN_REPORT_CONCEPT": shared_concept}):
+        hit = asyncio.run(client._find_presign_draft("ServiceRequest/sr-1", "Patient/p1"))
+    # The collision: a human's draft is matched as ours. Main's dedicated default (#55) is what
+    # prevents this -- with a distinct concept the same lookup returns None (see the tests above).
+    assert hit == "radiologist-own-draft"
 
 
 # --- typed clinical reads for the Communications Agent (#52) -------------------------

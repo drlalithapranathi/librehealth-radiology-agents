@@ -247,6 +247,13 @@ services:
       <<: *otel-env
       TEMPORAL_TARGET: temporal:7233
       FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
+      # FHIR2_BASE_URL above is plaintext http to a non-loopback host, which the write-transport
+      # guard (#30) refuses by default. This demo stack talks to openmrs over the internal compose
+      # bridge, so it consciously opts in: without this, the moment a real COMPLETE finding lands
+      # (the #27 CAD tools) every pre-sign write raises -> bounded retries -> skip, and the draft
+      # silently never appears. A real deployment sets an https FHIR2_BASE_URL instead and drops
+      # this. Cleartext PHI + Basic credentials on this hop is the accepted dev-stack posture only.
+      FHIR2_ALLOW_INSECURE_WRITE: "1"
       # Live fhir2 401s unauthenticated reads and the callers swallow fhir2 errors by design,
       # so missing credentials fail SILENTLY (#53). Dev-stack values = the o3 admin account.
       FHIR2_BASIC_USER: admin
