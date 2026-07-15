@@ -20,6 +20,7 @@ from temporalio.service import RPCError, RPCStatusCode
 from radagent_common import validate_against, paths
 from radagent_common.client import parse_push_callback
 from radagent_common.fhir_client import Fhir2Client
+from radagent_common.openmrs_rest import OpenmrsRestClient
 from radagent_common.orthanc_client import OrthancClient
 from radagent_common.validation import validate_skill_output
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id, init_tracing, tracing_enabled
@@ -76,16 +77,19 @@ def _store() -> IngressStore:
     return _STORE
 
 
-# Read-only fhir2 client for accession -> patient/order resolution (#11). Lazily constructed so
-# importing this module has no side effect; tests override `_FHIR` with a fake.
-_FHIR: Fhir2Client | None = None
+# Read-only OpenMRS REST client for accession -> RadiologyOrder resolution (#11, #70). fhir2 cannot
+# serve this: `ServiceRequest?identifier=<accession>` returns HTTP 400 on the deployed fhir2 4.1.0
+# and the ServiceRequest exposes no accession identifier, so the accession is resolved through the
+# radiology module's own REST search handler instead (see radagent_common.openmrs_rest). Lazily
+# constructed so importing this module has no side effect; tests override `_OPENMRS_REST` with a fake.
+_OPENMRS_REST: OpenmrsRestClient | None = None
 
 
-def _fhir() -> Fhir2Client:
-    global _FHIR
-    if _FHIR is None:
-        _FHIR = Fhir2Client()
-    return _FHIR
+def _openmrs_rest() -> OpenmrsRestClient:
+    global _OPENMRS_REST
+    if _OPENMRS_REST is None:
+        _OPENMRS_REST = OpenmrsRestClient()
+    return _OPENMRS_REST
 
 
 # Read-only Orthanc client for the study's DICOM description (#62). Same lazy shape as _FHIR.
@@ -163,18 +167,22 @@ _ORDER_SIGNALS = ("priority", "reasonCode")
 
 async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
     """(patient, order) blocks for the StudyContext. Resolve the real refs -- and the order's
-    urgency signals, which triage scores on (#61) -- from fhir2 by accession; on a miss or ANY fhir2
-    failure, return the UNRESOLVED placeholder -- never fail ingestion (#11).
+    urgency signal, which triage scores on (#61) -- from the accession; on a miss or ANY failure,
+    return the UNRESOLVED placeholder -- never fail ingestion (#11).
 
-    An order that carries no priority and no reason code resolves to the join ref alone; triage
-    treats an absent priority as neutral, which is honest. What is NOT honest is dropping the ones
-    that were there.
+    Resolution goes through the radiology module's REST search handler, not fhir2 (#70): fhir2 has no
+    searchable accession (`ServiceRequest?identifier=` 400s on 4.1.0), and the ServiceRequest id the
+    resolver returns is the SAME order uuid the signed report's `basedOn` carries, so the sign-off
+    join closes on one ServiceRequest/<order uuid>.
+
+    An order that carries no priority resolves to the join ref alone; triage treats an absent
+    priority as neutral, which is honest. What is NOT honest is dropping one that was there.
     """
     if accession:
         try:
-            resolved = await _fhir().resolve_order_by_accession(accession)
-        except Exception:  # noqa: BLE001 - fhir2 down/unreachable must not fail the webhook
-            _log.warning("fhir2 resolution failed for accession %s; starting Patient/UNRESOLVED", accession)
+            resolved = await _openmrs_rest().resolve_radiology_order_by_accession(accession)
+        except Exception:  # noqa: BLE001 - OpenMRS down/unreachable must not fail the webhook
+            _log.warning("order resolution failed for accession %s; starting Patient/UNRESOLVED", accession)
             resolved = None
         if resolved:
             order = {"fhirServiceRequestId": resolved["fhirServiceRequestId"]}

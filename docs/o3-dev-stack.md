@@ -55,3 +55,21 @@ the server stuck at `/initialsetup`. If a stack gets wedged that way, run
 Making the module reference-data load idempotent so a restart does not collide
 would remove this constraint. That is an o3-image change (sibling `lh-radiology`
 repo) and is tracked separately.
+
+## Fast restore from a seed (skip the ~16 min first boot)
+
+The wedge above is why you cannot just keep the volume. The supported shortcut is a
+**seed snapshot**: capture the finished DB once, then reload it into a fresh volume
+with Liquibase migration off, so a boot is the module-load pass only.
+
+```
+scripts/dump_openmrs_seed.sh          # once, from a healthy clean boot -> docker/openmrs/seed/*.sql.gz
+docker compose down -v
+docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d
+```
+
+Verified: a seeded boot reaches a usable server (200) in ~6 min vs ~16 min clean, and does
+NOT hit the initializer wedge (the seed carries the initializer/OCL tracking rows, so their
+loaders find everything already present). The seed blob is data, not code, and is gitignored
+(it will carry MIMIC/PHI once the #68 cohort is loaded). See `docker-compose.seed.yml`. The
+durable fix is still the idempotent reference-data load noted above (#72).

@@ -47,15 +47,15 @@ async def mock_escalate(workflow_id: str, reason: str) -> None:
     return None
 
 
-class _FakeFhir:
-    """Stand-in for Fhir2Client in ingress tests (no live fhir2). `result` is returned by
-    resolve_order_by_accession; `error`, if set, is raised (simulates fhir2 down)."""
+class _FakeResolver:
+    """Stand-in for the OpenMRS-REST order resolver in ingress tests (no live server). `result` is
+    returned by resolve_radiology_order_by_accession; `error`, if set, is raised (simulates OpenMRS down)."""
     def __init__(self, result=None, error=None):
         self.result = result
         self.error = error
         self.calls: list[str] = []
 
-    async def resolve_order_by_accession(self, accession: str):
+    async def resolve_radiology_order_by_accession(self, accession: str):
         self.calls.append(accession)
         if self.error is not None:
             raise self.error
@@ -99,7 +99,7 @@ def _reset_ingress_globals():
             pass
         ingress._STORE = None
     ingress._client = None  # don't leak the test env's client into another test
-    ingress._FHIR = None    # ditto the injected fhir2 client
+    ingress._OPENMRS_REST = None    # ditto the injected fhir2 client
     ingress._ORTHANC = None  # ditto the injected Orthanc client (#62)
 
 
@@ -121,7 +121,7 @@ def test_duplicate_stable_event_is_idempotent(tmp_path):
                               activities=[mock_call_agent, mock_publish, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client  # so _temporal() returns the test client, no real connect
-                ingress._FHIR = _FakeFhir(result=None)  # unresolved: keep this test purely about idempotency
+                ingress._OPENMRS_REST = _FakeResolver(result=None)  # unresolved: keep this test purely about idempotency
                 ingress._ORTHANC = _FakeOrthanc()
 
                 # First event: starts the workflow normally.
@@ -150,7 +150,7 @@ def test_duplicate_after_completion_starts_fresh(tmp_path):
                               activities=[mock_call_agent, mock_publish, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client
-                ingress._FHIR = _FakeFhir(result=None)
+                ingress._OPENMRS_REST = _FakeResolver(result=None)
                 ingress._ORTHANC = _FakeOrthanc()
 
                 first = await ingress.orthanc_webhook(dict(EVENT))

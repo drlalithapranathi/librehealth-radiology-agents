@@ -1,0 +1,32 @@
+# Fast-restore override: seed the OpenMRS DB from a snapshot instead of paying the ~16 min clean
+# first boot every time the stack is torn down (issue #72 demo-host ops; see docs/o3-dev-stack.md).
+#
+# WHY this is needed: a clean OpenMRS first boot runs Liquibase (~1800 changesets), imports the
+# concept dictionary, and generates demo data -- ~16 min. None of that changes between boots, so we
+# capture the finished DB once and reload it. The expensive state lives entirely in mariadb-data.
+#
+# WHY not just keep the volume: recreating the openmrs container against an ALREADY-populated volume
+# on a normal (migrations-on) boot wedges at /initialsetup (initializer/OCL re-load collisions -- see
+# docs/o3-dev-stack.md). This override instead restores into a FRESH volume and boots with Liquibase
+# migration OFF, so OpenMRS connects to a ready DB and only runs the module-load pass.
+#
+# USAGE
+#   1. Capture a seed once, from a healthy clean boot:
+#        scripts/dump_openmrs_seed.sh
+#   2. Restore (the seed loads ONLY into an empty mariadb-data volume, so start from -v):
+#        docker compose down -v
+#        docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d
+#
+# The seed blob is data, not code, and is gitignored (it will carry MIMIC/PHI later, per the DUA).
+services:
+  mariadb:
+    # mariadb runs /docker-entrypoint-initdb.d/*.sql.gz ONLY on first init (empty datadir), against
+    # the MARIADB_DATABASE (openmrs). A stale volume silently skips it -- hence `down -v` above.
+    volumes:
+      - ./docker/openmrs/seed/openmrs-seed.sql.gz:/docker-entrypoint-initdb.d/openmrs-seed.sql.gz:ro
+
+  openmrs:
+    environment:
+      # The schema + reference data are already in the seed; do NOT re-run them.
+      OMRS_CREATE_TABLES: "false"
+      OMRS_AUTO_UPDATE_DATABASE: "false"
