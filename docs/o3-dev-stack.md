@@ -73,3 +73,34 @@ NOT hit the initializer wedge (the seed carries the initializer/OCL tracking row
 loaders find everything already present). The seed blob is data, not code, and is gitignored
 (it will carry MIMIC/PHI once the #68 cohort is loaded). See `docker-compose.seed.yml`. The
 durable fix is still the idempotent reference-data load noted above (#72).
+
+## Demo host ops (#72)
+
+For the hosted showcase the stack must survive restarts without losing clinical
+state, so the compose file was hardened (#72):
+
+- **Durable state lives on named volumes — do NOT `down -v` casually on the demo
+  host.** `-v` deletes volumes, which now include:
+  - `ingress-store-data` — the orchestrator's report→workflow join index, poll
+    cursor, and dead letters (`INGRESS_STORE_PATH`). Losing it mid-read-gate means
+    a radiologist signs, the poller matches nothing, and the study waits forever.
+  - `comms-ledger-data` — the comms ledger's file-based H2, the
+    clinical-communication audit trail.
+  - `mariadb-data`, `orthanc-db`, `temporal-pg-data`, `worklist-api-db` as before.
+  A plain `docker compose down` (no `-v`) stops containers but keeps all of these,
+  so `up` resumes where it left off.
+
+- **The OpenMRS/mariadb wedge still applies** (see the section above): never
+  recreate `openmrs` against a reused `mariadb-data` volume. When you deliberately
+  want a clean slate, `down -v` and boot clean — accepting that it also clears the
+  ingress store and comms ledger.
+
+- **Restart policy.** The long-lived services (`openmrs`, `orthanc`, `ohif`,
+  `orchestrator`, `comms-ledger`, `worklist-api`) run `restart: unless-stopped`, so
+  the demo host recovers them across a crash or a host reboot without intervention.
+  `presign-concept-bootstrap` is `restart: "no"` on purpose — it is a one-shot that
+  runs to completion each `up` and is idempotent.
+
+- **Images are pinned to digests** (`name:tag@sha256:...`) so the demo host cannot
+  drift under a re-pushed tag. Bump a digest deliberately when adopting a new build;
+  `jaeger` (opt-in `otel` profile) keeps an explicit version tag.
