@@ -1,21 +1,65 @@
 """Interpretation Assistant handler — owner: Chaitra.
 
-v1 = tool REGISTRY that selects by modality/study-type and returns STUBBED results.
-M3: wire real CAD/detection tools behind the same registry interface. Real slices so far (#27):
-pneumothorax-detect and pe-detect each cross-check the referral reason rather than image pixels --
-there is no pixel-read path (or imaging deps) yet, so this is a genuine but narrow interim signal,
-not a CAD model. Both run through the same table-driven _reason_finding rule rather than one
-hand-copied function per tool (per lead review). Every other tool stays STUBBED until it gets its
-own real implementation.
+The tool REGISTRY selects by modality/study-type; each selected tool then reports at one of three
+levels of reality, and the level is visible in the output rather than implied:
+
+  * PIXELS (#71, slice of #27) -- `pneumothorax-detect` runs a real pretrained classifier over the
+    study's image data (cxr_model.py) and reads its Pneumothorax head. This is the first tool in
+    the system that actually looks at the image. A POSITIVE screen reports COMPLETE, with a real
+    confidence and an evidenceRef naming the instance it scored; a NEGATIVE screen reports STUBBED
+    (the model ran, but "draft only on positives" -- see _pixel_finding). When it cannot look at
+    pixels (extras absent / no Orthanc study / non-image instances) it DEGRADES to the referral
+    reason below rather than fabricating a result.
+  * REFERRAL REASON (#27) -- the order.reasonCode cross-check. `pe-detect` uses only this; it is
+    also the degrade path for `pneumothorax-detect` when the pixel read cannot run. A genuine but
+    narrow interim signal, not a CAD model, so it stays STUBBED.
+  * STUBBED -- everything else, until it gets its own real implementation.
+
+A tool that cannot run degrades to STUBBED (or ERROR) and NEVER invents a negative: "nothing found"
+from a tool that never looked is the automation-bias trap the #26 COMPLETE-gate exists to prevent.
+
 Input  : { studyContext }
 Output : contracts/skills/interpretation.schema.json
 """
 from __future__ import annotations
+
+import asyncio
+import logging
 from typing import Optional
+
 from radagent_common.tracing import now_iso
 from registry import select_tools
 
-AGENT_VERSION = "0.3.0"
+log = logging.getLogger(__name__)
+
+AGENT_VERSION = "0.4.0"
+
+# Is this image built with the pixel/model extras? Decided ONCE, at import, by whether the imports
+# succeed -- not discovered over the network mid-study. cxr_model imports torch eagerly for exactly
+# this reason. The agent-tests CI lane installs neither extra, so PIXEL_TOOLING is False there and
+# pneumothorax-detect falls back to its referral-reason rule -- which is why the pre-#71 suite still
+# passes untouched.
+#
+# These are module-level names rather than function-local imports so a test can substitute a fake
+# Orthanc and a fake model and exercise the pixel path WITHOUT torch. A seam that only exists in
+# the presence of a 1.5GB dependency is a seam nobody tests.
+try:
+    from radagent_common.imaging import NotAnImage, dicom_to_greyscale
+    from radagent_common.orthanc_client import OrthancClient
+
+    from cxr_model import POSITIVE_THRESHOLD, TARGET_PATHOLOGY, score
+
+    PIXEL_TOOLING = True
+except ImportError as _exc:  # pragma: no cover - only reachable in a lane without the extras installed
+    log.info("interpretation: pixel/model extras absent (%s); pixel tools stay STUBBED", _exc)
+    PIXEL_TOOLING = False
+
+    class NotAnImage(Exception):  # type: ignore[no-redef]
+        """Placeholder so the except-clause below is always a valid type."""
+
+    OrthancClient = dicom_to_greyscale = score = None  # type: ignore[assignment]
+    POSITIVE_THRESHOLD = 0.5
+    TARGET_PATHOLOGY = "Pneumothorax"
 
 # Referral-reason ICD-10 codes per real-slice tool, matched by FAMILY PREFIX rather than exact
 # code. worklist-triage normalises the same order.reasonCode field to a 3-char ICD-10 category
@@ -52,23 +96,45 @@ def _reason_finding(tool_id: str, reason_codes: list[str]) -> Optional[dict]:
         return None
     return {
         "toolId": tool_id,
-        "label": f"Referral reason coded {hit} ({condition}); imaging-based detection pending M3 pixel analysis",
+        "label": f"Referral reason coded {hit} ({condition}); no imaging-based result for this study",
         "confidence": None,
-        # Text pointer to where the evidence lives, not an image-region ref: no pixel read exists
-        # yet, and writing a DICOM SC/overlay into Orthanc needs a safety review we haven't done
-        # (#27). evidenceRef is `["string", "null"]` in the contract, so a plain-text locator is
-        # a legitimate value here, not a placeholder for the M3 image-based ref.
+        # Text pointer to where the evidence lives, not an image-region ref: no pixel read ran for
+        # this study (extras absent or no image), and writing a DICOM SC/overlay into Orthanc needs a
+        # safety review we haven't done (#59). evidenceRef is `["string", "null"]` in the contract,
+        # so a plain-text locator is a legitimate value here, not a placeholder for the image ref.
         "evidenceRef": f"order.reasonCode={hit}",
         # `status` stays STUBBED even though label/evidenceRef are populated: COMPLETE is reserved
         # for real pixel-level results, because it gates the pre-sign fhir2 write
         # (orchestrator/workflow.py:_has_complete_finding -> _presign_impression, before
         # AWAITING_RADIOLOGIST). A referral reason the ordering clinician typed is not imaging
-        # evidence for the condition any more than a non-matching code is evidence against it (see
-        # the comment above on absence-of-match) -- so it must not trip a pre-read critical-finding
-        # chart write. Do not flip this to COMPLETE without also addressing the fhir2 write-back
-        # security/PHI review (#30).
+        # evidence for the condition any more than a non-matching code is evidence against it -- so
+        # it must not trip a pre-read critical-finding chart write. Do not flip this to COMPLETE
+        # without also addressing the fhir2 write-back security/PHI review (#30).
         "status": "STUBBED",
     }
+
+
+_MODEL_VERSION = "cxr-densenet121-res224-all"
+
+
+def _tool_version(finding: dict) -> str:
+    """What actually produced this finding. Visible in toolsSelected[].version so a consumer -- and
+    anyone auditing why a chart says what it says -- can tell a real model from a referral-code rule
+    from a stub. Three different things must not all report as "stub-0".
+
+    The model version is claimed ONLY when the model actually SCORED an instance -- which is exactly
+    when `evidenceRef` points at one: a COMPLETE positive, a STUBBED negative ("the model ran and
+    found nothing"), or an ERROR that reached the model (which carries the instance it reached). A
+    transport-stage failure (Orthanc down) degrades to the referral rule / stub in `_pixel_finding`
+    and never lands here claiming the model. Claiming a model that never ran is the same lie as
+    inventing a finding, so the check is on the instance ref, not on the status.
+    """
+    ev = finding.get("evidenceRef") or ""
+    if finding["toolId"] in _PIXEL_TOOLS and ev.startswith("orthanc:instance/"):
+        return _MODEL_VERSION
+    if ev:
+        return "referral-rule-1"
+    return "stub-0"
 
 
 def _overall_status(statuses: list[str]) -> str:
@@ -82,6 +148,137 @@ def _overall_status(statuses: list[str]) -> str:
     return "PARTIAL"
 
 
+# Tools that read PIXELS. Everything else in the registry either cross-checks the referral reason
+# (above) or is still a stub. pneumothorax-detect is the first real model in the system (#71).
+_PIXEL_TOOLS = frozenset({"pneumothorax-detect"})
+
+
+def _pneumothorax_finding(tool_id: str, probs: dict, instance_id: str) -> dict:
+    """Turn the model's Pneumothorax probability into the contract's finding.
+
+    THE "DRAFT ONLY ON POSITIVES" DECISION (#71's open question, resolved here and documented in
+    CLAUDE.md). #71 asks whether a negative screen should emit COMPLETE (a draft on every study) or
+    stay inert (a draft only on positives). It must be "only on positives", because the pre-sign
+    write downstream is UNCONDITIONAL on any COMPLETE finding: orchestrator/workflow.py
+    `_presign_impression` calls impression.generate and writes its `impressionText` to the chart
+    regardless of whether anything was flagged. A COMPLETE *negative* would therefore write "No acute
+    findings identified" -- a fixed negative impression authored by nobody -- into every normal
+    patient's chart ahead of the read, which is exactly the automation-bias trap the #26 COMPLETE
+    gate exists to prevent. So:
+
+      * POSITIVE (p >= threshold) -> COMPLETE. Arms the pre-sign draft and the Cat1 critical-comm
+        path, correctly: there is a finding to offer. The label names the pathology, which is what
+        impression-generation's keyword scan folds into criticalFlags.
+      * NEGATIVE (p < threshold) -> STUBBED. The model ran (evidenceRef records which instance, and
+        _tool_version still reports the model id), but it emits no COMPLETE, so the normal stays
+        inert: no pre-sign chart write, no false Cat1 page. The label is negation-worded and is not
+        scanned today anyway (impression-generation only folds COMPLETE labels), so it cannot trip a
+        critical flag -- and stays correct once the scan becomes negation-aware (#78).
+    """
+    p = probs[TARGET_PATHOLOGY]  # KeyError if the model lacks the head -> caller turns it into ERROR
+    if p >= POSITIVE_THRESHOLD:
+        return {
+            "toolId": tool_id,
+            "label": f"Pneumothorax (screening p={p:.2f}); screening signal only, not a read",
+            "confidence": p,
+            # Text locator: the instance the model actually scored, so a reader can pull up the exact
+            # frame. Not a DICOM SC/overlay ref -- writing AI-made images into the record is deferred
+            # (#59) and needs its own safety review.
+            "evidenceRef": f"orthanc:instance/{instance_id}",
+            "status": "COMPLETE",
+        }
+    return {
+        "toolId": tool_id,
+        "label": (
+            f"Pneumothorax screening negative (p={p:.2f} < {POSITIVE_THRESHOLD:g}); "
+            "model ran, no finding at threshold -- screening signal only, not a read"
+        ),
+        "confidence": None,
+        "evidenceRef": f"orthanc:instance/{instance_id}",
+        "status": "STUBBED",
+    }
+
+
+async def _pixel_finding(tool_id: str, ctx: dict) -> Optional[dict]:
+    """Run the real model over the study's pixels, or return None to fall through to the referral
+    rule / stub.
+
+    DEGRADES, NEVER CRASHES, and separates "could not LOOK" from "the model BROKE":
+      * extras not installed / no Orthanc study id / no instances / no scoreable pixels / an Orthanc
+        or decode failure -> the study could not be screened -> return None (fall through to the
+        referral rule, then a bare stub). An Orthanc outage costs the study its screen; it must not
+        turn the tool red, and it must never be reported as the model "running";
+      * the MODEL throws once it has real pixels (a uniform frame, a model missing the target head,
+        an inference error) -> ERROR, honestly, carrying the instance it reached.
+
+    What it must never do is invent a negative. A tool that cannot look at the image and reports
+    "nothing found" is the automation-bias trap the #26 COMPLETE-gate exists to prevent, and it is
+    worse here than in the stub, because this one carries a model's authority.
+    """
+    if tool_id not in _PIXEL_TOOLS or not PIXEL_TOOLING:
+        return None
+
+    orthanc_study_id = (ctx.get("study") or {}).get("orthancStudyId")
+    if not orthanc_study_id:
+        return None
+
+    # --- fetch stage: a failure here means we could not LOOK, so DEGRADE (fall through). Never an
+    # ERROR (an Orthanc outage is not a model failure) and never the model version in the audit.
+    try:
+        client = OrthancClient()
+        instances = await client.list_study_instances(orthanc_study_id)
+    except Exception:  # noqa: BLE001 - Orthanc unreachable -> degrade, not error
+        log.warning("pneumothorax-detect: could not list instances for %s; degrading", orthanc_study_id)
+        return None
+    if not instances:
+        log.warning("pneumothorax-detect: study %s has no instances", orthanc_study_id)
+        return None
+
+    # Score the FIRST SCOREABLE instance, in (SeriesNumber, InstanceNumber) order -- the frontal
+    # view of a frontal+lateral study (list_study_instances guarantees that order). A study can
+    # also carry non-image objects -- a Structured Report, a radiation-dose SR, a presentation
+    # state -- that sort AHEAD of the image; skip those and score the first real image rather than
+    # letting one of them fail the whole study. That is imaging.NotAnImage's contract: a caller
+    # SKIPS such an instance, it does not abort -- a tool that errors out because a study happens
+    # to contain an SR is a tool that never runs.
+    instance_id = None
+    pixels = None
+    for candidate in instances:
+        try:
+            pixels = dicom_to_greyscale(await client.get_instance_dicom(candidate))
+        except NotAnImage as exc:
+            log.warning("pneumothorax-detect: %s skipping non-image instance %s (%s)",
+                        orthanc_study_id, candidate, exc)
+            continue
+        except Exception:  # noqa: BLE001 - fetch/decode failure -> could not look -> degrade
+            log.warning("pneumothorax-detect: %s could not fetch/decode instance %s; degrading",
+                        orthanc_study_id, candidate)
+            return None
+        instance_id = candidate
+        break
+    if pixels is None:
+        # No scoreable pixels anywhere in the study -> fall through, never a fabricated negative.
+        log.warning("pneumothorax-detect: study %s has no scoreable image instance", orthanc_study_id)
+        return None
+
+    # --- model stage: the model now runs on a REAL instance, so a failure here is an honest ERROR
+    # attributed to the model (evidenceRef records which instance it reached), not a degrade.
+    # Inference is CPU-bound and blocking; keep it off the event loop so one study being screened
+    # does not stall every other A2A request this agent is serving.
+    try:
+        probs = await asyncio.to_thread(score, pixels)
+        return _pneumothorax_finding(tool_id, probs, instance_id)
+    except Exception as exc:  # noqa: BLE001 - model/head-missing failure -> ERROR, not a negative
+        log.exception("pneumothorax-detect model failed for %s", orthanc_study_id)
+        return {
+            "toolId": tool_id,
+            "label": f"screening model failed: {type(exc).__name__}",
+            "confidence": None,
+            "evidenceRef": f"orthanc:instance/{instance_id}",  # the model reached this instance
+            "status": "ERROR",
+        }
+
+
 async def handle(skill_id: str, payload: dict) -> dict:
     if skill_id != "interpretation.runTools":
         raise ValueError(f"unexpected skill {skill_id}")
@@ -93,14 +290,17 @@ async def handle(skill_id: str, payload: dict) -> dict:
 
     findings = []
     for tool in tools:
-        real = _reason_finding(tool, reason_codes) if tool in _REASON_CODE_RULES else None
+        # Pixel result wins when the model ran (COMPLETE positive, STUBBED negative, or ERROR); a
+        # None means it could not look, so fall back to the referral-reason cross-check, then a stub.
+        real = await _pixel_finding(tool, ctx)
+        if real is None and tool in _REASON_CODE_RULES:
+            real = _reason_finding(tool, reason_codes)
         findings.append(real or {
             "toolId": tool, "label": "", "confidence": None, "evidenceRef": None, "status": "STUBBED",
         })
 
     tools_selected = [
-        {"toolId": f["toolId"], "version": "referral-rule-1" if f["evidenceRef"] else "stub-0",
-         "status": f["status"]}
+        {"toolId": f["toolId"], "version": _tool_version(f), "status": f["status"]}
         for f in findings
     ]
 
