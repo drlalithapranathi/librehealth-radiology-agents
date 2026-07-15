@@ -19,6 +19,7 @@ import os
 from manifest import load_manifest, CohortStudy
 from dicom_fixup import study_id_to_accession
 from omrs_client import OmrsClient, ORDER_CONCEPT_UUID
+from bootstrap_radiology_concept import LAB_LOINC_TO_CONCEPT
 
 # A FHIR-valid instant (fhir2 rejects the +0000 offset form). Real loads should stamp the MIMIC
 # study date; the manifest can carry it later.
@@ -36,8 +37,9 @@ def load_study(c: OmrsClient, s: CohortStudy, concept_uuid: str, when_iso: str =
 
     # EHR packet -- best-effort: a missing concept mapping must not strand the study.
     for lab in s.labs:
+        concept = LAB_LOINC_TO_CONCEPT.get(lab.code, lab.code)  # map manifest LOINC -> provisioned concept
         try:
-            c.create_observation(patient, lab.code, lab.value, lab.unit, lab.date or when_iso)
+            c.create_observation(patient, concept, lab.value, lab.unit, lab.date or when_iso)
             summary["ehr"]["labs"] += 1
         except Exception as e:  # noqa: BLE001
             summary.setdefault("warnings", []).append(f"lab {lab.code}: {e}")

@@ -8,14 +8,18 @@ only the tooling and a synthetic `sample_cohort.json`.
 
 - `pip install -r requirements.txt` (pydicom, boto3, httpx, pymysql).
 - Credentialed PhysioNet AWS access for `fetch.py` (MIMIC-CXR **and** MIMIC-IV DUAs signed).
-- An order/report concept: the demo dictionary has no chest-x-ray concept. Provision one and set
-  `MIMIC_ORDER_CONCEPT_UUID` (see gap 1 in the mapping doc).
+- The concepts the demo dictionary lacks: run `bootstrap_radiology_concept.py` (provisions the
+  chest-x-ray order/report concept + numeric creatinine/eGFR lab concepts), then set
+  `MIMIC_ORDER_CONCEPT_UUID` to the printed Chest-radiograph UUID.
 - Run on the compose network (mariadb/openmrs reachable by service name), e.g. as a one-shot
   container; do NOT publish the DB port.
 
 ## Flow
 
 ```bash
+# 0. provision the concepts the demo dictionary lacks (CXR order/report + numeric labs); prints the UUID
+python bootstrap_radiology_concept.py           # -> set MIMIC_ORDER_CONCEPT_UUID to the printed value
+
 # 1. fetch only the cohort's studies from PhysioNet S3 (off-repo dest, DUA)
 python fetch.py my_cohort.json /secure/mimic-dl
 

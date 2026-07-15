@@ -17,8 +17,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 import os
+import re
 from urllib.parse import urlparse
 import httpx
+
+
+def fhir_instant(s: str) -> str:
+    """Normalize an ISO datetime to a FHIR-valid instant: this fhir2 rejects a `+0000` offset, it
+    wants `+00:00`. Leaves already-valid values (or `Z`) untouched."""
+    s = (s or "").strip()
+    m = re.search(r"([+-]\d{2})(\d{2})$", s)
+    return s[: m.start()] + m.group(1) + ":" + m.group(2) if m else s
 
 # Stable references discovered on the o3 demo stack (overridable via env for another deployment).
 RADIOLOGY_ORDER_TYPE_UUID = os.environ.get("MIMIC_ORDER_TYPE_UUID", "dbdb9a9b-56ea-11e5-a47f-08002719a237")
@@ -186,7 +195,7 @@ class OmrsClient:
         body = {"resourceType": "Observation", "status": "final",
                 "code": {"coding": [{"code": concept_uuid}]},
                 "subject": {"reference": f"Patient/{patient_uuid}"},
-                "effectiveDateTime": when_iso,
+                "effectiveDateTime": fhir_instant(when_iso),
                 "valueQuantity": {"value": value, "unit": unit}}
         return self._fpost("Observation", body)["id"]
 

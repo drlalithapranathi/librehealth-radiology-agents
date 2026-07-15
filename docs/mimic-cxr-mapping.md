@@ -47,23 +47,27 @@ seeded report to `final` and the poller released the gate.
 - `fetch.py` -- selective PhysioNet S3 pull (needs credentialed AWS).
 - `registry_corpus.py` -- export loaded (modality, StudyDescription) for the selection test (#64).
 
-## Known gaps / prerequisites (before a real cohort load)
+## Prerequisite: provision the missing concepts
 
-1. **Order/report concept.** The demo dictionary has NO chest-x-ray concept. Provision one (a
-   `bootstrap_radiology_concept.py` like the presign bootstrap) and set `MIMIC_ORDER_CONCEPT_UUID`.
-   The current tooling requires this UUID and refuses to guess.
-2. **EHR labs need numeric concepts.** MIMIC-IV creatinine/eGFR -> Observation needs numeric
-   concepts (the demo has none) and a FHIR-valid datetime. Labs load is best-effort until concepts
-   are provisioned.
-3. **Meds have no create path.** fhir2 can't create MedicationRequest; OpenMRS drug orders need a
+The demo dictionary has no chest-x-ray concept and no numeric lab concepts, so
+`bootstrap_radiology_concept.py` (direct SQL at stable UUID5s, mirroring the presign bootstrap)
+provisions them before a load: "Chest radiograph" (order/report; set `MIMIC_ORDER_CONCEPT_UUID` to
+it) and "Serum creatinine" / "Estimated GFR" (Numeric, `allow_decimal=1`, so decimal lab values are
+accepted). `load_cohort` maps the manifest's LOINC lab codes onto these via `LAB_LOINC_TO_CONCEPT`.
+Verified: after the bootstrap, the sample cohort loads 3/3 with orders, labs, problems and seeded
+reports.
+
+## Known gaps (remaining)
+
+1. **Meds have no create path.** fhir2 can't create MedicationRequest; OpenMRS drug orders need a
    Drug/concept model. The anticoagulant med-flag story needs this built (follow-up).
-4. **reasonCode on the order (pneumothorax-detect slice).** #68 wants the order's ICD-10 reason
+2. **reasonCode on the order (pneumothorax-detect slice).** #68 wants the order's ICD-10 reason
    (J93*/J95.811) to fire the reason-code slice, but the #70 ingest resolver currently returns only
    `priority`, not `reasonCode` (the module order reason is a Concept, not an ICD-10 code). To light
    this up, the ETL must set the order reason as an ICD-10-mapped concept AND the resolver must
    extract it. Tracked as a follow-up to the #70 resolver.
-5. **DB access for the SQL order path.** The loader connects to mariadb (pymysql). Run it as a
+3. **DB access for the SQL order path.** The loader connects to mariadb (pymysql). Run it as a
    one-shot container on the compose network (mariadb/openmrs by service name), the way the #68
    E2E ran it -- do not publish the DB port.
-6. **MIMIC-IV DUA.** A separate PhysioNet signature from MIMIC-CXR; sign early or criterion 3
+4. **MIMIC-IV DUA.** A separate PhysioNet signature from MIMIC-CXR; sign early or criterion 3
    (labs/meds/problems) has no data.
