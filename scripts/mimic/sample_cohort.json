@@ -1,0 +1,41 @@
+{
+  "_comment": "SYNTHETIC sample manifest for the MIMIC ETL (#68). Fake data only -- NO real MIMIC content (DUA). Shows the schema the curator fills from the real cohort. Study ids/subject ids are invented.",
+  "studies": [
+    {
+      "study_id": "s90000001",
+      "subject_id": "19000001",
+      "description": "CHEST (PA AND LAT)",
+      "priority": "routine",
+      "report_text": "FINDINGS: The lungs are clear. Heart size normal. No effusion or pneumothorax. IMPRESSION: No acute cardiopulmonary process.",
+      "labels": {"gender": "F", "No Finding": 1},
+      "labs": [{"code": "2160-0", "value": 0.9, "unit": "mg/dL", "display": "Creatinine"}],
+      "problems": [],
+      "meds": []
+    },
+    {
+      "study_id": "s90000002",
+      "subject_id": "19000002",
+      "description": "CHEST (PORTABLE AP)",
+      "portable": true,
+      "priority": "stat",
+      "reason_codes": ["J95.811"],
+      "report_text": "INDICATION: Rule out pneumothorax post line placement. FINDINGS: Small right apical pneumothorax. IMPRESSION: Small right apical pneumothorax; recommend follow-up.",
+      "labels": {"gender": "M", "Pneumothorax": 1},
+      "labs": [{"code": "2160-0", "value": 1.6, "unit": "mg/dL", "display": "Creatinine"}],
+      "problems": [{"code": "J95.811", "display": "Postprocedural pneumothorax"}],
+      "meds": [{"display": "warfarin"}]
+    },
+    {
+      "study_id": "s90000003",
+      "subject_id": "19000003",
+      "description": "CHEST (PA AND LAT)",
+      "priority": "urgent",
+      "report_text": "FINDINGS: Moderate right pleural effusion with adjacent atelectasis. IMPRESSION: Moderate right pleural effusion.",
+      "labels": {"gender": "F", "Pleural Effusion": 1},
+      "prior_study_ids": ["s89999999"],
+      "labs": [],
+      "problems": [{"code": "J90", "display": "Pleural effusion"}],
+      "meds": []
+    }
+  ]
+}
