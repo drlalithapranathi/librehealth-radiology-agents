@@ -20,9 +20,11 @@ levels, and `toolsSelected[].version` names it rather than leaving you to guess.
   Reports `COMPLETE` with a real confidence and `evidenceRef: orthanc:instance/<id>`.
   Version reads `cxr-densenet121-res224-all`.
 - **REFERRAL REASON — `pneumothorax-detect`, `pe-detect` (#27).** Cross-check `order.reasonCode`,
-  not pixels. A genuine but narrow interim signal, not CAD, so they stay `STUBBED` with a plain-text
-  `evidenceRef` (`order.reasonCode=J93.1`). Table-driven via `_REASON_CODE_RULES`. Version reads
-  `referral-rule-1`.
+  not pixels. Matched by ICD-10 family **prefix** (dot-stripped, e.g. `I26`, `J93`), the same
+  normalisation `worklist-triage` uses on the same field — an exact-code list silently disagreed
+  with triage on bare `I26` / `I2699`. A genuine but narrow interim signal, not CAD, so they stay
+  `STUBBED` with a plain-text `evidenceRef` (`order.reasonCode=J93.1`). Table-driven via
+  `_REASON_CODE_RULES`. Version reads `referral-rule-1`.
 - **STUBBED — everything else,** until it gets a real implementation. Version reads `stub-0`.
 
 ## The rules a real model does not get to break
@@ -43,7 +45,8 @@ levels, and `toolsSelected[].version` names it rather than leaving you to guess.
 The pixel path needs `radagent-common[imaging]` + torch; the Dockerfile installs both and **bakes the
 model weights at build time**. `handler.PIXEL_TOOLING` records at import whether they are present —
 the `agent-tests` CI lane installs neither, so `cxr-screen` degrades to `STUBBED` there and the suite
-stays torch-free. The pixel path is still tested in that lane, through a seam (`tests/test_cxr_screen.py`).
+stays torch-free. The pixel path is still tested in that lane, through a seam (`tests/test_cxr_screen.py`),
+and `cxr_model.py` itself runs under a torch-gated test (`tests/test_cxr_model.py`, skipped without torch).
 
 - **DICOM SC/overlay evidenceRef is still deferred.** *Reading* pixels is now supported; **writing**
   AI-made images/overlays back into the patient record is not, and needs a safety review that hasn't

@@ -53,40 +53,37 @@ except ImportError as _exc:  # pragma: no cover - covered by the import-guard te
 
     OrthancClient = dicom_to_greyscale = score = summarise = None  # type: ignore[assignment]
 
-# Referral-reason ICD-10 codes per real-slice tool. A real, narrow signal: the ordering
-# clinician already named the suspicion, so the tool can act on it before any pixel-level model
-# exists (#27). A code NOT in a tool's set means "nothing to check", not "confirmed normal" -- a
-# referral reason that doesn't mention the condition is not imaging evidence against it, so
-# absence of a match must stay STUBBED rather than fabricate a negative finding (the same trap the
-# #26 COMPLETE-gate guards against on the write side). Lists confirmed with Pranathi (lead review):
-#   - pneumothorax-detect: J93.* (spontaneous), S27.0XXA (traumatic), J95.811 (postprocedural,
-#     e.g. r/o PTX post-line film).
-#   - pe-detect: I26.* (parent + billable children, with/without acute cor pulmonale) and O88.2*
-#     (obstetric thromboembolism) -- PE is coded under I26 regardless of cause, so unlike
-#     pneumothorax there's no separate traumatic code, but pregnancy/puerperium PE sits outside
-#     I26 entirely in the O88.2 family and needs its own entry.
-_REASON_CODE_RULES: dict[str, tuple[frozenset[str], str]] = {
-    "pneumothorax-detect": (
-        frozenset({
-            "J93.0", "J93.1", "J93.11", "J93.12", "J93.81", "J93.82", "J93.83", "J93.9",
-            "S27.0XXA", "J95.811",
-        }),
-        "pneumothorax",
-    ),
-    "pe-detect": (
-        frozenset({
-            "I26.0", "I26.01", "I26.02", "I26.09",
-            "I26.9", "I26.90", "I26.92", "I26.93", "I26.94", "I26.99",
-            "O88.2", "O88.211", "O88.212", "O88.213", "O88.219", "O88.22", "O88.23",
-        }),
-        "pulmonary embolism",
-    ),
+# Referral-reason ICD-10 codes per real-slice tool, matched by FAMILY PREFIX rather than exact
+# code. worklist-triage normalises the same order.reasonCode field to a 3-char ICD-10 category
+# (agents/worklist-triage/handler.py:_reason_code_signals), so an exact-string list here silently
+# disagreed with triage on the same order: triage escalated "I26" or "I2699" as urgent PE while
+# this tool stayed silent on the identical code (#27 follow-up, Saptarshi/Pranathi). Prefixes
+# confirmed with Pranathi (lead review):
+#   - pneumothorax-detect: "J93" (spontaneous pneumothorax *and other air leak*, e.g. J93.82 --
+#     that code already matched under the old exact-code list on main, so staying matched here
+#     is not a widening; it's a chest study and the finding stays STUBBED regardless). S27.0XXA
+#     (traumatic) and J95.811 (postprocedural, e.g. r/o PTX post-line film) stay explicit full
+#     codes because their families -- S27 intrathoracic injury generally, J95 postprocedural
+#     respiratory complications generally -- are NOT all pneumothorax.
+#   - pe-detect: "I26" (parent + all billable children, with/without acute cor pulmonale --
+#     all of I26 is pulmonary embolism, so the prefix can't over-match). "O882" (dot-normalised
+#     O88.2, obstetric thromboembolism) stays a 4-char prefix rather than the 3-char "O88"
+#     family, because O88 also covers air/amniotic-fluid/septic embolism, which are not PE.
+_REASON_CODE_RULES: dict[str, tuple[tuple[str, ...], str]] = {
+    "pneumothorax-detect": (("J93", "S270XXA", "J95811"), "pneumothorax"),
+    "pe-detect": (("I26", "O882"), "pulmonary embolism"),
 }
 
 
+def _normalize_reason_code(code: str) -> str:
+    """Same normalisation shape as worklist-triage's _reason_code_signals (dot-stripped,
+    upper), so both agents read order.reasonCode the same way."""
+    return code.upper().replace(".", "")
+
+
 def _reason_finding(tool_id: str, reason_codes: list[str]) -> Optional[dict]:
-    codes, condition = _REASON_CODE_RULES[tool_id]
-    hit = next((code for code in reason_codes if code.upper() in codes), None)
+    prefixes, condition = _REASON_CODE_RULES[tool_id]
+    hit = next((code for code in reason_codes if _normalize_reason_code(code).startswith(prefixes)), None)
     if hit is None:
         return None
     return {

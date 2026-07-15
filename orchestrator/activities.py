@@ -192,6 +192,38 @@ async def record_policy_failure_activity(workflow_id: str, tier: str | None, rea
     )
 
 
+@activity.defn(name=state.ACT_RECORD_SIGNOFF_ABANDONED)
+async def record_signoff_abandoned_activity(workflow_id: str, tier: str | None,
+                                            pages: int) -> None:
+    """A sign-off gate ran out of ladder with nobody acknowledging (#57) -> make it visible.
+
+    The gate no longer holds forever (see StudyWorkflow._hold_signoff_gate): it releases the study
+    to COMMUNICATE so the finding that made verification FAIL actually gets dispatched. But a
+    release nobody authorised is exactly the thing an operator must see, so it lands on the surface
+    they already watch: /admin/dead-letters. The study archives with the FAIL unacknowledged.
+
+    An activity because the workflow must stay deterministic (golden rule 5): this is the I/O.
+    """
+    store = IngressStore(default_store_path())
+    try:
+        store.add_signoff_abandoned(workflow_id, tier, pages, now_iso())
+    finally:
+        store.close()
+    activity.logger.error(
+        "DEAD LETTER: sign-off gate for %s (tier=%s) exhausted its ladder after %d page(s) with no "
+        "acknowledgement; released to COMMUNICATE with the verification FAIL unacknowledged. "
+        "See /admin/dead-letters",
+        workflow_id, tier or "unknown", pages,
+    )
+
+
+# Where a paged human goes to release the gate (#57). Injected into every ladder page so a study
+# sitting at the gate always carries the pointer to its own exit -- a page that says "act" without
+# saying HOW is how a gate ends up stranded. Read here, in the I/O layer: the workflow may not read
+# env (golden rule 5). Unset (dev/compose default) simply omits the field.
+SIGNOFF_OVERRIDE_URL = os.environ.get("SIGNOFF_OVERRIDE_URL", "")
+
+
 @activity.defn(name=state.ACT_ESCALATE)
 async def escalate_activity(workflow_id: str, reason: str, escalation: dict | None = None) -> dict:
     """The sign-off human gate is still open with no radiologist action -> page a human (#23/#29).
@@ -233,6 +265,12 @@ async def escalate_activity(workflow_id: str, reason: str, escalation: dict | No
             "attempt": escalation.get("attempt", 1),
             "reason": reason,
         }
+        # Every page carries the way OUT of the gate it is paging about (#57). The person being
+        # woken is the person who can release the study; telling them to act without telling them
+        # how is how a study sits at this gate until its ladder runs out.
+        if SIGNOFF_OVERRIDE_URL:
+            payload["escalation"]["overrideUrl"] = SIGNOFF_OVERRIDE_URL.replace(
+                "{workflowId}", workflow_id)
     return await call_agent_skill(state.agent_base_url("communications"), "comms.dispatch", payload)
 
 

@@ -7,6 +7,7 @@ Owner: Pranathi (lead). Trigger map: ARCHITECTURE.md
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -33,6 +34,13 @@ POLL_INTERVAL_S = int(os.environ.get("RIS_POLL_INTERVAL_S", "30"))
 # Empty (the default) accepts unauthenticated callbacks — dev/compose posture, same as the
 # Orthanc webhook; set it in any deployment that leaves the compose network.
 A2A_CALLBACK_TOKEN = os.environ.get("A2A_CALLBACK_TOKEN", "")
+# Shared secret for the sign-off override (#57). REQUIRED, unlike the two above: those endpoints
+# deliver facts, this one waives a safety verdict on a report. Unset -> the endpoint 503s rather
+# than accepting anonymous releases (see signoff_override).
+SIGNOFF_OVERRIDE_TOKEN = os.environ.get("SIGNOFF_OVERRIDE_TOKEN", "")
+# Cap on the free-text reason. It is a clinician's audit note, not a report: bounded so a stray
+# paste cannot bloat workflow history (which is replayed on every worker pickup).
+SIGNOFF_REASON_MAX = int(os.environ.get("SIGNOFF_REASON_MAX", "500"))
 # Reconcile the index against Temporal every N polls (plus once at startup) to evict rows for
 # workflows that completed/terminated without ever delivering a report.
 RECONCILE_EVERY_POLLS = int(os.environ.get("INGRESS_RECONCILE_EVERY_POLLS", "120"))
@@ -472,6 +480,81 @@ async def ris_event() -> dict:
     return {"nudged": True}
 
 
+@app.post("/signoff/{workflow_id}/override", status_code=202)
+async def signoff_override(
+    workflow_id: str,
+    body: dict,
+    x_signoff_token: str = Header(default=""),
+) -> dict:
+    """A radiologist acknowledges a verification finding and releases the sign-off gate (#57).
+
+    THE MISSING PRODUCER. `signoff_acknowledged` is the signal AWAITING_SIGNOFF waits on, and until
+    this endpoint existed nothing in production sent it -- it lived only in tests. A study whose
+    report FAILed verification with requiresHumanReview therefore paged its way up the ladder and
+    then waited forever: it never reached COMMUNICATE, so the very finding that made verification
+    FAIL was never dispatched, and it never archived (#56).
+
+    The study does NOT get re-verified. Re-running report.verify on the unchanged report re-derives
+    the same FAIL and drops it straight back into the gate. It proceeds to COMMUNICATE carrying the
+    FAIL *and* this acknowledgement, both on the record (#56 decision (b)). At M2 the addendum flow
+    (#56 (a)) becomes the main path -- an addendum updates the report, so re-verification is finally
+    meaningful -- and this endpoint remains the escape hatch.
+
+    AUTHENTICATION IS MANDATORY, unlike the Orthanc webhook and the A2A callback, whose tokens are
+    optional for the compose posture. Those endpoints deliver facts; this one lets a caller waive a
+    safety verdict on a radiology report. With SIGNOFF_OVERRIDE_TOKEN unset the endpoint refuses to
+    act at all rather than silently accepting anonymous releases -- an override nobody can be
+    identified with is not an override, it is a hole.
+    """
+    if not SIGNOFF_OVERRIDE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="sign-off override is not configured (set SIGNOFF_OVERRIDE_TOKEN)",
+        )
+    # Compare as BYTES. hmac.compare_digest on str raises TypeError the moment either side holds a
+    # non-ASCII character -- so a junk header with one accented byte would crash the auth check into
+    # an unhandled 500 instead of a clean 401, and a deployment whose token happened to be non-ASCII
+    # would 500 on every call, i.e. brick the escape hatch.
+    if not hmac.compare_digest(x_signoff_token.encode("utf-8"),
+                               SIGNOFF_OVERRIDE_TOKEN.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="bad sign-off override token")
+
+    # Who and why are the whole point: this is the audit record of a human waiving a safety verdict.
+    # An override with an anonymous author, or with no stated reason, is not auditable -- reject it
+    # rather than record a blank.
+    who = str(body.get("acknowledgedBy") or "").strip()
+    why = str(body.get("reason") or "").strip()
+    if not who or not why:
+        raise HTTPException(
+            status_code=422,
+            detail="acknowledgedBy and reason are both required: an override must say who and why",
+        )
+    if len(why) > SIGNOFF_REASON_MAX:
+        raise HTTPException(
+            status_code=422,
+            detail=f"reason must be at most {SIGNOFF_REASON_MAX} characters",
+        )
+
+    ack = {"acknowledgedBy": who, "reason": why, "acknowledgedAt": now_iso()}
+    try:
+        client = await _temporal()
+        await client.get_workflow_handle(workflow_id).signal(
+            StudyWorkflow.signoff_acknowledged, ack)
+    except Exception as e:  # noqa: BLE001 - unknown workflow / Temporal down -> tell the caller
+        _log.warning("sign-off override for %s could not be signalled: %s", workflow_id, e)
+        raise HTTPException(
+            status_code=502,
+            detail="could not signal the workflow; the gate is still held",
+        )
+
+    # `reason` is free text a clinician typed, so it is NOT echoed into the log (lean-reference: it
+    # is the one field here that could carry PHI). It lives in the workflow history, which is where
+    # the audit trail belongs.
+    _log.warning("SIGN-OFF OVERRIDE: %s released by %s", workflow_id, who)
+    return {"acknowledged": True, "workflowId": workflow_id, "acknowledgedBy": who,
+            "acknowledgedAt": ack["acknowledgedAt"]}
+
+
 @app.get("/admin/dead-letters")
 async def dead_letters() -> dict:
     """Everything the pipeline permanently gave up on. Rows carry IDs only (lean-reference, no
@@ -484,6 +567,10 @@ async def dead_letters() -> dict:
       ladder, so it fell back to a single flat page. The study is still escalated and readable, but
       escalation is DEGRADED until the policy is fixed: check escalation-policy.yaml and any
       ESCALATION_POLICY_PATH override.
+    * `signoff-abandoned` (#57) — a sign-off gate paged its whole escalation ladder and NOBODY
+      acknowledged. The study was released to COMMUNICATE (so the finding that made verification
+      FAIL still got dispatched) and archived, but its report carries a verification FAIL that no
+      human ever signed off. Go and look at the study. This is the loudest row on this surface.
     """
     letters = _store().dead_letters()
     return {"count": len(letters), "deadLetters": letters}

@@ -158,6 +158,57 @@ def test_escalate_activity_passes_the_rung_slice(monkeypatch):
     _DISPATCH_ESCALATION_VALIDATOR.validate(captured["payload"]["escalation"])
 
 
+def test_every_page_carries_the_way_out_of_the_gate(monkeypatch):
+    """#57: a page tells a human to act on a stuck study, so it must also tell them HOW to release
+    it. Without the pointer, the escalation ladder wakes people who then have nowhere to go -- which
+    is how a study sat at this gate until its ladder ran out (#56).
+
+    The URL is read in the ACTIVITY, not the workflow: the workflow may not read env (golden rule 5).
+    """
+    captured: dict = {}
+
+    async def _fake_dispatch(base_url, skill_id, payload):
+        captured.update(payload=payload)
+        return {"schemaVersion": "1.0.0", "workflowId": "wf_o", "dispatchStatus": "SENT",
+                "agentVersion": "0.1.0", "dispatchedAt": "2026-07-13T00:00:00Z"}
+
+    monkeypatch.setattr(activities, "call_agent_skill", _fake_dispatch)
+    monkeypatch.setattr(activities, "SIGNOFF_OVERRIDE_URL",
+                        "https://ris.example/signoff/{workflowId}/override")
+    rung = {"level": 2, "afterMinutes": 120, "targetRole": "on-call-radiologist",
+            "channels": ["pager"], "urgency": "critical"}
+
+    asyncio.run(ActivityEnvironment().run(
+        activities.escalate_activity, "wf_o", "sign-off gate timed out awaiting radiologist", rung))
+
+    esc = captured["payload"]["escalation"]
+    assert esc["overrideUrl"] == "https://ris.example/signoff/wf_o/override"   # id substituted
+    _DISPATCH_ESCALATION_VALIDATOR.validate(esc)          # and it still satisfies the contract
+
+
+def test_an_unconfigured_override_url_simply_omits_the_pointer(monkeypatch):
+    """A deployment that has not set SIGNOFF_OVERRIDE_URL still pages -- it just cannot say where to
+    go. The page is the safety-critical part; the pointer is an improvement on it, not a gate on it.
+    """
+    captured: dict = {}
+
+    async def _fake_dispatch(base_url, skill_id, payload):
+        captured.update(payload=payload)
+        return {"schemaVersion": "1.0.0", "workflowId": "wf_o", "dispatchStatus": "SENT",
+                "agentVersion": "0.1.0", "dispatchedAt": "2026-07-13T00:00:00Z"}
+
+    monkeypatch.setattr(activities, "call_agent_skill", _fake_dispatch)
+    monkeypatch.setattr(activities, "SIGNOFF_OVERRIDE_URL", "")
+    rung = {"level": 1, "afterMinutes": 60, "targetRole": "reading-radiologist",
+            "channels": ["in-app"], "urgency": "routine"}
+
+    asyncio.run(ActivityEnvironment().run(activities.escalate_activity, "wf_o", "reason", rung))
+
+    esc = captured["payload"]["escalation"]
+    assert "overrideUrl" not in esc
+    _DISPATCH_ESCALATION_VALIDATOR.validate(esc)
+
+
 # --- integration plumbing -----------------------------------------------------------
 
 STUDY_CONTEXT = {
@@ -221,6 +272,11 @@ async def _boom_record_policy_failure(workflow_id: str, tier: str | None, reason
     raise RuntimeError("dead-letter store unwritable")
 
 
+@activity.defn(name="record_signoff_abandoned_activity")
+async def _mock_record_signoff_abandoned(workflow_id: str, tier: str | None, pages: int) -> None:
+    _STATE.setdefault("abandoned", []).append((workflow_id, tier, pages))
+
+
 async def _wait_state(handle, target: str, tries: int = 200) -> None:
     for _ in range(tries):
         if await handle.query(StudyWorkflow.current_state) == target:
@@ -257,19 +313,24 @@ def test_ack_before_first_rung_pages_nobody():
 # --- integration: policy unavailable -> legacy single-timeout gate ------------------
 
 def test_policy_load_failure_falls_back_to_legacy_gate():
-    """A config disaster must not silence escalation OR strand the gate: the ladder loader
-    fails (bounded retries), the gate falls back to the pre-#29 behavior — single tier
-    timeout, one flat page (escalation=None), back to the verify loop — and the study
-    completes without an ack, exactly as it did before #29.
+    """A config disaster must not silence escalation OR strand the gate: the ladder loader fails
+    (bounded retries) and the gate falls back to flat pages on the legacy tier timeout
+    (escalation=None, no rung slice).
 
-    #54: the fallback is now also LOUD — one dead letter records that escalation is degraded —
-    without changing any of the paging behavior asserted below."""
+    #54: the fallback is LOUD — a dead letter records that escalation is degraded.
+
+    #57: the fallback is also BOUNDED and TERMINAL. It used to page once and drop back into the
+    verify loop, which re-verified the unchanged report, re-FAILed, and re-entered the gate — so
+    the degraded path paged forever and the study never archived. Now it pages up to the same cap
+    as the ladder's repeating rung and then releases the study with the FAIL unacknowledged, which
+    is the only ending that gets the finding to COMMUNICATE at all."""
     async def scenario():
         _reset()
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
                               activities=[_mock_call, _mock_publish, _mock_escalate,
-                                          _boom_load_policy, _mock_record_policy_failure]):
+                                          _boom_load_policy, _mock_record_policy_failure,
+                                          _mock_record_signoff_abandoned]):
                 handle = await env.client.start_workflow(
                     StudyWorkflow.run, STUDY_CONTEXT, id="wf-ladder-fallback", task_queue=TASK_QUEUE
                 )
@@ -277,11 +338,20 @@ def test_policy_load_failure_falls_back_to_legacy_gate():
                 await handle.signal(StudyWorkflow.report_finalized,
                                     {"diagnosticReportId": "DiagnosticReport/1"})
                 result = await handle.result()  # env time-skips the legacy 4h ROUTINE timeout
+        from orchestrator.workflow import ESCALATION_REPEAT_CAP
+
         assert result["finalState"] == "ARCHIVED"
-        assert len(_STATE["escalations"]) == 1
+        # Bounded (#57): the degraded path pages up to the cap, not once and not forever.
+        assert len(_STATE["escalations"]) == ESCALATION_REPEAT_CAP
         wf, reason, esc = _STATE["escalations"][0]
         assert (wf, esc) == ("wf_ladder", None)    # the legacy flat page, no rung slice
         assert "sign-off" in reason
+        # Terminal (#57): nobody acknowledged, so the gate says so and releases rather than holding
+        # for a signal that -- on this path -- no one was ever told how to send.
+        assert result["signoff"] == {"status": "ABANDONED"}
+        assert _STATE["abandoned"] == [("wf_ladder", "ROUTINE", ESCALATION_REPEAT_CAP)]
+        # The report still carries its FAIL: releasing the gate is NOT the same as passing.
+        assert result["verification"]["verificationStatus"] == "FAIL"
         # ...and the collapse was announced exactly once, carrying the tier that lost its ladder.
         assert len(_STATE["policy_failures"]) == 1
         dl_wf, dl_tier, dl_reason, dl_attempts = _STATE["policy_failures"][0]
@@ -298,7 +368,8 @@ def test_policy_dead_letter_failure_never_costs_the_page():
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
                               activities=[_mock_call, _mock_publish, _mock_escalate,
-                                          _boom_load_policy, _boom_record_policy_failure]):
+                                          _boom_load_policy, _boom_record_policy_failure,
+                                          _mock_record_signoff_abandoned]):
                 handle = await env.client.start_workflow(
                     StudyWorkflow.run, STUDY_CONTEXT, id="wf-ladder-dl-boom",
                     task_queue=TASK_QUEUE,
@@ -308,5 +379,10 @@ def test_policy_dead_letter_failure_never_costs_the_page():
                                     {"diagnosticReportId": "DiagnosticReport/1"})
                 result = await handle.result()
         assert result["finalState"] == "ARCHIVED"    # not a workflow failure
-        assert len(_STATE["escalations"]) == 1       # the radiologist still got paged
+        # The radiologist still got paged even though BOTH the policy and the dead-letter store
+        # were down -- the page is the safety-critical part, the alert is only observability.
+        assert _STATE["escalations"], "a config disaster silenced escalation entirely"
+        # ...and the gate still terminated (#57) rather than holding forever on a signal nobody
+        # sends. An unwritable dead-letter store must not turn a released gate into a stranded one.
+        assert result["signoff"]["status"] == "ABANDONED"
     asyncio.run(scenario())

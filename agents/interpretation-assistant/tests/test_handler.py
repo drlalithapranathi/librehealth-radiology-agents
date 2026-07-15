@@ -182,6 +182,52 @@ async def test_pe_without_matching_reason_code_stays_stubbed():
     assert pe["evidenceRef"] is None
     assert out["overallStatus"] == "STUBBED"
 
+
+# #27 follow-up (Saptarshi/Pranathi): worklist-triage normalises order.reasonCode to a 3-char
+# ICD-10 prefix and escalated "I26"/"I2699" as urgent PE while the old exact-string list here
+# stayed silent on the identical code -- the two agents disagreed about the same order.
+async def test_pe_bare_category_code_records_evidence():
+    ctx = {**CTPA_CONTEXT, "order": {"priority": "stat", "reasonCode": ["I26"]}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    pe = next(f for f in out["findings"] if f["toolId"] == "pe-detect")
+    assert pe["evidenceRef"] == "order.reasonCode=I26"
+
+
+async def test_pe_code_without_dot_records_evidence():
+    ctx = {**CTPA_CONTEXT, "order": {"priority": "stat", "reasonCode": ["I2699"]}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    pe = next(f for f in out["findings"] if f["toolId"] == "pe-detect")
+    assert pe["evidenceRef"] == "order.reasonCode=I2699"
+
+
+async def test_pe_other_obstetric_embolism_code_stays_unmatched():
+    # O88.0 (air embolism) sits in the same O88 family as O88.2 (thromboembolism) but is not PE --
+    # the prefix must stay the 4-char "O882", not widen to the 3-char "O88" family.
+    ctx = {**CTPA_CONTEXT, "order": {"priority": "stat", "reasonCode": ["O88.0"]}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    pe = next(f for f in out["findings"] if f["toolId"] == "pe-detect")
+    assert pe["evidenceRef"] is None
+
+
+# Pins "O882" as a PREFIX, not an exact match: the billable obstetric-PE children (O88.211,
+# O88.219, O88.22, O88.23) must keep matching. Without this, the O88.0-stays-unmatched test above
+# alone would pass just as well if O882 were tightened to an exact match -- and every billable
+# child would go silent while the suite stayed green (Pranathi, MR review).
+async def test_pe_obstetric_embolism_child_code_records_evidence():
+    ctx = {**CTPA_CONTEXT, "order": {"priority": "stat", "reasonCode": ["O88.211"]}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    pe = next(f for f in out["findings"] if f["toolId"] == "pe-detect")
+    assert pe["evidenceRef"] == "order.reasonCode=O88.211"
+
+
+async def test_pneumothorax_other_intrathoracic_injury_code_stays_unmatched():
+    # S27.1 (traumatic hemothorax) sits in the same S27 family as S27.0XXA (traumatic
+    # pneumothorax) but is not pneumothorax -- S27.0XXA must stay an explicit full code.
+    ctx = {**CXR_CONTEXT, "order": {"priority": "stat", "reasonCode": ["S27.1"]}}
+    out = await handle("interpretation.runTools", {"studyContext": ctx})
+    ptx = next(f for f in out["findings"] if f["toolId"] == "pneumothorax-detect")
+    assert ptx["evidenceRef"] is None
+
 # --- selection on the descriptions departments ACTUALLY send (#63) -----------------------------
 #
 # The tests above all feed a description that spells the anatomy out ("CT CHEST", "CT HEAD"), which
