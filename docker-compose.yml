@@ -335,8 +335,54 @@ services:
       - worklist-api-db:/var/lib/lhrad
     depends_on: [orthanc]
     restart: unless-stopped
-  # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`
-  # (external image, added when it runs).
+  # The Communications Agent (CritCom, #52) -- the terminal COMMUNICATE stage's target. Until #69
+  # this was only a note, `communications:8106` resolved to nothing, and every study parked forever
+  # at COMMUNICATE retrying it (the stage's retry is deliberately unbounded); sign-off ladder pages
+  # failed too. Reads clinical context from fhir2 (read-only), writes Communication/Task to the
+  # comms ledger, resolves on-call from the directory the one-shot below seeds.
+  communications:
+    build:
+      context: .
+      dockerfile: agents/communications/Dockerfile
+    ports: ["8106:8106"]
+    environment:
+      COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
+      FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
+      FHIR2_BASIC_USER: admin
+      FHIR2_BASIC_PASS: Admin123
+      # Read-only fhir2 consumer (ServiceRequest.requester): the #67 read-transport guard refuses
+      # plaintext-to-remote reads without an opt-in, and this hop is plaintext http to the
+      # in-compose openmrs (see the orchestrator's FHIR2_ALLOW_INSECURE_WRITE note; a real
+      # deployment uses an https FHIR2_BASE_URL). Inert until #67 merges; needed after.
+      FHIR2_ALLOW_INSECURE_READ: "1"
+      # Ack windows are env-overridable per deployment (a tertiary centre's Cat1 window is not a
+      # rural clinic's); the showcase runs the clinical defaults (Cat1 60m / Cat2 24h / escalated
+      # loops 60m), so none are overridden here.
+    depends_on:
+      comms-ledger:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-shot on-call directory seed (#69): one general-radiology Practitioner + an active
+  # PractitionerRole tagged `on-call` in the LEDGER (PractitionerRole is ledger-native; fhir2
+  # implements neither it nor Communication). PUT at known ids -> idempotent per `up`, same
+  # contract as presign-concept-bootstrap. A single rota deliberately sidesteps the specialty-
+  # routing gap (#58). Without this, an unacknowledged critical result is UNESCALATABLE: the agent
+  # reports "no on-call provider is configured in the ledger" rather than paging nobody silently.
+  comms-oncall-seed:
+    image: python:3.11-slim
+    environment:
+      COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
+    volumes:
+      - ./docker/comms-ledger/seed_oncall.py:/opt/seed_oncall.py:ro
+    command:
+      - sh
+      - -c
+      - "pip install --quiet --no-cache-dir httpx==0.27.2 && python /opt/seed_oncall.py"
+    depends_on:
+      comms-ledger:
+        condition: service_healthy
+    restart: "no"
 
 volumes:
   mariadb-data:
