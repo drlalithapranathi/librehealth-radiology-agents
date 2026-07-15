@@ -85,9 +85,13 @@ def _truthy_problem(when: dict, ctx: dict) -> bool:
         return False
     if op == "equals":      return left == right
     if op == "not_equals":  return left != right
-    if op == "contains":    return right in left
-    if op == "gt":          return left > right
-    if op == "lt":          return left < right
+    try:
+        if op == "contains": return right in left
+        if op == "gt":       return left > right
+        if op == "lt":       return left < right
+    except TypeError:
+        # Unexpected payload types fail closed instead of aborting report verification.
+        return False
     return False
 
 
