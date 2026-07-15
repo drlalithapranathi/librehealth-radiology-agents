@@ -72,15 +72,25 @@ _REGION_ALIASES: dict[str, tuple[str, ...]] = {
 # MR through the head<->brain cross-alias.
 #
 # Requiring a leading modality token (`CT HEAD`, `MRI HEAD`) does not fix it: `MRI HEAD OF FEMUR` is
-# a real way to name the study and still matches "MRI HEAD". What actually separates the two is the
-# BONE, so the region is refused whenever the description names one. This also makes the plural
-# consistent -- `MR FEMORAL HEADS` used to fall through by accident, because `\bhead\b` does not
-# match "heads", so the same study behaved differently depending on how the tech typed it.
-_MSK_JOINT = re.compile(r"\b(?:femoral|femur|humeral|humerus|radial|ulnar|hip|shoulder)\b")
+# a real way to name the study and still matches "MRI HEAD". What separates the two is the BONE --
+# but the bone must sit NEXT TO "head" (`<bone> head` / `head of <bone>`), NOT anywhere in the
+# description. Refusing the region on any bone word anywhere is too blunt: a polytrauma
+# `CT HEAD ABDOMEN PELVIS FEMUR` is a real brain scan, and dropping `ich-detect` because "femur"
+# appears elsewhere silently removes intracranial-hemorrhage screening from exactly the studies
+# that need it. Matching the adjacency also lets the bone list be complete without that risk, so
+# `fibular head`, `mandibular head` (TMJ) etc. are covered too, not just femoral/humeral. `heads?`
+# keeps the plural consistent (`MR FEMORAL HEADS`).
+_MSK_BONE = (
+    "femoral|femur|humeral|humerus|radial|radius|ulnar|ulna|fibular|fibula|tibial|tibia|"
+    "mandibular|mandible|condylar|condyle|patellar|patella|metacarpal|metatarsal|hip|shoulder"
+)
+_MSK_JOINT_HEAD = re.compile(
+    rf"\b(?:{_MSK_BONE})\s+heads?\b|\bheads?\s+of\s+(?:the\s+)?(?:{_MSK_BONE})\b"
+)
 
 _REGION_EXCLUSIONS: dict[str, re.Pattern[str]] = {
-    "head":  _MSK_JOINT,
-    "brain": _MSK_JOINT,
+    "head":  _MSK_JOINT_HEAD,
+    "brain": _MSK_JOINT_HEAD,
 }
 
 # Aliases match on WORD BOUNDARIES, unlike the plain-substring match on the key itself.

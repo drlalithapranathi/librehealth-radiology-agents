@@ -316,6 +316,11 @@ def test_an_unrelated_study_still_falls_back_to_the_generic_screen():
     # the uterine cervix is not the cervical spine
     ("MR", "MR CERVICAL CANCER STAGING",   ["generic-mr-screen"]),
     ("CT", "CT CERVICAL CANCER",           ["generic-ct-screen"]),
+    # the exclusion matches ANY bone ADJACENT to "head", not a hand-listed few: a fibular head
+    # (knee) or a mandibular head (TMJ) is refused too, not just femoral/humeral.
+    ("CT", "CT FIBULAR HEAD",              ["generic-ct-screen"]),
+    ("CT", "CT MANDIBULAR HEAD",           ["generic-ct-screen"]),
+    ("MR", "MR RADIAL HEAD",               ["generic-mr-screen"]),
 ])
 def test_a_region_named_but_not_the_subject_does_not_select_its_tools(modality, description, expected):
     assert select_tools(modality, description) == expected
@@ -331,6 +336,12 @@ def test_a_region_named_but_not_the_subject_does_not_select_its_tools(modality, 
     ("MR", "MRI C-SPINE",                ["cord-compression-detect"]),
     ("CT", "CT LUMBAR SPINE",            ["vertebral-fracture-detect"]),
     ("MR", "MRI LUMBAR",                 ["cord-compression-detect"]),
+    # a bone named ELSEWHERE in the description (not adjacent to "head") must NOT suppress the
+    # brain region: a polytrauma head CT that also scans a long bone is a real brain scan and must
+    # keep ich-detect. Excluding on any bone anywhere silently dropped hemorrhage screening here.
+    ("CT", "CT HEAD ABDOMEN PELVIS FEMUR", ["ich-detect", "stroke-detect", "liver-lesion-detect"]),
+    ("CT", "CT HEAD AND FEMUR TRAUMA",     ["ich-detect", "stroke-detect"]),
+    ("CT", "CT BRAIN AND SHOULDER",        ["ich-detect", "stroke-detect"]),
 ])
 def test_the_exclusions_do_not_cost_the_real_studies(modality, description, expected):
     """The exclusion refuses a region; it must not refuse the studies the region exists for."""
