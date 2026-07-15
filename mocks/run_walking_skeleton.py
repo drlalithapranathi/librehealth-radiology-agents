@@ -5,7 +5,7 @@ This is the M0 "it runs and the contracts hold together" proof. The live wiring
 (Temporal workflow + A2A transport) is exercised in M1; here we call each agent's
 pure handler directly in the order the StudyWorkflow would.
 
-Run:  python mocks/run_walking_skeleton.py
+Run:  python mocks/run_walking_skeleton.py [mocks/fixtures/studycontext.*.json]
 """
 from __future__ import annotations
 
@@ -40,18 +40,11 @@ class _DemoFhir:
         return "CT chest: large left tension pneumothorax."
 
 
-async def main() -> int:
-    ctx = json.loads((ROOT / "mocks/fixtures/studycontext.sample.json").read_text())
+async def run_fixture(fixture: Path, handlers: tuple) -> None:
+    """Run and validate every pipeline hop for one StudyContext fixture."""
+    ctx = json.loads(fixture.read_text())
     wf = ctx["workflowId"]
-    print(f"\n=== Walking skeleton for {wf} ===\n")
-
-    triage = load_handler("worklist-triage")
-    ehr = load_handler("ehr-assistant")
-    interp = load_handler("interpretation-assistant")
-    impression = load_handler("impression-generation")
-    impression.__globals__["_FHIR"] = _DemoFhir()  # inject the fhir2 the handler fetches from (#16)
-    verify = load_handler("report-verification")
-    verify.__globals__["_FHIR"] = _DemoFhir()  # verify parses report.body from the same conclusion (#22)
+    triage, ehr, interp, impression, verify = handlers
 
     # 1) Pre-read fan-out (triage ‖ ehr ‖ interpretation)
     t, e, a = await asyncio.gather(
@@ -61,9 +54,6 @@ async def main() -> int:
     )
     for skill, out in [("triage.score", t), ("ehr.assembleContext", e), ("interpretation.runTools", a)]:
         validate_skill_output(skill, out)
-    print(f"  triage    -> {t['priorityTier']} ({t['priorityScore']})")
-    print(f"  ehr       -> priors={len(e['priorStudies'])} labs={len(e['relevantLabs'])}")
-    print(f"  interp    -> {out['overallStatus']} tools={len(a['toolsSelected'])}")
 
     # 2) (radiologist signs report in RIS — simulated finalized event)
     report_event = {"schemaVersion": "1.0.0", "eventType": "ris.report.finalized",
@@ -74,15 +64,54 @@ async def main() -> int:
     imp = await impression("impression.generate",
                            {"studyContext": ctx, "report": report_event, "ehrContext": e, "aiFindings": a})
     validate_skill_output("impression.generate", imp)
-    print(f"  impression-> {imp['impressionText'][:48]!r}")
 
     # 4) Verify
     ver = await verify("report.verify",
                        {"studyContext": ctx, "report": report_event, "impression": imp, "ehrContext": e, "aiFindings": a})
     validate_skill_output("report.verify", ver)
-    print(f"  verify    -> {ver['verificationStatus']} (human_review={ver['requiresHumanReview']}, issues={len(ver['issues'])})")
 
-    print("\nAll hops validated against /contracts. ✅\n")
+    tools = ",".join(tool["toolId"] for tool in a["toolsSelected"]) or "none"
+    print(
+        f"{fixture.name}: workflow={wf} triage={t['priorityTier']} "
+        f"tools={tools} verification={ver['verificationStatus']}"
+    )
+
+
+async def main() -> int:
+    fixture_dir = ROOT / "mocks" / "fixtures"
+    if len(sys.argv) > 2:
+        print(f"Usage: python {Path(__file__).as_posix()} [fixture.json]", file=sys.stderr)
+        return 2
+
+    fixtures = [Path(sys.argv[1])] if len(sys.argv) == 2 else sorted(
+        fixture_dir.glob("studycontext.*.json")
+    )
+    if not fixtures:
+        print(f"No StudyContext fixtures found in {fixture_dir}", file=sys.stderr)
+        return 1
+
+    triage = load_handler("worklist-triage")
+    ehr = load_handler("ehr-assistant")
+    interp = load_handler("interpretation-assistant")
+    impression = load_handler("impression-generation")
+    impression.__globals__["_FHIR"] = _DemoFhir()  # inject the fhir2 the handler fetches from (#16)
+    verify = load_handler("report-verification")
+    verify.__globals__["_FHIR"] = _DemoFhir()  # verify parses report.body from the same conclusion (#22)
+    handlers = triage, ehr, interp, impression, verify
+
+    failures = 0
+    for fixture in fixtures:
+        try:
+            await run_fixture(fixture, handlers)
+        except Exception as exc:
+            failures += 1
+            print(f"{fixture}: FAILED: {exc}", file=sys.stderr)
+
+    if failures:
+        print(f"\nValidation failed for {failures} of {len(fixtures)} fixture(s).", file=sys.stderr)
+        return 1
+
+    print(f"\nAll hops validated against /contracts. ✅ {len(fixtures)} fixture(s) checked.\n")
     return 0
 
 
