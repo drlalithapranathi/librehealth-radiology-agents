@@ -1,7 +1,8 @@
-"""Ingress patient/order resolution via fhir2 (issue #11).
+"""Ingress patient/order resolution via the radiology module REST (issues #11, #70).
 
-`_build_study_context` now resolves the real patient + order from the accession via fhir2, with a
-graceful fallback to `Patient/UNRESOLVED` so ingestion never fails the PACS. A stable-event re-fire
+`_build_study_context` resolves the real patient + order from the accession via the module's
+`radiologyorder` REST search (fhir2 cannot search ServiceRequest by accession), with a graceful
+fallback to `Patient/UNRESOLVED` so ingestion never fails the PACS. A stable-event re-fire
 repairs an UNRESOLVED first pass by re-indexing the (now-resolved) ServiceRequest join, with no
 restart.
 
@@ -44,15 +45,15 @@ async def mock_escalate(workflow_id: str, reason: str) -> None:
     return None
 
 
-class _FakeFhir:
-    """Stand-in for Fhir2Client: `result` is returned by resolve_order_by_accession; `error`, if
-    set, is raised (simulates fhir2 being down)."""
+class _FakeResolver:
+    """Stand-in for the OpenMRS-REST order resolver: `result` is returned by
+    resolve_radiology_order_by_accession; `error`, if set, is raised (simulates OpenMRS being down)."""
     def __init__(self, result=None, error=None):
         self.result = result
         self.error = error
         self.calls: list[str] = []
 
-    async def resolve_order_by_accession(self, accession: str):
+    async def resolve_radiology_order_by_accession(self, accession: str):
         self.calls.append(accession)
         if self.error is not None:
             raise self.error
@@ -97,7 +98,7 @@ def _reset_ingress_globals():
             pass
         ingress._STORE = None
     ingress._client = None
-    ingress._FHIR = None
+    ingress._OPENMRS_REST = None
     ingress._ORTHANC = None
 
 
@@ -111,7 +112,7 @@ async def _await_state(handle, target: str, tries: int = 400) -> None:
 
 # --- unit: resolution and its fallbacks ------------------------------------
 def test_build_context_populates_real_patient_and_order():
-    ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._OPENMRS_REST = _FakeResolver(result=RESOLVED)
     ingress._ORTHANC = _FakeOrthanc()
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["patient"] == {"fhirPatientId": "Patient/pat-1"}
@@ -119,7 +120,7 @@ def test_build_context_populates_real_patient_and_order():
 
 
 def test_build_context_falls_back_when_fhir2_down():
-    ingress._FHIR = _FakeFhir(error=RuntimeError("fhir2 unreachable"))
+    ingress._OPENMRS_REST = _FakeResolver(error=RuntimeError("fhir2 unreachable"))
     ingress._ORTHANC = _FakeOrthanc()
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     # Never fail the PACS: still a valid StudyContext, just the UNRESOLVED placeholder.
@@ -128,7 +129,7 @@ def test_build_context_falls_back_when_fhir2_down():
 
 
 def test_build_context_falls_back_on_miss():
-    ingress._FHIR = _FakeFhir(result=None)
+    ingress._OPENMRS_REST = _FakeResolver(result=None)
     ingress._ORTHANC = _FakeOrthanc()
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["patient"] == {"fhirPatientId": "Patient/UNRESOLVED"}
@@ -151,7 +152,7 @@ RESOLVED_STAT = {
 
 
 def test_build_context_carries_the_signals_triage_scores_on():
-    ingress._FHIR = _FakeFhir(result=RESOLVED_STAT)
+    ingress._OPENMRS_REST = _FakeResolver(result=RESOLVED_STAT)
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["order"] == {
         "fhirServiceRequestId": "ServiceRequest/sr-dup",
@@ -164,7 +165,7 @@ def test_build_context_carries_the_signals_triage_scores_on():
 
 
 def test_build_context_omits_signals_an_order_does_not_have():
-    ingress._FHIR = _FakeFhir(result={k: RESOLVED_STAT[k]
+    ingress._OPENMRS_REST = _FakeResolver(result={k: RESOLVED_STAT[k]
                                       for k in ("fhirPatientId", "fhirServiceRequestId")})
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["order"] == {"fhirServiceRequestId": "ServiceRequest/sr-dup"}
@@ -183,7 +184,7 @@ def test_refire_repairs_serviceRequest_join(tmp_path):
                 ingress._client = env.client
 
                 # Event 1: fhir2 is DOWN -> UNRESOLVED, accession-only index.
-                ingress._FHIR = _FakeFhir(error=RuntimeError("fhir2 down"))
+                ingress._OPENMRS_REST = _FakeResolver(error=RuntimeError("fhir2 down"))
                 ingress._ORTHANC = _FakeOrthanc()
                 assert await ingress.orthanc_webhook(dict(EVENT)) == {"started": WF_ID}
                 # The robust ServiceRequest join does NOT exist yet...
@@ -197,7 +198,7 @@ def test_refire_repairs_serviceRequest_join(tmp_path):
 
                 # Event 2 (re-fire): fhir2 is BACK -> duplicate 200, and the SR join is repaired
                 # in place (no restart of the already-running workflow).
-                ingress._FHIR = _FakeFhir(result=RESOLVED)
+                ingress._OPENMRS_REST = _FakeResolver(result=RESOLVED)
                 assert await ingress.orthanc_webhook(dict(EVENT)) == {"started": WF_ID, "duplicate": True}
                 assert ingress._workflow_id_for_report(
                     {"serviceRequestRef": "ServiceRequest/sr-dup"}) == WF_ID
@@ -214,7 +215,7 @@ def test_refire_repairs_serviceRequest_join(tmp_path):
 # back, and so every live study reached the registry with "" and got the generic tool. The
 # interpretation agent's tests were green throughout: every fixture hand-writes a studyDescription.
 def test_build_context_carries_the_description_the_registry_selects_on():
-    ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._OPENMRS_REST = _FakeResolver(result=RESOLVED)
     ingress._ORTHANC = _FakeOrthanc(description="CT HEAD WITHOUT CONTRAST")
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert ctx["study"]["studyDescription"] == "CT HEAD WITHOUT CONTRAST"
@@ -223,7 +224,7 @@ def test_build_context_carries_the_description_the_registry_selects_on():
 
 
 def test_build_context_omits_the_description_when_orthanc_has_none():
-    ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._OPENMRS_REST = _FakeResolver(result=RESOLVED)
     ingress._ORTHANC = _FakeOrthanc(description="")
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     # Absent, not "": the key says "unknown", an empty string would assert "no description".
@@ -234,7 +235,7 @@ def test_build_context_omits_the_description_when_orthanc_has_none():
 def test_build_context_still_starts_when_orthanc_is_down():
     # Orthanc down costs the study its body-region tools. Failing the webhook would cost it the
     # whole workflow -- ingestion must never fail the PACS (#11).
-    ingress._FHIR = _FakeFhir(result=RESOLVED)
+    ingress._OPENMRS_REST = _FakeResolver(result=RESOLVED)
     ingress._ORTHANC = _FakeOrthanc(error=RuntimeError("orthanc unreachable"))
     ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
     assert "studyDescription" not in ctx["study"]

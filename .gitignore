@@ -14,3 +14,6 @@ build/
 ingress_state.db
 ingress_state.db-wal
 ingress_state.db-shm
+
+# OpenMRS DB seed snapshots (data, not code; may carry PHI/MIMIC per DUA)
+docker/openmrs/seed/*.sql.gz
