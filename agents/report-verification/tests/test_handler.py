@@ -84,6 +84,65 @@ async def test_critical_in_body_but_unflagged_warns():
     assert "critical-finding-unflagged" in _rule_ids(out)
 
 
+async def test_pertinent_negative_body_does_not_warn_or_fail():
+    """#78 acceptance (verification side): a normal report of pertinent negatives must NOT trip the
+    unflagged-critical WARN. Before the negation window, "No pneumothorax..." matched the term, and
+    since the impression carried no flag, this rule WARNed on every normal study."""
+    out = await handle("report.verify", {
+        "studyContext": SAMPLE_CONTEXT,
+        "report": {"conclusion": "IMPRESSION: No pneumothorax, pleural effusion, or focal consolidation."},
+        "impression": {"impressionText": "No acute cardiopulmonary process.",
+                       "criticalFlags": [], "recommendations": []},
+    })
+    validate_skill_output("report.verify", out)
+    assert "critical-finding-unflagged" not in _rule_ids(out)
+    assert out["verificationStatus"] == "PASS"
+
+
+async def test_indication_naming_the_suspicion_does_not_warn():
+    """#78 regression (reproduced): the rule scanned the WHOLE narrative including the INDICATION section, so
+    "evaluate for pneumothorax" re-flagged every normal study ordered to exclude it. The scan is
+    scoped to the finding-bearing sections (falling back to full text only when no headers parse)."""
+    out = await handle("report.verify", {
+        "studyContext": SAMPLE_CONTEXT,
+        "report": {"conclusion": ("INDICATION: Chest pain, evaluate for pneumothorax.\n"
+                                  "FINDINGS: Lungs are clear.\n"
+                                  "IMPRESSION: No pneumothorax.")},
+        "impression": {"impressionText": "No acute findings.", "criticalFlags": [], "recommendations": []},
+    })
+    validate_skill_output("report.verify", out)
+    assert "critical-finding-unflagged" not in _rule_ids(out)
+    assert out["verificationStatus"] == "PASS"
+
+
+async def test_a_finding_in_the_preheader_preamble_still_warns():
+    """#78 regression (reproduced): report_body.split_sections drops text before the first header, so a
+    finding dictated ahead of the headers went unscanned. The rule scans via the shared
+    scannable_text, which keeps the preamble."""
+    out = await handle("report.verify", {
+        "studyContext": SAMPLE_CONTEXT,
+        "report": {"conclusion": ("Large right pneumothorax.\n"
+                                  "COMPARISON: None available.\n"
+                                  "IMPRESSION: No acute cardiopulmonary process.")},
+        "impression": {"impressionText": "Stable.", "criticalFlags": [], "recommendations": [{"text": "x"}]},
+    })
+    validate_skill_output("report.verify", out)
+    assert "critical-finding-unflagged" in _rule_ids(out)
+
+
+async def test_a_stable_but_present_finding_in_the_body_still_warns():
+    """#78 regression (reproduced false negative): "no significant change in the large
+    pneumothorax" is standard dictation for a PRESENT finding -- the WARN must fire when the
+    impression carries no flag."""
+    out = await handle("report.verify", {
+        "studyContext": SAMPLE_CONTEXT,
+        "report": {"conclusion": "FINDINGS: No significant change in the large pneumothorax."},
+        "impression": {"impressionText": "Stable.", "criticalFlags": [], "recommendations": [{"text": "x"}]},
+    })
+    validate_skill_output("report.verify", out)
+    assert "critical-finding-unflagged" in _rule_ids(out)
+
+
 async def test_findings_without_impression_warns():
     out = await handle("report.verify", {
         "studyContext": SAMPLE_CONTEXT,
