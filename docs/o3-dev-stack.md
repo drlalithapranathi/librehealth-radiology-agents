@@ -87,19 +87,26 @@ state, so the compose file was hardened (#72):
   - `comms-ledger-data` — the comms ledger's file-based H2, the
     clinical-communication audit trail.
   - `mariadb-data`, `orthanc-db`, `temporal-pg-data`, `worklist-api-db` as before.
-  A plain `docker compose down` (no `-v`) stops containers but keeps all of these,
-  so `up` resumes where it left off.
+  A plain `docker compose down` (no `-v`) keeps all of these volumes, so the DURABLE
+  services (orthanc, the ledger, temporal, the ingress store) resume where they left
+  off — but `openmrs` does NOT: `up` recreates its container against the populated
+  `mariadb-data` volume, which is exactly the wedge above. After a full `down`, bring
+  OpenMRS back wedge-aware: clean `down -v` boot, or the seed fast-restore.
 
 - **The OpenMRS/mariadb wedge still applies** (see the section above): never
   recreate `openmrs` against a reused `mariadb-data` volume. When you deliberately
   want a clean slate, `down -v` and boot clean — accepting that it also clears the
   ingress store and comms ledger.
 
-- **Restart policy.** The long-lived services (`openmrs`, `orthanc`, `ohif`,
-  `orchestrator`, `comms-ledger`, `worklist-api`) run `restart: unless-stopped`, so
-  the demo host recovers them across a crash or a host reboot without intervention.
-  `presign-concept-bootstrap` is `restart: "no"` on purpose — it is a one-shot that
-  runs to completion each `up` and is idempotent.
+- **Restart policy.** The long-lived app services (`orthanc`, `ohif`, `orchestrator`,
+  `comms-ledger`, `worklist-api`) run `restart: unless-stopped`, so the demo host
+  recovers them across a crash or a host reboot without intervention. **`openmrs` and
+  `mariadb` deliberately carry NO restart policy**: an automatic restart re-runs the
+  OpenMRS module startup against the populated volume, which is the wedge described
+  above — after a host reboot, bring them back deliberately (clean boot, or the seed
+  fast-restore) rather than letting Docker loop them into a wedged state. The
+  one-shots (`presign-concept-bootstrap`, `comms-ledger-init`) are `restart: "no"` on
+  purpose — each runs to completion every `up` and is idempotent.
 
 - **Images are pinned to digests** (`name:tag@sha256:...`) so the demo host cannot
   drift under a re-pushed tag. Bump a digest deliberately when adopting a new build;

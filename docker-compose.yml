@@ -223,8 +223,9 @@ services:
       # comms-ledger-data volume, so Communication/Task audit records survive `down && up`.
       # DB_CLOSE_DELAY=-1 keeps the DB open between pooled connections; DB_CLOSE_ON_EXIT=FALSE keeps
       # the file intact on JVM shutdown. The comms-ledger.mv.db file under /data/hapi is what
-      # persists. NOTE: verify the `down && up` persistence acceptance test on a live stack -- this
-      # HAPI datasource override is config-only and was not runnable in the authoring environment.
+      # persists. Live-verified on the demo stack; needs comms-ledger-init below (the image runs as
+      # uid 65532 and cannot write a root-owned fresh volume -- found as a live crash-loop:
+      # AccessDeniedException on /data/hapi/comms-ledger.trace.db, 23 restarts).
       spring.datasource.url: "jdbc:h2:file:/data/hapi/comms-ledger;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE"
       spring.datasource.username: sa
       spring.datasource.password: ""
@@ -239,15 +240,37 @@ services:
     restart: unless-stopped
     volumes:
       - comms-ledger-data:/data/hapi
+    depends_on:
+      comms-ledger-init:
+        condition: service_completed_successfully
+
+  # One-shot volume-permission init for the ledger (#72). The hapi image is distroless and runs as
+  # uid 65532 (nonroot), but a freshly created named volume is root-owned -- so the file-H2 above
+  # crash-loops on AccessDeniedException before its first write (observed live: 23 restarts).
+  # Same one-shot idiom as presign-concept-bootstrap: runs to completion each `up`, idempotent.
+  # Hardened to its minimum authority: it must run as root to chown, so everything else is taken
+  # away -- no network, no capability beyond CAP_CHOWN, a read-only root fs (the volume is its only
+  # writable surface), and no privilege escalation. Its whole life is one chown, then exit.
+  comms-ledger-init:
+    image: alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b   # pinned (#72); digest wins, tag is a label
+    command: ["chown", "-R", "65532:65532", "/data/hapi"]
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - comms-ledger-data:/data/hapi
 
   # --- Tracing backend (#28), opt-in: `docker compose --profile otel up` -----------
   # Jaeger all-in-one = OTLP receiver + storage + UI in one container. It only starts under the
   # `otel` profile, so the default stack is byte-for-byte unchanged. 4318 = OTLP/HTTP, which is
   # what init_tracing()'s exporter speaks (opentelemetry.exporter.otlp.proto.http).
   jaeger:
-    # Explicit version (acceptable per #72). Opt-in via the `otel` profile, so it is not in the
-    # default demo path and was not pulled in the authoring env to read a digest; digest-pin this
-    # too if the showcase ever runs with tracing on.
+    # Explicit version (acceptable per #72): opt-in via the `otel` profile, so it is not in the
+    # default demo path. Digest-pin this too if the showcase ever runs with tracing on.
     image: jaegertracing/all-in-one:1.62.0
     profiles: ["otel"]
     environment:
