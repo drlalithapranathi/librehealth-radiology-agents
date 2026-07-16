@@ -102,3 +102,39 @@ def test_result_is_2d_float_regardless_of_stored_integer_type():
     out = dicom_to_greyscale(_dicom(PIXELS))
     assert out.ndim == 2
     assert out.dtype == np.float32
+
+
+def test_multiframe_colour_still_collapses_to_a_2d_frame():
+    """A multi-frame colour object is (frames, H, W, 3) -- ndim 4 -- so it used to fall into the
+    bare multi-frame branch and come back as frame 0 STILL COLOUR (H, W, 3), breaking the 2-D
+    contract: the model's centre-crop then dies and the handler misreports a MODEL failure on
+    what is just a clip in the study. Frame first, then the colour collapse."""
+    frame0 = np.array([[[255, 0, 0], [0, 255, 0]],
+                       [[0, 0, 255], [255, 255, 255]]], dtype=np.uint8)
+    arr = np.stack([frame0, np.zeros_like(frame0)])   # frame 1 all-black: proves frame 0 is taken
+
+    ds = Dataset()
+    ds.file_meta = FileMetaDataset()
+    ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds.file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7.4"  # multi-frame colour SC
+    ds.file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    ds.SOPClassUID = "1.2.840.10008.5.1.4.1.1.7.4"
+    ds.SOPInstanceUID = ds.file_meta.MediaStorageSOPInstanceUID
+    ds.Modality = "OT"
+    ds.PhotometricInterpretation = "RGB"
+    ds.SamplesPerPixel = 3
+    ds.PlanarConfiguration = 0
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.PixelRepresentation = 0
+    ds.NumberOfFrames = 2
+    ds.Rows, ds.Columns = 2, 2
+    ds.PixelData = arr.tobytes()
+    buf = io.BytesIO()
+    ds.save_as(buf, enforce_file_format=True)
+
+    out = dicom_to_greyscale(buf.getvalue())
+    assert out.ndim == 2 and out.shape == (2, 2)
+    # BT.601 luminance of frame 0's bottom-right white pixel; the all-black frame 1 would be 0.
+    assert out[1][1] == pytest.approx(255.0, abs=0.5)

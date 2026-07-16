@@ -66,12 +66,14 @@ def dicom_to_greyscale(dicom_bytes: bytes) -> "np.ndarray":
     arr = ds.pixel_array  # may raise if the transfer syntax needs a codec we lack -- let it
     arr = np.asarray(arr)
 
+    if arr.ndim == 4:
+        arr = arr[0]  # multi-frame colour (frames, H, W, C) -> first frame, THEN collapse colour
     if arr.ndim == 3 and arr.shape[-1] in (3, 4):
         # Colour (e.g. an RGB secondary capture). Luminance, so a screenshot in the study does not
         # crash the tool -- ITU-R BT.601, the same weights DICOM uses for YBR conversion.
         arr = arr[..., :3] @ np.array([0.299, 0.587, 0.114])
     elif arr.ndim > 2:
-        arr = arr[0]  # multi-frame -> first frame
+        arr = arr[0]  # multi-frame greyscale -> first frame
 
     arr = arr.astype(np.float32)
 
