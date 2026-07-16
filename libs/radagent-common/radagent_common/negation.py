@@ -80,9 +80,12 @@ _ADVERSATIVE = re.compile(
 # too broad ("not only a pneumothorax but...") and would suppress real findings.
 # ORDER IS LOAD-BEARING: re alternation is first-listed-wins at a given position, so the longer
 # "no evidence of / no signs of" phrases are listed BEFORE the bare "no" and win -- which matters
-# because the cue's END feeds the meta-noun window in _cue_is_void ("no evidence of interval
-# change in the pneumothorax" only voids with the long cue). Either way a plain negative
-# suppresses; the long forms exist so the window starts after the whole phrase.
+# because the cue's END feeds the meta-noun {0,4}-qualifier window in _cue_is_void. The effect
+# shows once the long cue's words would exhaust that window: "no evidence of definite significant
+# interval change in the pneumothorax" voids (asserts the pneumothorax) with the long cue, but
+# under bare-"no"-first the five intervening words overrun the window and the sentence would
+# wrongly suppress. Either way a plain negative suppresses; the long forms exist so the window
+# starts after the whole phrase.
 _PRE_NEGATION = re.compile(
     r"\b(?:no\s+evidence\s+(?:of|for)|no\s+(?:sign|signs)\s+of|no|without|negative\s+for|"
     r"free\s+of|absence\s+of|rule\s+out|ruled\s+out|r/o)\b", re.I)
@@ -287,6 +290,30 @@ _HEADER_RE = re.compile(r"(?i)\b(" + "|".join(re.escape(h) for h in _ALL_HEADERS
 _SUB_HEADER_RE = re.compile(r"(?m)^[ \t]*([A-Z][A-Za-z /-]{1,30}?)" + _HEADER_SEP)
 
 
+def _clamped_skip_end(text: str, body_start: int, hard_end: int) -> int:
+    """Where a skipped section's PROVABLE content ends: its header line plus hard-wrap
+    continuations.
+
+    A skip section must not swallow everything to the next header: a short report that dictates
+    the finding WITHOUT a FINDINGS header, after a trailing INDICATION/COMPARISON/TECHNIQUE line
+    ("COMPARISON: None available.\\nLarge right tension pneumothorax..."), would positionally
+    attribute the finding to the skip section and delete it -- a reproduced under-flag, the
+    failure class this module exists to prevent. So the skip consumes further lines only while
+    they are hard-wrap continuations (the previous line did not finish a sentence); a blank line,
+    or a new line after a completed sentence, is no longer provably the section's own prose and
+    is scanned instead (doubt resolves toward scanning).
+    """
+    lines = text[body_start:hard_end].split("\n")
+    end_offset = len(lines[0])
+    prev = lines[0]
+    for line in lines[1:]:
+        if not line.strip() or prev.rstrip().endswith((".", ";")):
+            break
+        end_offset += 1 + len(line)
+        prev = line
+    return body_start + end_offset
+
+
 def scannable_text(narrative: str) -> str:
     """The finding-bearing portion of a report narrative, for the critical-term scanners.
 
@@ -295,10 +322,12 @@ def scannable_text(narrative: str) -> str:
     describes the PRIOR study. Unknown headers (organ sub-headers like "CHEST:", or a template's
     per-finding headers like "PNEUMOTHORAX:") both TERMINATE a skipped section and have their
     content kept WITH the header name -- a template header can itself carry the finding
-    ("PNEUMOTHORAX: Large, under tension"). Only what is provably non-finding text is dropped;
-    every doubt resolves toward scanning (the safe direction). Without headers: the text
-    unchanged. Text before the first header is kept for the same reason. Sections are joined with
-    a period so one section's clause can never leak negation into the next.
+    ("PNEUMOTHORAX: Large, under tension"). A skipped section only spans its own header line and
+    hard-wrap continuations (see _clamped_skip_end); anything after that within its span is kept.
+    Only what is provably non-finding text is dropped; every doubt resolves toward scanning (the
+    safe direction). Without headers: the text unchanged. Text before the first header is kept
+    for the same reason. Sections are joined with a period so one section's clause can never leak
+    negation into the next.
     """
     text = narrative or ""
     seen_starts: set[int] = set()
@@ -317,9 +346,14 @@ def scannable_text(narrative: str) -> str:
     if preamble:
         parts.append(preamble)
     for i, (start, body_start, name, known) in enumerate(boundaries):
-        if name in _SKIP_SECTIONS:
-            continue
         end = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(text)
+        if name in _SKIP_SECTIONS:
+            # Keep what the skip cannot prove is its own (a finding dictated after the section's
+            # last line, with no header of its own).
+            tail = text[_clamped_skip_end(text, body_start, end):end].strip()
+            if tail:
+                parts.append(tail)
+            continue
         # An unknown header's NAME is content ("PNEUMOTHORAX: Large..."); a known structural
         # header's ("FINDINGS:") is not.
         body = (text[start:end] if not known else text[body_start:end]).strip()

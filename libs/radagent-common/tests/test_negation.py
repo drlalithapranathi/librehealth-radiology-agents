@@ -179,6 +179,42 @@ def test_scannable_text_keeps_the_preamble_before_the_first_header():
     assert "Large pneumothorax." in scannable_text(narrative)
 
 
+def test_finding_dictated_after_a_trailing_skip_header_is_still_scanned():
+    """Reproduced under-flag: a short report with skip headers but NO FINDINGS header dictates
+    the finding as bare trailing text. Positionally it sits inside the last skip section, and
+    dropping it to end-of-text silenced a tension pneumothorax that an unscoped scan flagged --
+    the exact failure class this module must never introduce. A skip section owns only its header
+    line (plus hard-wrap continuations); a new sentence on a new line is scanned."""
+    narrative = (
+        "INDICATION: Trauma.\n"
+        "COMPARISON: None available.\n"
+        "Large right tension pneumothorax with mediastinal shift."
+    )
+    assert find_asserted_terms(scannable_text(narrative), TERMS) == ["pneumothorax"]
+
+    # Same shape with the skip header in the MIDDLE of the report.
+    narrative2 = (
+        "FINDINGS: Limited exam.\n"
+        "TECHNIQUE: Portable AP.\n"
+        "Large right pneumothorax is new."
+    )
+    assert find_asserted_terms(scannable_text(narrative2), TERMS) == ["pneumothorax"]
+
+
+def test_hard_wrapped_skip_section_content_stays_skipped():
+    """The clamp must not undo the skip's purpose: a MIMIC-style hard-wrapped indication whose
+    sentence continues onto the next line is still the indication -- 'concern for pneumothorax'
+    is a suspicion, not a finding, wherever the line breaks."""
+    narrative = (
+        "INDICATION: 55M with chest pain, concern for\n"
+        "pneumothorax after fall.\n"
+        "FINDINGS: Lungs are clear."
+    )
+    scoped = scannable_text(narrative)
+    assert "concern for" not in scoped and "after fall" not in scoped
+    assert find_asserted_terms(scoped, TERMS) == []
+
+
 # --- reproduced-false-result regressions, second sweep: found against the once-fixed module ----
 
 def test_hedged_rule_out_with_intervening_adverbs_asserts():
