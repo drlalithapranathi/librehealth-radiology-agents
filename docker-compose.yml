@@ -215,12 +215,13 @@ services:
       # Verified end-to-end against this HAPI image (create + for-alias + read-modify-write +
       # search-by-based-on + audit join, all green).
       hapi.fhir.auto_create_placeholder_reference_targets: "true"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/fhir/metadata"]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 90s
+    # NO healthcheck -- deliberately. hapiproject/hapi is distroless (the entrypoint is `java`
+    # itself; no curl, no shell), so ANY exec-form probe fails with "executable file not found"
+    # and the container sits permanently `unhealthy` while serving fine (the previous curl check
+    # did exactly that, and once #69 gated dependents on service_healthy, nothing downstream
+    # could ever start). Readiness lives where a probe can actually run: the on-call seed polls
+    # /fhir/metadata before writing, and the agent's ledger client is lazy behind Temporal's
+    # unbounded COMMUNICATE retry.
     restart: unless-stopped
 
   # --- Tracing backend (#28), opt-in: `docker compose --profile otel up` -----------
@@ -346,6 +347,9 @@ services:
       dockerfile: agents/communications/Dockerfile
     ports: ["8106:8106"]
     environment:
+      # #28 tracing: every app service carries the anchor, and the terminal COMMUNICATE stage
+      # must not be the one hop that goes dark in a study's trace.
+      <<: *otel-env
       COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
       FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
       FHIR2_BASIC_USER: admin
@@ -360,7 +364,10 @@ services:
       # loops 60m), so none are overridden here.
     depends_on:
       comms-ledger:
-        condition: service_healthy
+        # service_started, NOT service_healthy: the distroless HAPI image cannot host a probe
+        # (see comms-ledger above), so a health gate here never opens. The agent tolerates a
+        # still-booting ledger -- its client is lazy and COMMUNICATE retries unbounded.
+        condition: service_started
     restart: unless-stopped
 
   # One-shot on-call directory seed (#69): one general-radiology Practitioner + an active
@@ -381,7 +388,9 @@ services:
       - "pip install --quiet --no-cache-dir httpx==0.27.2 && python /opt/seed_oncall.py"
     depends_on:
       comms-ledger:
-        condition: service_healthy
+        # service_started, NOT service_healthy (no probe fits the distroless HAPI image -- see
+        # comms-ledger above); the seed does its own readiness wait against /fhir/metadata.
+        condition: service_started
     restart: "no"
 
 volumes:

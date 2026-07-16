@@ -16,10 +16,31 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import httpx
 
 BASE = os.environ.get("COMMS_LEDGER_BASE_URL", "http://comms-ledger:8080/fhir").rstrip("/")
+
+
+def wait_for_ledger(client: httpx.Client, tries: int = 60, delay: float = 5.0) -> None:
+    """Poll /metadata until the ledger answers 200.
+
+    The compose gate on this one-shot is only `service_started`: the distroless HAPI image can't
+    host a healthcheck probe (no curl, no shell), so THIS loop is where readiness actually
+    lives. 60 x 5s covers a cold HAPI schema build with room to spare; a ledger that is still
+    down after that is a real failure the operator must see, not paper over.
+    """
+    for attempt in range(1, tries + 1):
+        try:
+            if client.get(f"{BASE}/metadata").status_code == 200:
+                return
+            print(f"ledger up but not ready, attempt {attempt}/{tries}", flush=True)
+        except httpx.HTTPError as e:
+            print(f"ledger not reachable ({type(e).__name__}), attempt {attempt}/{tries}",
+                  flush=True)
+        time.sleep(delay)
+    raise SystemExit("comms-ledger never became ready; on-call directory NOT seeded")
 
 PRACTITIONER = {
     "resourceType": "Practitioner",
@@ -50,6 +71,7 @@ def put(client: httpx.Client, resource: dict) -> None:
 
 def main() -> int:
     with httpx.Client(timeout=30) as client:
+        wait_for_ledger(client)
         put(client, PRACTITIONER)
         put(client, ROLE)
     print("on-call directory seeded; idempotent per `up`.")
