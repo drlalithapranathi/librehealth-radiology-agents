@@ -159,7 +159,7 @@ ris-poller-tests:
     # are the ONLY tests that exercise the real get_study_description, and without them CI would
     # stay green if the method were deleted. (Needs no extra deps: httpx is a core dep and the
     # file drives async via asyncio.run, not pytest-asyncio.)
-    - pip install -e "libs/radagent-common[a2a,otel]" "temporalio==1.29.0" fastapi pytest
+    - pip install -e "libs/radagent-common[a2a,otel,imaging]" "temporalio==1.29.0" fastapi pytest
     - >
       python -m pytest
       libs/radagent-common/tests/test_fhir_client.py
@@ -169,6 +169,7 @@ ris-poller-tests:
       libs/radagent-common/tests/test_fhir_models.py
       libs/radagent-common/tests/test_comms_ledger.py
       libs/radagent-common/tests/test_orthanc_client.py
+      libs/radagent-common/tests/test_orthanc_client_write.py
       libs/radagent-common/tests/test_tracing.py
       libs/radagent-common/tests/test_presign_concept_drift.py
       orchestrator/tests -q

@@ -20,6 +20,15 @@ dependencies = [
 # churns hard (0.3 pydantic -> 1.0 protobuf rewrite; see a2a.py). [http-server] pulls starlette.
 # This is the single source of truth for the a2a-sdk pin.
 a2a = ["a2a-sdk[http-server]==1.0.3"]
+# DICOM imaging (radagent_common.orthanc_client write path, #59). Optional because the read-only
+# lib works without any DICOM parsing -- only agents that WRITE evidence captures need pydicom.
+# pydicom 3.x is a real API break from 2.x (transfer-syntax-derived endianness, enforce_file_format
+# renamed) so this pin floors at 3.0 to stop `pip install pydicom` from resolving a 2.x line that
+# would emit deprecation warnings at import time. numpy for the pixel array.
+imaging = [
+  "pydicom>=3.0",
+  "numpy>=1.24",
+]
 # OpenTelemetry tracing (#28). Optional: the core lib + handler tests never touch OTel — only the
 # worker/ingress entrypoints (and the compose stack) install this. tracing.init_tracing imports it
 # lazily. The Temporal TracingInterceptor lives in temporalio.contrib.opentelemetry and only needs
