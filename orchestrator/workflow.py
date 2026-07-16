@@ -794,8 +794,22 @@ class StudyWorkflow:
         override, which waives an UNCHANGED report, this REPLACES the report, so a genuinely
         corrected one can now legitimately PASS. The event is the same lean, PHI-free shape
         report_finalized carries (see finalized_report_record); status distinguishes them.
+
+        DELIVERY BEFORE THE REPORT GATE: when this is the poller's FIRST sighting of the study's
+        report -- the radiologist signed and corrected within one poll interval, a poller/fhir2
+        outage spanned both events, or the sign-off predates a fresh-start cursor -- the resource
+        only ever shows status amended, report_finalized never fires, and the report gate would
+        wait forever with the corrected report buffered here. In that case the addendum IS the
+        signed report: satisfy the gate with it. Replay-safe without a patch marker: a pre-fix
+        history that recorded this signal after report_finalized takes the else-branch (identical
+        to the old behaviour), and one stranded AT the gate recorded no commands after the signal,
+        so the new commands are a live continuation past its recorded edge -- the same property
+        the gate-release path above relies on.
         """
-        self._report_addendum = event
+        if self._report_event is None:
+            self._report_event = event
+        else:
+            self._report_addendum = event
 
     @workflow.signal
     def skill_completed(self, event: dict) -> None:

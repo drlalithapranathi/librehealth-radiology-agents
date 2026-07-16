@@ -144,7 +144,8 @@ def test_gate_releases_after_ingress_restart(tmp_path):
                 # the mapping survived the restart — the whole point:
                 assert ingress._workflow_id_for_report(report) == STUDY_CONTEXT["workflowId"]
                 newly, _failed = await ingress._process_batch(env.client, [report], set())
-                assert newly == {"DiagnosticReport/r1"}
+                # dedup keys are id@lastUpdatedCursor (#66); this record carries no stamp
+                assert newly == {"DiagnosticReport/r1@"}
                 result = await handle.result()  # gate released -> runs to ARCHIVED
                 # once COMPLETED, reconciliation reclaims the study's index row (evict on completion)
                 assert await ingress._reconcile_index(env.client) == 1
