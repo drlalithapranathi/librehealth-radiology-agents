@@ -17,8 +17,10 @@
 # it is on call. The two values fail in opposite directions (issue #58 item 3):
 #   any-on-call -- page whoever is on call and stamp the Communication out-of-specialty, so
 #                  someone hears it and the record says it was the wrong someone.
-#   none        -- page nobody from here; the dispatch reports the miss honestly and the
-#                  orchestrator's #29 sign-off ladder escalates to a human instead.
+#   none        -- page nobody from here: the dispatch reports the miss honestly (SKIPPED /
+#                  escalated: false) and the workflow archives it. NOTHING re-pages in response
+#                  -- the #29 ladder is the pre-sign gate, decoupled from dispatch -- so a
+#                  `none` site accepts that a miss is only as loud as its ledger/log record.
 schemaVersion: "1.0.0"
 outOfSpecialtyFallback: any-on-call
 

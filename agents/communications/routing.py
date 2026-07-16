@@ -29,7 +29,7 @@ _log = logging.getLogger("agents.communications.routing")
 # The two directions the out-of-specialty fallback can fail in (issue #58 item 3). This default is
 # a starting point, not a ruling -- the dial is in the YAML precisely so the PI can set it.
 FALLBACK_ANY_ON_CALL = "any-on-call"  # page whoever is on call; the record says it was the wrong someone
-FALLBACK_NONE = "none"                # page nobody; the orchestrator's #29 ladder reaches a human instead
+FALLBACK_NONE = "none"                # page nobody; the miss is recorded (SKIPPED / escalated:false), nothing re-pages
 
 
 def _routing_path() -> Path:
@@ -65,7 +65,11 @@ def derive_specialty(study: dict) -> str | None:
         for rule in _config().get("rules") or []:
             if modality and modality in (m.upper() for m in rule.get("modalities") or []):
                 return rule["specialty"]
-            if description and any(k.lower() in description for k in rule.get("keywords") or []):
+            # `k and` guards a live-edited table with an empty keyword: "" is a substring of
+            # every description, which would route ALL studies here (CI's minLength only
+            # validates the in-repo file).
+            if description and any(k and k.lower() in description
+                                   for k in rule.get("keywords") or []):
                 return rule["specialty"]
     except Exception as e:  # noqa: BLE001 -- a malformed rule in a live-edited table; CI validates
         # the in-repo file, so degrade here rather than fail the dispatch (module docstring).

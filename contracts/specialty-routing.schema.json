@@ -12,7 +12,7 @@
     "outOfSpecialtyFallback": {
       "type": "string",
       "enum": ["any-on-call", "none"],
-      "description": "When a specialty is derived but nobody tagged for it is on call: `any-on-call` pages whoever is on call and stamps the Communication out-of-specialty; `none` pages nobody from the agent, so the orchestrator's sign-off ladder (#29) reaches a human instead. These fail in opposite directions -- a safety call, not an implementation detail."
+      "description": "When a specialty is derived but nobody tagged for it is on call: `any-on-call` pages whoever is on call and stamps the Communication out-of-specialty; `none` pages nobody from the agent -- the dispatch reports the miss honestly (SKIPPED / escalated:false) and the workflow archives it, with NO further automatic paging (the #29 sign-off ladder runs pre-sign and does not react to dispatch outcomes). These fail in opposite directions -- a safety call, not an implementation detail."
     },
     "rules": {
       "type": "array",

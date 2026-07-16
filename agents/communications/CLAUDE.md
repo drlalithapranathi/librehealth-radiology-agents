@@ -47,9 +47,11 @@ lists first. The mapping and the **out-of-specialty fallback dial** live in
 `specialty-routing.yaml` beside the agent (CI-validated against
 `contracts/specialty-routing.schema.json`; `SPECIALTY_ROUTING_PATH` overrides the path):
 `any-on-call` pages whoever is on call and stamps the Communication with an
-`http://critcom/routing|out-of-specialty` category; `none` pages nobody and lets the
-orchestrator's #29 ladder reach a human. The two fail in opposite directions — the dial is a
-safety call (issue #58 item 3), so change its default only with PI sign-off. An unmapped study
+`http://critcom/routing|out-of-specialty` category; `none` pages nobody — the miss is recorded
+(`SKIPPED` / `escalated: false`) and the study archives, with **no automatic human backstop**
+(the #29 ladder is the pre-sign gate and does not react to dispatch outcomes). The two fail in
+opposite directions — the dial is a safety call (issue #58 item 3), so change its default only
+with PI sign-off. An unmapped study
 searches unnarrowed (pre-#58 behaviour); the ordering-provider path never consults routing.
 
 ## v1 vs later

@@ -127,7 +127,8 @@ async def _dispatch(payload: dict) -> dict:
                      ", out of specialty" if out_of_specialty else "")
     if not recipient:
         # Nobody to tell, at all. SKIPPED is the honest answer -- reporting SENT would claim a page
-        # that never happened. The orchestrator's own #29 ladder still pages a human.
+        # that never happened. Nothing re-pages in response (the #29 ladder is the pre-sign gate,
+        # decoupled from dispatch): the miss lives in this log line and the workflow's record.
         _log.error("no recipient for a %s finding on %s", result.category.value, order_ref)
         return _out(
             payload,

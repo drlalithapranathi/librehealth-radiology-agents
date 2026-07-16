@@ -7,6 +7,8 @@ schema validation in scripts/validate_contracts.py.
 """
 import textwrap
 
+import yaml
+
 import routing
 from routing import FALLBACK_ANY_ON_CALL, derive_specialty, out_of_specialty_fallback
 
@@ -47,6 +49,20 @@ def test_first_matching_rule_wins(monkeypatch, tmp_path):
     """'CT head and chest' hits both the neuro and chest rules; file order decides."""
     _point_at(monkeypatch, tmp_path, TABLE)
     assert derive_specialty({"modality": "CT", "studyDescription": "CT head and chest"}) == "neuro"
+
+
+def test_an_empty_keyword_matches_nothing_not_everything(monkeypatch, tmp_path):
+    """`"" in description` is True for every non-empty description, so a live-edited table with
+    an empty keyword would silently route EVERY described study to that specialty. CI's
+    minLength only guards the in-repo file; the matcher itself must refuse the empty string."""
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: neuro
+            keywords: [""]
+    """)
+    assert derive_specialty({"modality": "US", "studyDescription": "US thyroid"}) is None
 
 
 def test_unmatched_study_gets_no_specialty(monkeypatch, tmp_path):
@@ -128,4 +144,7 @@ def test_the_shipped_table_loads_and_maps_the_canonical_cases(monkeypatch):
     assert routing._routing_path().is_file()
     assert derive_specialty({"modality": "MG"}) == "breast"
     assert derive_specialty({"modality": "CT", "studyDescription": "CT head"}) == "neuro"
-    assert out_of_specialty_fallback() in ("any-on-call", "none")
+    # Assert on the RAW parsed value, not out_of_specialty_fallback(): that function coerces
+    # every garbage input to a valid dial, so asserting on its return can never fail.
+    raw = yaml.safe_load(routing._routing_path().read_text())
+    assert raw["outOfSpecialtyFallback"] in ("any-on-call", "none")

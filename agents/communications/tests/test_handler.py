@@ -37,8 +37,16 @@ CRITICAL = {"criticalFlags": [{"label": "aortic dissection", "severity": "critic
 
 
 @pytest.fixture(autouse=True)
-def stores():
-    """Every test gets fresh doubles; no test ever reaches a real fhir2 or ledger."""
+def stores(monkeypatch, tmp_path):
+    """Every test gets fresh doubles; no test ever reaches a real fhir2 or ledger.
+
+    Routing is pinned to a hermetic table too (via _routing_table below): the no-requester and
+    escalate paths read the routing config on every call, so without the pin these tests would
+    read the shipped clinical YAML -- or whatever SPECIALTY_ROUTING_PATH happens to be set to in
+    the developer's shell -- and a legitimate table edit could break tests about unrelated
+    behaviour. SAMPLE_CONTEXT matches no rule in the pinned table, so non-#58 tests see the
+    pre-#58 unnarrowed search; the #58 tests re-point the table per test."""
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
     fhir, ledger = FakeFhir2(), FakeLedger()
     handler._FHIR, handler._LEDGER = fhir, ledger
     yield fhir, ledger
@@ -359,8 +367,8 @@ async def test_nobody_in_specialty_pages_any_on_call_and_stamps_the_record(store
 
 async def test_fallback_none_pages_nobody_and_reports_skipped(stores, monkeypatch, tmp_path):
     """The other direction of the dial: the policy says never page out of specialty, so the
-    dispatch reports the miss honestly (SKIPPED, nothing written) and the orchestrator's #29
-    ladder is what reaches a human."""
+    dispatch reports the miss honestly (SKIPPED, nothing written). Nothing re-pages in response
+    -- under `none` the miss is only as loud as this record."""
     _routing_table(monkeypatch, tmp_path, "none")
     fhir, ledger = stores
     fhir.requester = None
@@ -428,6 +436,24 @@ async def test_escalation_out_of_specialty_stamps_the_record_and_keeps_the_categ
     assert new_comm.category[0].coding[0].code == "Cat1"   # the re-derived urgency, still first
     assert _marker_codes(new_comm) == [OUT_OF_SPECIALTY]
     assert new_comm.finding_summary.startswith("[ESCALATED]")
+
+
+async def test_escalation_with_an_empty_directory_names_the_directory_not_the_policy(
+        stores, monkeypatch, tmp_path):
+    """Under any-on-call, an empty directory is an empty-directory miss. The reason must not
+    blame a policy that never declined anything -- the two are different audit facts, and this
+    is the only test that can tell escalate's two failure reasons apart."""
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
+    _, ledger = stores
+    sent = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+    ledger.on_call = None
+
+    out = await handle("comms.escalate", {"studyContext": NEURO_CONTEXT, "taskId": sent["taskId"]})
+    validate_skill_output("comms.escalate", out)
+    assert out["escalated"] is False
+    assert ledger.on_call_searches == ["neuro", None]   # narrowed miss, then the fallback tried
+    assert "configured in the ledger" in out["reason"]
+    assert "does not page out of specialty" not in out["reason"]
 
 
 async def test_escalation_under_fallback_none_reports_the_miss_honestly(stores, monkeypatch,

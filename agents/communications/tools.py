@@ -102,7 +102,10 @@ async def resolve_on_call_provider(
     intracranial finding should page neuro call, not whoever the directory lists first. When
     nobody in that specialty is on call, `fallback` picks the failure direction --
     FALLBACK_ANY_ON_CALL re-searches unnarrowed and marks the result out-of-specialty;
-    FALLBACK_NONE resolves nobody, so the orchestrator's #29 ladder reaches a human instead.
+    FALLBACK_NONE resolves nobody, so the caller reports the miss honestly instead of paging out
+    of specialty. Nothing downstream re-pages in response to that miss: the sign-off ladder
+    (#29) is the pre-sign gate, decoupled from dispatch, so under FALLBACK_NONE a miss is only
+    as loud as its ledger/log record.
 
     A None reference is a real answer, not an error: the caller must surface it (an
     unescalatable critical result is exactly the thing a human has to hear about) rather than
