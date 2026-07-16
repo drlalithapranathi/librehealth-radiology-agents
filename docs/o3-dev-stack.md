@@ -68,6 +68,15 @@ docker compose down -v
 docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d
 ```
 
+The seed only needs the **mariadb volume** empty. On the demo host, do NOT pay for that
+with `-v` (which also wipes the comms ledger and the ingress store — see Demo host ops):
+
+```
+docker compose down
+docker volume rm <compose-project>_mariadb-data     # docker volume ls to find the prefix
+docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d
+```
+
 Verified: a seeded boot reaches a usable server (200) in ~6 min vs ~16 min clean, and does
 NOT hit the initializer wedge (the seed carries the initializer/OCL tracking rows, so their
 loaders find everything already present). The seed blob is data, not code, and is gitignored
@@ -91,12 +100,17 @@ state, so the compose file was hardened (#72):
   services (orthanc, the ledger, temporal, the ingress store) resume where they left
   off — but `openmrs` does NOT: `up` recreates its container against the populated
   `mariadb-data` volume, which is exactly the wedge above. After a full `down`, bring
-  OpenMRS back wedge-aware: clean `down -v` boot, or the seed fast-restore.
+  OpenMRS back wedge-aware **without sacrificing the other volumes**: remove ONLY the
+  mariadb volume, then boot the seed overlay (the selective path in the seed section
+  above). `down -v` also works but wipes the comms ledger and ingress store — the
+  clinical state this hardening exists to protect — so on the demo host it is the
+  last resort, not the routine.
 
 - **The OpenMRS/mariadb wedge still applies** (see the section above): never
   recreate `openmrs` against a reused `mariadb-data` volume. When you deliberately
-  want a clean slate, `down -v` and boot clean — accepting that it also clears the
-  ingress store and comms ledger.
+  want a WHOLE-STACK clean slate, `down -v` and boot clean — knowing that clears the
+  ingress store and comms ledger too. For an OpenMRS-only reset, remove just
+  `mariadb-data` and use the seed overlay.
 
 - **Restart policy.** The long-lived app services (`orthanc`, `ohif`, `orchestrator`,
   `comms-ledger`, `worklist-api`) run `restart: unless-stopped`, so the demo host
@@ -106,8 +120,15 @@ state, so the compose file was hardened (#72):
   above — after a host reboot, bring them back deliberately (clean boot, or the seed
   fast-restore) rather than letting Docker loop them into a wedged state. The
   one-shots (`presign-concept-bootstrap`, `comms-ledger-init`) are `restart: "no"` on
-  purpose — each runs to completion every `up` and is idempotent.
+  purpose — each runs to completion every `up` and is idempotent. The Temporal trio
+  (`temporal`, `temporal-postgresql`, `temporal-ui`) and the five A2A agents also have
+  no restart policy: after a reboot they stay down until `docker compose up`, which the
+  reboot already requires for openmrs/mariadb — Temporal durability resumes every
+  workflow once they return, so nothing is lost, only paused.
 
 - **Images are pinned to digests** (`name:tag@sha256:...`) so the demo host cannot
   drift under a re-pushed tag. Bump a digest deliberately when adopting a new build;
-  `jaeger` (opt-in `otel` profile) keeps an explicit version tag.
+  `jaeger` (opt-in `otel` profile) keeps an explicit version tag. **Exception: the
+  `openmrs` (o3) image rides its tag** — o3:o3 is a moving tag whose superseded
+  manifests GitLab's registry garbage-collects, so a digest pin there 404s on any
+  fresh host after the next upstream push (see the comment in `docker-compose.yml`).
