@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:lhrad:specialty-routing:1.0.0",
+  "title": "SpecialtyRouting",
+  "description": "Study -> subspecialty routing for critical-result on-call paging (#58). Rules are evaluated in order, first match wins; a matched study's on-call directory search is narrowed to that specialty, and outOfSpecialtyFallback decides the failure direction when nobody in it is on call. Config only -- modalities, keywords, specialty tokens; never PHI. Lives beside the Communications Agent (agents/communications/specialty-routing.yaml).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "outOfSpecialtyFallback", "rules"],
+  "properties": {
+    "schemaVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "description": { "type": "string" },
+    "outOfSpecialtyFallback": {
+      "type": "string",
+      "enum": ["any-on-call", "none"],
+      "description": "When a specialty is derived but nobody tagged for it is on call: `any-on-call` pages whoever is on call and stamps the Communication out-of-specialty; `none` pages nobody from the agent, so the orchestrator's sign-off ladder (#29) reaches a human instead. These fail in opposite directions -- a safety call, not an implementation detail."
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Evaluated in order; FIRST match wins. Each rule needs at least one of modalities/keywords non-empty -- a rule that can never match is a config error (enforced by validate_contracts.py).",
+      "items": { "$ref": "#/$defs/rule" }
+    }
+  },
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["specialty"],
+      "properties": {
+        "specialty": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The specialty token the deployment tags its on-call PractitionerRoles with (ledger PractitionerRole.specialty coding code; pushed as the FHIR `specialty` search param)."
+        },
+        "modalities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "DICOM modality codes matched exactly, case-insensitive (e.g. MG)."
+        },
+        "keywords": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Case-insensitive substrings matched against StudyContext.study.studyDescription."
+        }
+      }
+    }
+  }
+}

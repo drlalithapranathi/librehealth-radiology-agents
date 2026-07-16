@@ -32,6 +32,7 @@ from radagent_common.fhir_client import Fhir2Client
 from radagent_common.tracing import now_iso
 
 from classifier import ACRCategory, classify, escalation_ack_minutes
+from routing import derive_specialty, out_of_specialty_fallback
 from tools import (
     ack_state,
     dispatch_communication,
@@ -111,12 +112,19 @@ async def _dispatch(payload: dict) -> dict:
 
     patient_ref, order_ref = _refs(payload)
     recipient = await resolve_ordering_provider(_fhir(), order_ref)
+    out_of_specialty = False
     if not recipient:
         # No requester on the order (e.g. a study ingested unresolved, #11). A critical finding
-        # with nobody to tell must not be silently dropped -- go straight to on-call.
-        recipient = await resolve_on_call_provider(_ledger())
-        _log.warning("no requester on %s; addressing the critical result to on-call (%s)",
-                     order_ref or "<no order>", recipient)
+        # with nobody to tell must not be silently dropped -- go to on-call, narrowed to the
+        # study's specialty when one derives (#58: an intracranial bleed should page neuro call,
+        # not whoever the directory lists first).
+        specialty = derive_specialty(payload["studyContext"].get("study") or {})
+        resolution = await resolve_on_call_provider(
+            _ledger(), specialty=specialty, fallback=out_of_specialty_fallback())
+        recipient, out_of_specialty = resolution.reference, resolution.out_of_specialty
+        _log.warning("no requester on %s; addressing the critical result to on-call (%s%s)",
+                     order_ref or "<no order>", recipient,
+                     ", out of specialty" if out_of_specialty else "")
     if not recipient:
         # Nobody to tell, at all. SKIPPED is the honest answer -- reporting SENT would claim a page
         # that never happened. The orchestrator's own #29 ladder still pages a human.
@@ -136,6 +144,7 @@ async def _dispatch(payload: dict) -> dict:
         recipient_ref=recipient,
         acr_category=result.category.value,
         finding=result.finding,
+        out_of_specialty=out_of_specialty,
     )
     task, deadline = await open_ack_task(
         _ledger(),
@@ -201,6 +210,10 @@ async def _escalate(payload: dict) -> dict:
         # See classifier.escalation_ack_minutes (this replaces a payload.get("ackMinutes") read the
         # input schema could never satisfy -- @sunbiz on #52).
         ack_minutes=escalation_ack_minutes(),
+        # Same routing as dispatch's on-call fallback (#58): the escalated page aims at the
+        # study's own specialty rota first.
+        specialty=derive_specialty(payload["studyContext"].get("study") or {}),
+        fallback=out_of_specialty_fallback(),
     )
     return _out(payload, escalatedAt=now_iso(), **result)
 

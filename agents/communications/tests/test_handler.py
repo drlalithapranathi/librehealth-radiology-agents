@@ -293,3 +293,153 @@ async def test_escalate_with_nobody_on_call_says_so_instead_of_claiming_success(
 async def test_unexpected_skill_raises():
     with pytest.raises(ValueError):
         await handle("comms.sendCarrierPigeon", {"studyContext": SAMPLE_CONTEXT})
+
+
+# --- #58: specialty-routed on-call paging ----------------------------------------------
+
+NEURO_CONTEXT = {**SAMPLE_CONTEXT,
+                 "study": {**SAMPLE_CONTEXT["study"], "studyDescription": "CT head w/o contrast"}}
+
+OUT_OF_SPECIALTY = "out-of-specialty"
+
+
+def _routing_table(monkeypatch, tmp_path, fallback: str):
+    """A hermetic routing table: 'head' -> neuro, dial as given. The handler tests must not
+    couple to the shipped table's keyword list -- that is clinical config under PI review."""
+    p = tmp_path / "routing.yaml"
+    p.write_text(
+        'schemaVersion: "1.0.0"\n'
+        f"outOfSpecialtyFallback: {fallback}\n"
+        "rules:\n"
+        "  - specialty: neuro\n"
+        "    keywords: [head]\n"
+    )
+    monkeypatch.setenv("SPECIALTY_ROUTING_PATH", str(p))
+
+
+def _marker_codes(comm) -> list[str]:
+    return [c.code for cc in comm.category for c in cc.coding
+            if c.system == "http://critcom/routing"]
+
+
+async def test_on_call_fallback_pages_the_studys_own_specialty(stores, monkeypatch, tmp_path):
+    """A neuro study with no requester pages NEURO call -- and the test asserts the search was
+    actually narrowed, not that the right person happened to come back first."""
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
+    fhir, ledger = stores
+    fhir.requester = None
+    ledger.on_call, ledger.on_call_specialty = "Practitioner/dr-neuro", "neuro"
+
+    out = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+    validate_skill_output("comms.dispatch", out)
+    assert out["recipient"] == "Practitioner/dr-neuro"
+    assert ledger.on_call_searches == ["neuro"]
+    # In-specialty: the record carries no routing marker.
+    assert _marker_codes(ledger.communications[out["communicationId"]]) == []
+
+
+async def test_nobody_in_specialty_pages_any_on_call_and_stamps_the_record(stores, monkeypatch,
+                                                                            tmp_path):
+    """The any-on-call direction: someone hears it, and the Communication says it was the wrong
+    someone. The marker is APPENDED -- the ACR category must stay at category[0], where readers
+    (and _escalate's re-derive) take it from."""
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
+    fhir, ledger = stores
+    fhir.requester = None           # on-call fallback; the general rota is untagged
+
+    out = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+    validate_skill_output("comms.dispatch", out)
+    assert out["dispatchStatus"] == "SENT"
+    assert out["recipient"] == "Practitioner/dr-oncall"
+    assert ledger.on_call_searches == ["neuro", None]      # narrowed miss, then the fallback
+    comm = ledger.communications[out["communicationId"]]
+    assert comm.category[0].coding[0].code == "Cat1"
+    assert _marker_codes(comm) == [OUT_OF_SPECIALTY]
+
+
+async def test_fallback_none_pages_nobody_and_reports_skipped(stores, monkeypatch, tmp_path):
+    """The other direction of the dial: the policy says never page out of specialty, so the
+    dispatch reports the miss honestly (SKIPPED, nothing written) and the orchestrator's #29
+    ladder is what reaches a human."""
+    _routing_table(monkeypatch, tmp_path, "none")
+    fhir, ledger = stores
+    fhir.requester = None
+
+    out = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+    validate_skill_output("comms.dispatch", out)
+    assert out["dispatchStatus"] == "SKIPPED"
+    assert ledger.on_call_searches == ["neuro"]            # no unnarrowed second search
+    assert ledger.communications == {} and ledger.tasks == {}
+
+
+async def test_an_unmapped_study_searches_unnarrowed_with_no_marker(stores, monkeypatch,
+                                                                    tmp_path):
+    """No rule matches SAMPLE_CONTEXT (CT, no description): the search runs exactly as before
+    #58 and the record carries no marker. A site with one general rota is unaffected."""
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
+    fhir, ledger = stores
+    fhir.requester = None
+
+    out = await handle("comms.dispatch", {"studyContext": SAMPLE_CONTEXT, "impression": CRITICAL})
+    assert out["recipient"] == "Practitioner/dr-oncall"
+    assert ledger.on_call_searches == [None]
+    assert _marker_codes(ledger.communications[out["communicationId"]]) == []
+
+
+async def test_the_ordering_provider_path_never_consults_routing(stores, monkeypatch, tmp_path):
+    """#58 touches ONLY the two on-call paths. With a requester on the order, the notification
+    goes to them: no directory search, no marker -- whatever the study maps to."""
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
+    _, ledger = stores
+
+    out = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+    assert out["recipient"] == "Practitioner/dr-order"
+    assert ledger.on_call_searches == []
+    assert _marker_codes(ledger.communications[out["communicationId"]]) == []
+
+
+async def test_escalation_pages_the_studys_specialty_first(stores, monkeypatch, tmp_path):
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
+    _, ledger = stores
+    ledger.on_call, ledger.on_call_specialty = "Practitioner/dr-neuro", "neuro"
+    sent = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+
+    out = await handle("comms.escalate", {"studyContext": NEURO_CONTEXT, "taskId": sent["taskId"]})
+    validate_skill_output("comms.escalate", out)
+    assert out["escalated"] is True
+    assert ledger.on_call_searches == ["neuro"]
+    new_comm = ledger.communications[out["newCommunicationId"]]
+    assert new_comm.recipient[0].reference == "Practitioner/dr-neuro"
+    assert _marker_codes(new_comm) == []
+
+
+async def test_escalation_out_of_specialty_stamps_the_record_and_keeps_the_category(
+        stores, monkeypatch, tmp_path):
+    _routing_table(monkeypatch, tmp_path, "any-on-call")
+    _, ledger = stores
+    sent = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+
+    out = await handle("comms.escalate", {"studyContext": NEURO_CONTEXT, "taskId": sent["taskId"]})
+    validate_skill_output("comms.escalate", out)
+    assert out["escalated"] is True
+    assert "out of specialty" in out["reason"]
+    new_comm = ledger.communications[out["newCommunicationId"]]
+    assert new_comm.recipient[0].reference == "Practitioner/dr-oncall"
+    assert new_comm.category[0].coding[0].code == "Cat1"   # the re-derived urgency, still first
+    assert _marker_codes(new_comm) == [OUT_OF_SPECIALTY]
+    assert new_comm.finding_summary.startswith("[ESCALATED]")
+
+
+async def test_escalation_under_fallback_none_reports_the_miss_honestly(stores, monkeypatch,
+                                                                         tmp_path):
+    """escalated=false with a reason that names the policy: "nobody was in specialty and we chose
+    not to page out of it" is a different audit fact from "the directory is empty"."""
+    _routing_table(monkeypatch, tmp_path, "none")
+    _, ledger = stores
+    sent = await handle("comms.dispatch", {"studyContext": NEURO_CONTEXT, "impression": CRITICAL})
+
+    out = await handle("comms.escalate", {"studyContext": NEURO_CONTEXT, "taskId": sent["taskId"]})
+    validate_skill_output("comms.escalate", out)
+    assert out["escalated"] is False
+    assert "neuro" in out["reason"] and "out of specialty" in out["reason"]
+    assert ledger.tasks[sent["taskId"]].status is TaskStatus.FAILED   # still not acknowledged
