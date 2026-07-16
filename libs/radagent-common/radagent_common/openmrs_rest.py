@@ -16,12 +16,20 @@ sides of the sign-off join land on the SAME ServiceRequest/<order uuid>.
 Read-only. HTTP Basic, the same FHIR2_BASIC_* credentials the fhir2 client uses. Every lookup is
 best-effort: like the fhir2 resolve it must never fail ingestion, so callers swallow errors and
 fall back to Patient/UNRESOLVED.
+
+TRANSPORT: this surface rides the SAME wire as fhir2 -- the base URL is derived from
+FHIR2_BASE_URL and the same Basic credentials travel with every request, and the responses carry
+patient/order identifiers. So it obeys the SAME read-transport guard (#67): plaintext HTTP to a
+non-loopback host is refused unless the deployment opted in, exactly like a fhir2 read. Without
+this, the fhir2 front door is locked while every DICOM arrival walks the credentials out this one.
 """
 from __future__ import annotations
 from typing import Any, Optional
 import os
 from urllib.parse import urlparse
 import httpx
+
+from .fhir_client import _guard_read_transport
 
 # OpenMRS Order.urgency -> StudyContext order.priority (the triage signal, #61). The envelope pins
 # priority to a four-value enum; anything unrecognised becomes "no priority" (honest, and it will
@@ -60,6 +68,10 @@ class OpenmrsRestClient:
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
         url = f"{self.base_url}/{path.lstrip('/')}"
+        # Same invariant, same opt-ins as the fhir2 client (see module docstring). Raises before
+        # any request leaves the process; ingress's best-effort swallow turns that into
+        # Patient/UNRESOLVED with the reason in the warning, never a failed ingestion (#11).
+        _guard_read_transport(url)
         async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
             r = await c.get(url, params=params)
             r.raise_for_status()

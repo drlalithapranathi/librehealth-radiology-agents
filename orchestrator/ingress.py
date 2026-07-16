@@ -181,8 +181,12 @@ async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
     if accession:
         try:
             resolved = await _openmrs_rest().resolve_radiology_order_by_accession(accession)
-        except Exception:  # noqa: BLE001 - OpenMRS down/unreachable must not fail the webhook
-            _log.warning("order resolution failed for accession %s; starting Patient/UNRESOLVED", accession)
+        except Exception as exc:  # noqa: BLE001 - OpenMRS down/unreachable must not fail the webhook
+            # The reason matters in the log: "connection refused" is an outage to wait out, but an
+            # InsecureReadTransportError (#67) is a config error that will fail EVERY ingest until
+            # someone fixes the base URL or sets the opt-in -- a reasonless warning hid that.
+            _log.warning("order resolution failed for accession %s (%s: %s); starting "
+                         "Patient/UNRESOLVED", accession, type(exc).__name__, exc)
             resolved = None
         if resolved:
             order = {"fhirServiceRequestId": resolved["fhirServiceRequestId"]}
