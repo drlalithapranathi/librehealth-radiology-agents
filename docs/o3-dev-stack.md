@@ -42,15 +42,32 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8080/openmrs/ws/rest/v
 Bring the stack up from empty volumes:
 
 ```
-docker compose down -v
+docker compose down -v        # dev machine only -- see the demo-host caveat below
 docker compose up -d mariadb openmrs
 ```
+
+On the **demo host**, `-v` wipes the comms-ledger audit trail and the ingress store
+(see Demo host ops); use the selective path in the seed section instead.
 
 Recreating the `openmrs` container against an **existing** `mariadb-data` volume
 is not supported. The initializer and OpenConceptLab modules re-load reference
 data, hit `already exists` validation errors, abort module startup, and leave
-the server stuck at `/initialsetup`. If a stack gets wedged that way, run
-`docker compose down -v` and boot clean.
+the server stuck at `/initialsetup`. If a stack gets wedged that way, clear
+ONLY the OpenMRS database and reboot it from the seed (the volumes worth protecting
+survive):
+
+```
+docker compose down
+docker volume rm lh-radiology-agents_mariadb-data   # volume name = <compose project>_mariadb-data
+docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d
+```
+
+No seed captured yet? Then there is nothing to overlay: remove the mariadb volume the
+same way, `docker compose up -d mariadb openmrs`, pay the ~16-minute first boot once,
+and capture the seed at the end of it (`scripts/dump_openmrs_seed.sh`) so the next
+recovery is fast. A full `docker compose down -v` also clears the wedge, but it wipes
+the comms-ledger audit trail and the ingress store with it -- on the demo host it is
+the last resort.
 
 Making the module reference-data load idempotent so a restart does not collide
 would remove this constraint. That is an o3-image change (sibling `lh-radiology`
@@ -64,7 +81,8 @@ with Liquibase migration off, so a boot is the module-load pass only.
 
 ```
 scripts/dump_openmrs_seed.sh          # once, from a healthy clean boot -> docker/openmrs/seed/*.sql.gz
-docker compose down -v
+docker compose down                                 # keeps every named volume
+docker volume rm lh-radiology-agents_mariadb-data   # ONLY the OpenMRS DB (docker volume ls | grep mariadb)
 docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d
 ```
 

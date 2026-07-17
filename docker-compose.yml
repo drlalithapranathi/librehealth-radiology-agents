@@ -32,7 +32,7 @@ services:
     #     registry.gitlab.com/librehealth/radiology/lh-radiology/o3:o3   (docker pull, no auth)
     #   Build from source instead (module developers): clone lh-radiology on the o3 branch as a
     #   sibling of this repo, then `docker compose build openmrs` (uses the build: block below).
-    # NOT digest-pinned, unlike every other image here (#72) -- deliberately. o3:o3 is a single
+    # NOT digest-pinned (#72) -- deliberately (jaeger, opt-in otel profile, also rides its tag). o3:o3 is a single
     # moving tag rebuilt per lh-radiology pipeline, and GitLab's registry garbage-collects
     # manifests that lose their tag: a pinned digest 404s (MANIFEST_UNKNOWN) after the next
     # upstream push, so on any fresh host `up` cannot pull and the whole stack is dead (verified
