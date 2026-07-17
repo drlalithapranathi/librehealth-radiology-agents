@@ -158,11 +158,16 @@ _INSECURE_READ_WARNED: set[str] = set()
 
 def _guard_read_transport(url: str) -> None:
     if not _read_transport_is_secure(url):
+        # Host named (never the full URL: it could carry userinfo) so the operator fixes the
+        # RIGHT base URL -- this guard also fronts the OpenMRS REST surface (#70), whose URL may
+        # come from OPENMRS_REST_BASE_URL rather than FHIR2_BASE_URL.
         raise InsecureReadTransportError(
-            "refusing a fhir2 read over plaintext HTTP to a non-loopback host: the response is PHI "
-            "and the HTTP Basic credentials travel with the request, both in cleartext. Use an "
-            "https base URL, or set FHIR2_ALLOW_INSECURE_READ=1 (or the existing "
-            "FHIR2_ALLOW_INSECURE_WRITE=1, which reads inherit) for a trusted internal network."
+            f"refusing a PHI read over plaintext HTTP to non-loopback host "
+            f"{(urlparse(url).hostname or '')!r}: the response is PHI and the HTTP Basic "
+            "credentials travel with the request, both in cleartext. Use an https base URL "
+            "(FHIR2_BASE_URL, or OPENMRS_REST_BASE_URL for the REST surface), or set "
+            "FHIR2_ALLOW_INSECURE_READ=1 (or the existing FHIR2_ALLOW_INSECURE_WRITE=1, which "
+            "reads inherit) for a trusted internal network."
         )
     if _is_plaintext_remote(url):
         host = (urlparse(url).hostname or "").lower()

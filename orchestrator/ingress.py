@@ -10,6 +10,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException
@@ -53,6 +54,17 @@ FAILED_POLLS_PER_WARNING = max(1, int(os.environ.get("INGRESS_FAILED_POLLS_PER_W
 
 _client: Client | None = None
 _log = logging.getLogger("orchestrator.ingress")
+
+# Greedy to the LAST @ before the path (so an un-encoded @ inside a password masks whole);
+# ? and # excluded so a query/fragment @ after a pathless host never swallows the hostname.
+_USERINFO_RE = re.compile(r"://[^/?#\s]+@")
+
+
+def _redacted(exc: BaseException) -> str:
+    """str(exc) with any URL userinfo masked -- exception text is the one place a
+    credentials-in-the-URL deployment would leak them into routine logs."""
+    return _USERINFO_RE.sub("://***@", str(exc))
+
 
 # Durable report->workflow index + poll cursor (#6): must survive an ingress restart during the
 # hours-long human-gate wait, or the sign-off is silently lost. Backed by SQLite at
@@ -185,8 +197,11 @@ async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
             # The reason matters in the log: "connection refused" is an outage to wait out, but an
             # InsecureReadTransportError (#67) is a config error that will fail EVERY ingest until
             # someone fixes the base URL or sets the opt-in -- a reasonless warning hid that.
+            # Redacted: httpx errors embed the request URL, and a base URL configured with
+            # userinfo (http://user:pass@host/...) would put Basic credentials in this line on
+            # EVERY DICOM arrival.
             _log.warning("order resolution failed for accession %s (%s: %s); starting "
-                         "Patient/UNRESOLVED", accession, type(exc).__name__, exc)
+                         "Patient/UNRESOLVED", accession, type(exc).__name__, _redacted(exc))
             resolved = None
         if resolved:
             order = {"fhirServiceRequestId": resolved["fhirServiceRequestId"]}
@@ -426,14 +441,18 @@ async def _ris_poller() -> None:
             reports, high_water = await activities.poll_finalized_reports(cursor)
         except NotImplementedError:
             continue  # fhir2 client not wired in this environment
-        except Exception:  # noqa: BLE001 - keep the loop alive
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive
             # Swallowing keeps the loop alive, but a fhir2 that is down (or rejecting our
             # credentials, #53) must not be silent: every failed poll is a window in which a
             # radiologist sign-off goes undetected. Warn on the first failure, then throttle.
+            # Type + redacted message, NOT exc_info: the formatted traceback ends with str(exc),
+            # and an HTTPStatusError embeds the full request URL -- with userinfo credentials in
+            # it if the deployment configured them that way (the 401/#53 case is exactly an
+            # HTTPStatusError, so the leak would fire precisely when credentials are wrong).
             consecutive_failures += 1
             if consecutive_failures == 1 or consecutive_failures % FAILED_POLLS_PER_WARNING == 0:
-                _log.warning("fhir2 poll failed (%d consecutive); sign-off detection is stalled",
-                             consecutive_failures, exc_info=True)
+                _log.warning("fhir2 poll failed (%d consecutive; %s: %s); sign-off detection is "
+                             "stalled", consecutive_failures, type(exc).__name__, _redacted(exc))
             continue
         if consecutive_failures:
             _log.warning("fhir2 poll recovered after %d consecutive failure(s)", consecutive_failures)
