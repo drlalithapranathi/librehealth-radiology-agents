@@ -136,13 +136,36 @@ class IngressStore:
 
     # ---- poll cursor (+ boundary dedup set) --------------------------------------
     def load_cursor(self) -> tuple[Optional[str], set[str]]:
-        """Return (cursor, signalled-ids-at-boundary). (None, set()) on a fresh store."""
+        """Return (cursor, signalled-ids-at-boundary). (None, set()) on a fresh store.
+
+        Upgrade shim: a store written before the version-keyed dedup (#66) holds BARE report
+        ids — rewrite them as id@cursor on load. For a store saved with an un-held cursor (the
+        quiet steady state) that key is exact: the pre-#66 prune kept only the boundary, whose
+        stamp IS the cursor. Without the rewrite, the first post-upgrade poll re-signals the
+        boundary report; if its workflow has meanwhile completed, that decays into a per-poll
+        "matched no waiting workflow" warning that never ages out on a quiet system, or — if
+        the index row is still pending reconciliation — a held cursor and a spurious
+        signoff-drop dead letter for a study that finished normally.
+
+        Known residual, kept deliberately: a store saved while the cursor was HELD by failing
+        signals (#29) may also hold ids whose true stamp is later than the cursor; those
+        migrate to a phantom key and their report re-signals once after the deploy — the
+        pre-shim behaviour for exactly those ids. The phantom key can only err toward
+        RE-delivery (it matches nothing real, and FHIR search returns one current version per
+        resource), never toward swallowing; a shim strong enough to silence that re-signal
+        (bare-id fallback matching) could swallow a genuine addendum, the one direction this
+        pipeline must never choose. FHIR ids cannot contain '@', so the marker is unambiguous.
+        The rewrite persists on the next save_cursor.
+        """
         row = self._db.execute(
             "SELECT cursor, signalled_ids FROM poller_state WHERE id = 1"
         ).fetchone()
         if not row:
             return None, set()
-        return row[0], set(json.loads(row[1] or "[]"))
+        cursor, ids = row[0], set(json.loads(row[1] or "[]"))
+        if cursor:
+            ids = {i if "@" in i else f"{i}@{cursor}" for i in ids}
+        return cursor, ids
 
     def save_cursor(self, cursor: str, signalled_ids: set[str]) -> None:
         self._db.execute(

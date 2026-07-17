@@ -253,6 +253,34 @@ def test_reconcile_evicts_on_affirmative_not_found():
     assert ingress._workflow_id_for_report({"accessionNumber": "ACC-1"}) is None
 
 
+def test_a_pre_66_store_boundary_report_stays_deduped_and_an_addendum_still_signals():
+    """Upgrade shim: a store written by the PRE-version-key poller holds bare ids. On load they
+    become id@cursor (they were, by construction, the boundary reports at that stamp), so the
+    first post-upgrade poll neither re-signals the already-delivered sign-off (whose workflow may
+    have completed -- the reproduced decay was a per-poll 'matched no waiting workflow' warning
+    forever, or a spurious signoff-drop dead letter) NOR loses a real addendum: the same id at a
+    LATER stamp still keys differently and fires report_addended."""
+    T = "2026-06-27T12:00:00Z"
+    ingress._STORE.save_cursor(T, {"DiagnosticReport/r1"})   # pre-#66 persisted format
+    cursor, dedup = ingress._STORE.load_cursor()
+    assert dedup == {f"DiagnosticReport/r1@{T}"}             # migrated on load
+
+    ingress._index_workflow(_ctx("wf_1", accession="ACC-1"))
+    client = _FakeClient()
+
+    # Post-upgrade poll 1 (quiet system): the boundary report re-enters the ge-window.
+    boundary = {**_report("DiagnosticReport/r1", T, accession="ACC-1"), "status": "final"}
+    newly, failed = asyncio.run(ingress._process_batch(client, [boundary], dedup))
+    assert client.signals == [] and newly == set() and failed == []
+
+    # The genuine amendment arriving after the upgrade must still get through.
+    amended = {**_report("DiagnosticReport/r1", "2026-06-27T12:30:00Z", accession="ACC-1"),
+               "status": "amended"}
+    newly2, _failed2 = asyncio.run(ingress._process_batch(client, [amended], dedup | newly))
+    assert client.signals == [("wf_1", ingress.StudyWorkflow.report_addended, amended)]
+    assert newly2 == {"DiagnosticReport/r1@2026-06-27T12:30:00Z"}
+
+
 def test_process_batch_dedups_already_signalled():
     ingress._index_workflow(_ctx("wf_1", accession="ACC-1"))
     reports = [_report("DiagnosticReport/r1", "t1", accession="ACC-1")]

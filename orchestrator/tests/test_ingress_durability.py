@@ -87,12 +87,14 @@ def test_index_and_cursor_survive_a_restart(tmp_path):
     s1 = ingress.IngressStore(db)
     s1.put_index("ACC-1", "wf_x")
     s1.put_index("ServiceRequest/sr-1", "wf_x")
-    s1.save_cursor("2026-06-27T12:00:00Z", {"DiagnosticReport/r1"})
+    s1.save_cursor("2026-06-27T12:00:00Z", {"DiagnosticReport/r1@2026-06-27T12:00:00Z"})
     s1.close()
 
     s2 = ingress.IngressStore(db)  # brand-new process, same file
     assert s2.workflow_id_for("ACC-1") == "wf_x"
-    assert s2.load_cursor() == ("2026-06-27T12:00:00Z", {"DiagnosticReport/r1"})
+    # Version-keyed entries (#66) round-trip untouched; only legacy bare ids are migrated.
+    assert s2.load_cursor() == (
+        "2026-06-27T12:00:00Z", {"DiagnosticReport/r1@2026-06-27T12:00:00Z"})
     assert s2.index_size() == 2
     s2.evict_workflow("wf_x")  # both of the workflow's keys go, bounding growth
     assert s2.workflow_id_for("ACC-1") is None
@@ -115,8 +117,32 @@ def test_store_survives_a_real_process_crash(tmp_path):
 
     s = ingress.IngressStore(db)  # a fresh, separate process reopens the same file
     assert s.workflow_id_for("ACC-CRASH") == "wf_crash"
-    assert s.load_cursor() == ("2026-06-27T09:00:00Z", {"DiagnosticReport/rc"})
+    # The crash-writer used the PRE-#66 bare-id format, so this doubles as the migration pin:
+    # a legacy entry comes back as id@cursor (see IngressStore.load_cursor's upgrade shim).
+    assert s.load_cursor() == (
+        "2026-06-27T09:00:00Z", {"DiagnosticReport/rc@2026-06-27T09:00:00Z"})
     s.close()
+
+
+# --- upgrade shim: pre-#66 bare-id dedup state is version-keyed on load -----------
+def test_a_pre_66_store_is_migrated_to_version_keys_on_load(tmp_path):
+    """Bare ids (pre-version-key writers) become id@cursor on load; already-versioned keys are
+    untouched; and one save/load cycle makes the migration durable. Without this, the first
+    post-upgrade poll re-signals the boundary report -- reproduced as a forever 'matched no
+    waiting workflow' warning loop on quiet systems and a spurious signoff-drop dead letter."""
+    db = str(tmp_path / "legacy.db")
+    s1 = ingress.IngressStore(db)
+    s1.save_cursor("2026-06-27T10:00:00Z",
+                   {"DiagnosticReport/old", "DiagnosticReport/new@2026-06-27T10:00:00Z"})
+    s1.close()
+
+    s2 = ingress.IngressStore(db)
+    cursor, ids = s2.load_cursor()
+    assert ids == {"DiagnosticReport/old@2026-06-27T10:00:00Z",
+                   "DiagnosticReport/new@2026-06-27T10:00:00Z"}
+    s2.save_cursor(cursor, ids)                     # the next poll persists the migrated form
+    assert s2.load_cursor() == (cursor, ids)
+    s2.close()
 
 
 # --- INTEGRATION: workflow survives ingress restart, gate still releases ----------
