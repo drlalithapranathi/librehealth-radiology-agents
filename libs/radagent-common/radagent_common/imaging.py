@@ -49,8 +49,12 @@ def dicom_to_greyscale(dicom_bytes: bytes) -> "np.ndarray":
          Feeding it to a MONOCHROME2-trained model hands it a negative of the X-ray. It looks like
          a plausible image, so nothing raises -- the model just quietly scores the wrong thing.
          This is the single most common way a CXR pipeline is silently wrong.
-      3. Multi-frame instances -> take the first frame. A single-frame CXR is the common case; a
-         caller that needs a specific frame of a cine loop should not be using this function.
+      3. Multi-frame GREYSCALE -> take the first frame. A single-frame CXR is the common case;
+         a caller that needs a specific frame of a cine loop should not be using this function.
+         Multi-frame COLOUR is refused outright (NotAnImage): that shape is a clip -- an
+         ultrasound/fluoro cine or a video secondary capture -- and scoring one of its frames
+         with a radiograph model returns a confident number about the wrong kind of pixels,
+         silently. Refusing lets the caller skip the clip and keep walking to the real image.
 
     Windowing (WindowCenter/WindowWidth) is deliberately NOT applied: it is a viewing preference
     baked in by the modality/technologist, and models normalize their own input. Applying it would
@@ -67,7 +71,13 @@ def dicom_to_greyscale(dicom_bytes: bytes) -> "np.ndarray":
     arr = np.asarray(arr)
 
     if arr.ndim == 4:
-        arr = arr[0]  # multi-frame colour (frames, H, W, C) -> first frame, THEN collapse colour
+        # (frames, H, W, C): a CLIP, not a radiograph -- see docstring point 3. NotAnImage means
+        # the caller SKIPS this instance and keeps walking the study, so a clip that happens to
+        # sort ahead of the frontal no longer swallows the screen.
+        raise NotAnImage(
+            f"multi-frame colour instance (shape {arr.shape}) is a clip, not a screenable "
+            "radiograph"
+        )
     if arr.ndim == 3 and arr.shape[-1] in (3, 4):
         # Colour (e.g. an RGB secondary capture). Luminance, so a screenshot in the study does not
         # crash the tool -- ITU-R BT.601, the same weights DICOM uses for YBR conversion.

@@ -104,14 +104,15 @@ def test_result_is_2d_float_regardless_of_stored_integer_type():
     assert out.dtype == np.float32
 
 
-def test_multiframe_colour_still_collapses_to_a_2d_frame():
-    """A multi-frame colour object is (frames, H, W, 3) -- ndim 4 -- so it used to fall into the
-    bare multi-frame branch and come back as frame 0 STILL COLOUR (H, W, 3), breaking the 2-D
-    contract: the model's centre-crop then dies and the handler misreports a MODEL failure on
-    what is just a clip in the study. Frame first, then the colour collapse."""
+def test_multiframe_colour_is_refused_as_a_clip_not_scored():
+    """A multi-frame colour object is (frames, H, W, 3) -- an ultrasound/fluoro cine or video SC.
+    It used to break the 2-D contract (frame 0 still colour), then briefly got silently SCORED
+    (frame first, colour collapse) -- a confident number about the wrong kind of pixels. Policy:
+    refuse with NotAnImage, so the caller skips the clip and keeps walking to the real image (a
+    clip sorted ahead of the frontal no longer swallows the screen)."""
     frame0 = np.array([[[255, 0, 0], [0, 255, 0]],
                        [[0, 0, 255], [255, 255, 255]]], dtype=np.uint8)
-    arr = np.stack([frame0, np.zeros_like(frame0)])   # frame 1 all-black: proves frame 0 is taken
+    arr = np.stack([frame0, np.zeros_like(frame0)])   # two frames: the shape that makes it a clip
 
     ds = Dataset()
     ds.file_meta = FileMetaDataset()
@@ -134,7 +135,5 @@ def test_multiframe_colour_still_collapses_to_a_2d_frame():
     buf = io.BytesIO()
     ds.save_as(buf, enforce_file_format=True)
 
-    out = dicom_to_greyscale(buf.getvalue())
-    assert out.ndim == 2 and out.shape == (2, 2)
-    # BT.601 luminance of frame 0's bottom-right white pixel; the all-black frame 1 would be 0.
-    assert out[1][1] == pytest.approx(255.0, abs=0.5)
+    with pytest.raises(NotAnImage, match="clip"):
+        dicom_to_greyscale(buf.getvalue())
