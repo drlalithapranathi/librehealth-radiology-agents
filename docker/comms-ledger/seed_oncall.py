@@ -23,24 +23,29 @@ import httpx
 BASE = os.environ.get("COMMS_LEDGER_BASE_URL", "http://comms-ledger:8080/fhir").rstrip("/")
 
 
-def wait_for_ledger(client: httpx.Client, tries: int = 60, delay: float = 5.0) -> None:
-    """Poll /metadata until the ledger answers 200.
+def wait_for_ledger(client: httpx.Client, budget_s: float = 300.0, delay: float = 5.0) -> None:
+    """Poll /metadata until the ledger answers 200, for at most ~budget_s of wall clock.
 
     The compose gate on this one-shot is only `service_started`: the distroless HAPI image can't
     host a healthcheck probe (no curl, no shell), so THIS loop is where readiness actually
-    lives. 60 x 5s covers a cold HAPI schema build with room to spare; a ledger that is still
+    lives. The budget is wall-clock, not attempt-counted -- each attempt can itself block for
+    the client's 30s timeout, so 60 tries x 5s sleep was a ~35-minute worst case masquerading
+    as "300s". Five minutes covers a cold HAPI schema build with room to spare; a ledger still
     down after that is a real failure the operator must see, not paper over.
     """
-    for attempt in range(1, tries + 1):
+    deadline = time.monotonic() + budget_s
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             if client.get(f"{BASE}/metadata").status_code == 200:
                 return
-            print(f"ledger up but not ready, attempt {attempt}/{tries}", flush=True)
+            print(f"ledger up but not ready, attempt {attempt}", flush=True)
         except httpx.HTTPError as e:
-            print(f"ledger not reachable ({type(e).__name__}), attempt {attempt}/{tries}",
-                  flush=True)
+            print(f"ledger not reachable ({type(e).__name__}), attempt {attempt}", flush=True)
+        if time.monotonic() >= deadline:
+            raise SystemExit("comms-ledger never became ready; on-call directory NOT seeded")
         time.sleep(delay)
-    raise SystemExit("comms-ledger never became ready; on-call directory NOT seeded")
 
 PRACTITIONER = {
     "resourceType": "Practitioner",

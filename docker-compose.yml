@@ -17,7 +17,8 @@
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile otel up -d
 #   Jaeger UI:              http://localhost:16686/   (one trace per study, across all agents)
 
-# Injected into every app service. Empty by default => tracing fully off (see tracing_enabled()).
+# Injected into the study-trace app services (worklist-api, off the trace path, does not
+# carry it). Empty by default => tracing fully off (see tracing_enabled()).
 x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
@@ -347,8 +348,9 @@ services:
       dockerfile: agents/communications/Dockerfile
     ports: ["8106:8106"]
     environment:
-      # #28 tracing: every app service carries the anchor, and the terminal COMMUNICATE stage
-      # must not be the one hop that goes dark in a study's trace.
+      # #28 tracing: the study-trace app services share this anchor (worklist-api, off the
+      # trace path, does not), and the terminal COMMUNICATE stage must not be the one hop that
+      # goes dark in a study's trace.
       <<: *otel-env
       COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
       FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
@@ -377,7 +379,7 @@ services:
   # routing gap (#58). Without this, an unacknowledged critical result is UNESCALATABLE: the agent
   # reports "no on-call provider is configured in the ledger" rather than paging nobody silently.
   comms-oncall-seed:
-    image: python:3.11-slim
+    image: python:3.11-slim@sha256:baf89808ec37adeaab83cec287adb4a2afa4a11c1d51e961c7ec737877e61af6   # pinned (#72)
     environment:
       COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
     volumes:
@@ -390,6 +392,11 @@ services:
       comms-ledger:
         # service_started, NOT service_healthy (no probe fits the distroless HAPI image -- see
         # comms-ledger above); the seed does its own readiness wait against /fhir/metadata.
+        # One-shot, no restart: if it exits nonzero the on-call directory is empty (or partial,
+        # if it died mid-PUT) and `up -d` will not say so -- `docker compose logs
+        # comms-oncall-seed` holds the evidence. The
+        # agent still tells the truth downstream (an unacknowledged critical result reports
+        # escalated:false, empty directory named as the reason).
         condition: service_started
     restart: "no"
 
