@@ -158,8 +158,9 @@ async def test_nobody_to_tell_reports_skipped_not_sent(stores):
 # --- the OTHER gate: #29's sign-off rung ----------------------------------------------
 
 async def test_signoff_rung_dispatches_its_channels_and_opens_NO_ack_clock(stores):
-    """#29's ladder is the "radiologist didn't SIGN" gate. There is no signed report to
-    acknowledge, so a Communication/Task here would put the same human on two clocks at once."""
+    """#29's ladder pages the radiologist whose SIGNED report sits at the verification hold.
+    The ladder owns its own cadence, so a Communication/Task here would put the same human on
+    two clocks at once."""
     _, ledger = stores
     payload = {"studyContext": SAMPLE_CONTEXT, "escalation": ESCALATION_RUNG}
     _input_validator("comms.dispatch").validate(payload)

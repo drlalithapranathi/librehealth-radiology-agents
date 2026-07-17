@@ -64,6 +64,115 @@ def test_an_empty_keyword_matches_nothing_not_everything(monkeypatch, tmp_path):
     """)
     assert derive_specialty({"modality": "US", "studyDescription": "US thyroid"}) is None
 
+def test_a_whitespace_only_keyword_matches_nothing_not_everything(monkeypatch, tmp_path):
+    '''" " is a substring of every multi-word description -- the same match-all disaster as ""
+    in a live-edited table, and it even passes the schema's minLength (one space IS a character);
+    the schema's \\S pattern now refuses it in-repo, and the matcher must refuse it live.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: neuro
+            keywords: [" "]
+    """)
+    assert derive_specialty({"modality": "US", "studyDescription": "US thyroid"}) is None
+
+
+def test_a_non_string_keyword_skips_the_rule_not_the_whole_table(monkeypatch, tmp_path):
+    '''A bare `123` in a live-edited table used to raise inside the scan and the blanket except
+    aborted EVERY later rule -- one junk entry silently un-narrowed the whole directory. The
+    junk entry must lose, not the table.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: msk
+            keywords: [123]
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_scalar_string_keywords_container_does_not_char_match_everything(monkeypatch, tmp_path):
+    '''`keywords: shoulder` (forgot the [list]) used to ITERATE CHARACTERS -- every single-char
+    substring matched, so the rule silently captured almost every described study with no
+    malformed-table log. A non-list container must contribute nothing; later rules still run.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: msk
+            keywords: shoulder
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_scalar_int_keywords_container_loses_the_rule_not_the_table(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: msk
+            keywords: 123
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_non_dict_rule_and_a_specialtyless_rule_each_lose_only_themselves(monkeypatch, tmp_path):
+    '''A stray string in `rules`, or a MATCHING rule with no `specialty`, used to abort the
+    whole scan via the (then table-level) except -- one junk entry un-narrowed the directory.
+    Each now costs only itself, logged, and the later valid rule still routes.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - "oops a bare string"
+          - keywords: ["head"]
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_scalar_rules_container_degrades_to_no_match(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules: 7
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head"}) is None
+
+
+def test_a_padded_modality_still_matches_after_stripping(monkeypatch, tmp_path):
+    '''Same rationale as padded keywords: " CT " must be a working rule -- the schema\'s \\S
+    pattern accepts it, so the matcher has to strip it or it is a CI-blessed dead rule.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: chest
+            modalities: [" CT "]
+    """)
+    assert derive_specialty({"modality": "CT"}) == "chest"
+
+
+def test_a_padded_keyword_still_matches_after_stripping(monkeypatch, tmp_path):
+    '''" head " must be a working rule, not a silently dead one: matching strips the keyword,
+    so hand-edited padding cannot make a description that plainly says "head" miss.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: neuro
+            keywords: [" head "]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
 
 def test_unmatched_study_gets_no_specialty(monkeypatch, tmp_path):
     """None = unnarrowed on-call search, the pre-#58 behaviour. A single general rota is

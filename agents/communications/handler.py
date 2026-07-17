@@ -6,10 +6,12 @@ The real CritCom (Critical-Results Communication) agent (#52). Three skills:
   - comms.escalate : an unacknowledged critical result goes to the on-call provider
 
 TWO DIFFERENT GATES. Do not confuse them, and do not double-page:
-  * #29's escalation ladder is the "radiologist didn't SIGN" gate. Its fired rung arrives here as
-    an `escalation` input slice on comms.dispatch. The ladder already chose who/how/how-loudly, so
-    those channels are dispatched VERBATIM and NO ack clock is opened -- this is the orchestrator
-    paging a human about a report that does not exist yet. There is nothing to acknowledge.
+  * #29's escalation ladder is the "radiologist hasn't RESOLVED the verification hold" gate: a
+    SIGNED report failed verification and sits at the sign-off gate awaiting its radiologist.
+    Its fired rung arrives here as an `escalation` input slice on comms.dispatch. The ladder
+    already chose who/how/how-loudly AND owns the cadence (Temporal durable timers fire the next
+    rung), so those channels are dispatched VERBATIM and NO ack clock is opened -- a comms-side
+    Task would put the same human on two clocks at once.
   * checkAck/escalate are the "physician didn't ACK a critical result" gate: a signed report whose
     critical finding was communicated, and nobody confirmed receipt. That loop is what the
     Communication/Task pair in the comms ledger tracks.
@@ -88,8 +90,9 @@ async def _dispatch(payload: dict) -> dict:
     escalation = payload.get("escalation") or {}
     if escalation:
         # A fired sign-off ladder rung (#29) -- the OTHER gate. The ladder picked the channels, so
-        # send them as asked. No Communication, no ack clock: there is no signed report to
-        # acknowledge, and opening one here would put the same human on two clocks at once.
+        # send them as asked. No Communication, no ack clock: the ladder itself is the clock
+        # (Temporal owns the cadence and the next rung), and a comms-side Task would put the
+        # same human on two clocks at once.
         return _out(
             payload,
             dispatchStatus="SENT",
@@ -127,8 +130,9 @@ async def _dispatch(payload: dict) -> dict:
                      ", out of specialty" if out_of_specialty else "")
     if not recipient:
         # Nobody to tell, at all. SKIPPED is the honest answer -- reporting SENT would claim a page
-        # that never happened. Nothing re-pages in response (the #29 ladder is the pre-sign gate,
-        # decoupled from dispatch): the miss lives in this log line and the workflow's record.
+        # that never happened. Nothing re-pages in response (the #29 ladder pages only at the
+        # post-sign verification hold, decoupled from dispatch): the miss lives in this log line
+        # and the workflow's record.
         _log.error("no recipient for a %s finding on %s", result.category.value, order_ref)
         return _out(
             payload,

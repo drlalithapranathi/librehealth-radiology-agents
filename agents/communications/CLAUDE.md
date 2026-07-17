@@ -49,10 +49,10 @@ lists first. The mapping and the **out-of-specialty fallback dial** live in
 `any-on-call` pages whoever is on call and stamps the Communication with an
 `http://critcom/routing|out-of-specialty` category; `none` pages nobody — the miss is recorded
 (`SKIPPED` / `escalated: false`) and the study archives, with **no automatic human backstop**
-(the #29 ladder is the pre-sign gate and does not react to dispatch outcomes). The two fail in
-opposite directions — the dial is a safety call (issue #58 item 3), so change its default only
-with PI sign-off. An unmapped study
-searches unnarrowed (pre-#58 behaviour); the ordering-provider path never consults routing.
+(the #29 ladder pages only at the post-sign verification hold and does not react to dispatch
+outcomes). The two fail in opposite directions — the dial is a safety call (issue #58 item 3),
+so change its default only with PI sign-off. An unmapped study searches unnarrowed (pre-#58
+behaviour); the ordering-provider path never consults routing.
 
 ## v1 vs later
 - **v1:** the ACR classifier is deterministic — it reads Impression's `criticalFlags` and
@@ -62,10 +62,11 @@ searches unnarrowed (pre-#58 behaviour); the ordering-provider path never consul
   signature (the pattern `interpretation-assistant/registry.py` uses).
 
 > ## Two gates. Do not double-page.
-> **#29's ladder** = "the radiologist didn't SIGN". Its fired rung arrives as an `escalation` input
-> slice on `comms.dispatch`; the ladder already chose who/how, so those channels are dispatched
-> verbatim and **no ack clock is opened** — there is no signed report to acknowledge.
-> **checkAck/escalate** = "the physician didn't ACK a critical result", on a report that IS signed.
+> **#29's ladder** = "the radiologist hasn't RESOLVED the verification hold on their signed
+> report". Its fired rung arrives as an `escalation` input slice on `comms.dispatch`; the ladder
+> already chose who/how and owns the cadence, so those channels are dispatched verbatim and
+> **no ack clock is opened** — a comms-side Task would double-clock the same human.
+> **checkAck/escalate** = "the ordering physician didn't ACK a communicated critical result".
 
 ## Run / test
 `cd agents/communications && python -m pytest -q`

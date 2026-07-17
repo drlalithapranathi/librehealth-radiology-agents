@@ -19,8 +19,9 @@
 #                  someone hears it and the record says it was the wrong someone.
 #   none        -- page nobody from here: the dispatch reports the miss honestly (SKIPPED /
 #                  escalated: false) and the workflow archives it. NOTHING re-pages in response
-#                  -- the #29 ladder is the pre-sign gate, decoupled from dispatch -- so a
-#                  `none` site accepts that a miss is only as loud as its ledger/log record.
+#                  -- the #29 ladder pages only at the post-sign verification hold, decoupled
+#                  from dispatch -- so a `none` site accepts that a miss is only as loud as its
+#                  log line and the workflow's record (the SKIPPED path writes no ledger entry).
 schemaVersion: "1.0.0"
 outOfSpecialtyFallback: any-on-call
 

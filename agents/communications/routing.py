@@ -61,19 +61,29 @@ def derive_specialty(study: dict) -> str | None:
     """
     modality = (study.get("modality") or "").upper()
     description = (study.get("studyDescription") or "").lower()
-    try:
-        for rule in _config().get("rules") or []:
-            if modality and modality in (m.upper() for m in rule.get("modalities") or []):
+    rules = _config().get("rules")
+    for rule in (rules if isinstance(rules, list) else []):
+        # Junk in a live-edited table costs at most ITS OWN rule, never the scan: the except is
+        # per-rule, so a stray non-dict entry or a matching rule missing `specialty` is logged
+        # and skipped while every LATER valid rule still runs. Junk CONTAINERS must not bleed
+        # either -- a scalar-string `keywords:` would char-iterate, and single-character
+        # substrings match almost every description (the "" disaster wearing a new coat) -- so a
+        # non-list container contributes nothing. Only non-empty string ITEMS may match, and
+        # matching strips, so a padded entry is a working rule, not a silently dead one (CI's
+        # schema only validates the in-repo file).
+        try:
+            modalities = rule.get("modalities")
+            keywords = rule.get("keywords")
+            if modality and any(m.strip().upper() == modality
+                                for m in (modalities if isinstance(modalities, list) else [])
+                                if isinstance(m, str)):
                 return rule["specialty"]
-            # `k and` guards a live-edited table with an empty keyword: "" is a substring of
-            # every description, which would route ALL studies here (CI's minLength only
-            # validates the in-repo file).
-            if description and any(k and k.lower() in description
-                                   for k in rule.get("keywords") or []):
+            if description and any(k.strip() and k.strip().lower() in description
+                                   for k in (keywords if isinstance(keywords, list) else [])
+                                   if isinstance(k, str)):
                 return rule["specialty"]
-    except Exception as e:  # noqa: BLE001 -- a malformed rule in a live-edited table; CI validates
-        # the in-repo file, so degrade here rather than fail the dispatch (module docstring).
-        _log.error("specialty routing table malformed (%s); on-call searches run unnarrowed", e)
+        except Exception as e:  # noqa: BLE001 -- this rule is malformed; the table survives
+            _log.error("specialty routing rule malformed (%s); rule skipped, scan continues", e)
     return None
 
 
