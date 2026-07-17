@@ -27,6 +27,7 @@ from radagent_common import paths
 # Dead-letter kinds (the `kind` column). A dead letter is anything an operator must see and
 # reconcile by hand; the kind says which surface degraded.
 KIND_SIGNOFF_DROP = "signoff-drop"                          # a sign-off the poller gave up on (#29)
+KIND_POST_ARCHIVE_ADDENDUM = "post-archive-addendum"         # a correction whose workflow had already finished (#66)
 KIND_POLICY_LOAD_FAILURE = "escalation-policy-load-failure"  # the ladder collapsed to one page (#54)
 KIND_SIGNOFF_ABANDONED = "signoff-abandoned"                 # gate ran out of ladder, nobody acked (#57)
 
@@ -102,6 +103,16 @@ class IngressStore:
             self._db.execute(
                 "ALTER TABLE dead_letters ADD COLUMN kind TEXT NOT NULL "
                 f"DEFAULT '{KIND_SIGNOFF_DROP}'"
+            )
+        # A failure record must remember WHICH signal failed: the eventual dead letter is
+        # classified from this history, not from whatever version fhir2 serves at eviction time
+        # (a report amended DURING the outage would otherwise re-label a genuinely lost sign-off
+        # as an addendum -- the dangerous direction). Pre-migration rows default to 'final':
+        # classifying an unknown history as a possible lost sign-off is the safe error.
+        fs_columns = {row[1] for row in self._db.execute("PRAGMA table_info(failed_signals)")}
+        if "signal" not in fs_columns:
+            self._db.execute(
+                "ALTER TABLE failed_signals ADD COLUMN signal TEXT NOT NULL DEFAULT 'final'"
             )
 
     # ---- report -> workflow join index -------------------------------------------
@@ -183,14 +194,22 @@ class IngressStore:
     # lets the poller tell "was ours, workflow gone" apart from "never ours" — the former is a
     # dead letter a human must see, the latter is routine fhir2 noise. IDs only, never PHI.
 
-    def record_failed_signal(self, report_id: str, workflow_id: str, at_iso: str) -> None:
-        """Upsert one failed delivery attempt for a mapped report (attempts increment)."""
+    def record_failed_signal(self, report_id: str, workflow_id: str, at_iso: str,
+                             signal: str = "final") -> None:
+        """Upsert one failed delivery attempt for a mapped report (attempts increment).
+
+        `signal` is 'final' or 'addendum' -- which DELIVERY failed. It is 'final'-sticky across
+        versions: once a report_finalized delivery has failed, a later retry that happens to
+        carry the amended version must not re-label the record, because the thing still
+        undelivered is the sign-off."""
         self._db.execute(
-            "INSERT INTO failed_signals (report_id, workflow_id, first_seen, last_attempt) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO failed_signals (report_id, workflow_id, first_seen, last_attempt, signal) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(report_id) DO UPDATE SET workflow_id = excluded.workflow_id, "
-            "last_attempt = excluded.last_attempt, attempts = attempts + 1",
-            (report_id, workflow_id, at_iso, at_iso),
+            "last_attempt = excluded.last_attempt, attempts = attempts + 1, "
+            "signal = CASE WHEN failed_signals.signal = 'final' THEN 'final' "
+            "ELSE excluded.signal END",
+            (report_id, workflow_id, at_iso, at_iso, signal),
         )
         self._db.commit()
 
@@ -201,13 +220,13 @@ class IngressStore:
 
     def failed_signal_for(self, report_id: str) -> Optional[dict]:
         row = self._db.execute(
-            "SELECT report_id, workflow_id, first_seen, last_attempt, attempts "
+            "SELECT report_id, workflow_id, first_seen, last_attempt, attempts, signal "
             "FROM failed_signals WHERE report_id = ?", (report_id,)
         ).fetchone()
         if not row:
             return None
         return {"reportId": row[0], "workflowId": row[1], "firstSeen": row[2],
-                "lastAttempt": row[3], "attempts": row[4]}
+                "lastAttempt": row[3], "attempts": row[4], "signal": row[5]}
 
     def add_dead_letter(self, report_id: str, workflow_id: str, attempts: int,
                         reason: str, at_iso: str,

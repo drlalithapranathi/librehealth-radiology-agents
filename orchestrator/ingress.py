@@ -25,7 +25,12 @@ from radagent_common.validation import validate_skill_output
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id, init_tracing, tracing_enabled
 from .state import TASK_QUEUE
 from .workflow import StudyWorkflow
-from .ingress_store import IngressStore, default_store_path
+from .ingress_store import (
+    KIND_POST_ARCHIVE_ADDENDUM,
+    KIND_SIGNOFF_DROP,
+    IngressStore,
+    default_store_path,
+)
 from . import activities
 
 TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
@@ -276,13 +281,37 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
         if not wf_id:
             was_failing = store.failed_signal_for(report_id) if report_id else None
             if was_failing:
+                # The kind must tell the truth about WHAT was dropped (lead ruling, #66 audit) --
+                # and the truth lives in the RECORDED failure history, not in whatever version
+                # fhir2 serves now: a report amended DURING the outage re-enters as `amended`,
+                # but if a report_finalized delivery ever failed, the thing still undelivered is
+                # the SIGN-OFF (classifying that as an addendum would hide a lost signature --
+                # the dangerous direction). Only a failure history that is addendum-only files as
+                # the post-archive addendum a human must re-verify by hand.
+                if was_failing.get("signal") == "addendum":
+                    kind = KIND_POST_ARCHIVE_ADDENDUM
+                    reason = ("addendum arrived after its workflow finished; the correction was "
+                              "never re-verified")
+                else:
+                    kind = KIND_SIGNOFF_DROP
+                    reason = "workflow evicted while its sign-off signal was still failing"
                 store.add_dead_letter(
                     report_id, was_failing["workflowId"], was_failing["attempts"],
-                    "workflow evicted while its sign-off signal was still failing", now_iso())
+                    reason, now_iso(), kind=kind)
                 store.clear_failed_signal(report_id)
-                _log.error("DEAD LETTER: sign-off %s for workflow %s dropped after %d failed "
-                           "attempt(s); see /admin/dead-letters", report_id,
+                _log.error("DEAD LETTER (%s): report %s for workflow %s dropped after %d failed "
+                           "attempt(s); see /admin/dead-letters", kind, report_id,
                            was_failing["workflowId"], was_failing["attempts"])
+            elif report.get("status") in ("amended", "corrected"):
+                # Unmapped addendum: no index row, no failure record -- either fhir2 noise for a
+                # study never tracked, or a correction arriving long after its workflow's rows
+                # were reconciled away (>~1h post-completion). The two are indistinguishable
+                # here, so no dead letter is fabricated -- but the log line names the second
+                # possibility so a grep can find it. Surfacing the long-tail case durably needs
+                # a retention design (lead decision pending).
+                _log.warning("amended/corrected report %s matched no waiting workflow (dropped; "
+                             "possible post-archive addendum for an already-reconciled study)",
+                             report_id)
             else:
                 _log.warning("finalized report %s matched no waiting workflow (dropped)", report_id)
             continue
@@ -302,7 +331,9 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
         except Exception:  # noqa: BLE001 - workflow gone/unreachable
             failed.append(report)
             if report_id:  # a report with no id can't be tracked; the held cursor still retries it
-                store.record_failed_signal(report_id, wf_id, now_iso())
+                store.record_failed_signal(
+                    report_id, wf_id, now_iso(),
+                    signal="addendum" if signal is StudyWorkflow.report_addended else "final")
             _log.warning("failed to signal workflow %s for report %s; will retry next poll", wf_id, report_id)
     return signalled, failed
 
@@ -595,6 +626,10 @@ async def dead_letters() -> dict:
       acknowledged. The study was released to COMMUNICATE (so the finding that made verification
       FAIL still got dispatched) and archived, but its report carries a verification FAIL that no
       human ever signed off. Go and look at the study. This is the loudest row on this surface.
+    * `post-archive-addendum` (#66) — a correction (amended/corrected report) arrived for a
+      workflow that had already finished, and its delivery failed until the rows were reclaimed.
+      The pipeline never re-verified the corrected body: read the amended report in the RIS and
+      run the correction through review by hand.
     """
     letters = _store().dead_letters()
     return {"count": len(letters), "deadLetters": letters}
