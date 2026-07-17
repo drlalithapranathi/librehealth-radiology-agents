@@ -402,3 +402,41 @@ def test_a_realistic_positive_cxr_report_flags_the_finding():
         "IMPRESSION: Large tension pneumothorax; recommend immediate decompression."
     )
     assert "pneumothorax" in asserted(report)
+
+
+# --- KNOWN RESIDUALS of the skip-clamp's terminal-punctuation proxy -------------------
+# These two tests pin CURRENT behaviour, not desired behaviour (module policy: "fix if
+# mechanical, otherwise document"). Both are strictly smaller errors than the pre-clamp
+# swallow-to-next-header. If either assertion starts failing, the heuristic changed --
+# re-decide the trade-off deliberately, don't just flip the assert.
+
+def test_residual_a_skip_header_that_ends_no_sentence_swallows_the_continuation_chain():
+    """UNDER-flag residual: "COMPARISON: chest CT 2024" has no terminal ./; so following lines
+    read as hard-wrap continuations of the skip section until one completes a sentence -- a
+    finding dictated there is silenced, and a HARD-WRAPPED finding is swallowed whole, both
+    lines (the pre-#78-fix behaviour silenced to end-of-text; this ends at the first ./;)."""
+    report = ("FINDINGS: Lungs clear.\n"
+              "COMPARISON: chest CT 2024\n"
+              "Large right pneumothorax is new.")
+    assert "pneumothorax" not in scannable_text(report).lower()  # documented residual
+    wrapped = ("FINDINGS: Lungs clear.\n"
+               "COMPARISON: chest CT 2024\n"
+               "Large right tension\n"
+               "pneumothorax is new.")
+    assert scannable_text(wrapped).strip() == "Lungs clear."     # the whole chain, not one line
+
+
+def test_residual_later_sentences_of_a_multiline_skip_paragraph_leak_and_flag():
+    """OVER-flag residual (the tolerated direction, but a REAL false page): line 2 of a
+    TECHNIQUE paragraph whose line 1 ends in "." is scanned, and a rule-out phrase there
+    ASSERTS -- "to exclude" is not a negation cue and the hedge rule voids suppression rather
+    than adding it. A normal study wraps a rule-out onto line 2 -> it gets flagged."""
+    report = ("TECHNIQUE: Portable AP radiograph.\n"
+              "Obtained to exclude pneumothorax.\n"
+              "FINDINGS: Lungs clear.")
+    leaked = scannable_text(report)
+    assert "exclude pneumothorax" in leaked.lower()           # the leak, pinned
+    assert find_asserted_terms(leaked, ["pneumothorax"]) == [
+        "pneumothorax"]                                       # ...and it FLAGS (plain terms,
+    # exactly how both scanners call this function -- a regex passed as a term is re.escape()d
+    # and can never match, which is how the first cut of this pin managed to assert nothing)

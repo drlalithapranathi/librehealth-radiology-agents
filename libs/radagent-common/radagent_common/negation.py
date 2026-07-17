@@ -302,6 +302,20 @@ def _clamped_skip_end(text: str, body_start: int, hard_end: int) -> int:
     they are hard-wrap continuations (the previous line did not finish a sentence); a blank line,
     or a new line after a completed sentence, is no longer provably the section's own prose and
     is scanned instead (doubt resolves toward scanning).
+
+    KNOWN RESIDUALS of the terminal-punctuation proxy (pinned in tests, accepted per the module
+    policy -- both are strictly SMALLER errors than the pre-clamp swallow-to-next-header):
+      * UNDER-flag: a skip header line that does NOT end a sentence ("COMPARISON: chest CT
+        2024") consumes the following continuation CHAIN -- every line up to the first one that
+        ends in ./; (or a blank line / the next header). A finding dictated there, including a
+        hard-wrapped one swallowed whole, is silenced. The pre-clamp behaviour silenced
+        everything to the next header; this residual ends at the first completed sentence.
+      * OVER-flag: the second-and-later sentences of a MULTI-LINE skip paragraph whose lines
+        each end in "." leak into scanning, and a rule-out phrase there DOES flag ("Obtained to
+        exclude pneumothorax" asserts: "to exclude" is not a negation cue, and the hedge rule
+        deliberately voids suppression rather than adding it). A normal study whose TECHNIQUE
+        paragraph wraps a rule-out onto line 2+ is over-flagged -- the tolerated direction,
+        but a real false page, not a harmless leak.
     """
     lines = text[body_start:hard_end].split("\n")
     end_offset = len(lines[0])
