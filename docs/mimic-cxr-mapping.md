@@ -1,0 +1,86 @@
+# MIMIC-CXR showcase ETL: design + write paths (#68)
+
+MIMIC replaces EMBED for the M4 demo (`docs/embed-mammography-mapping.md` stays the structural
+template). This doc is the corrected mapping, because the live stack forced a different loader shape
+than "POST FHIR bundles to fhir2".
+
+## Write paths (probed live against the o3 stack, 2026-07-15)
+
+fhir2 cannot create the resources the ETL needs most. What actually works, per resource:
+
+| Resource | Mechanism | Note |
+|---|---|---|
+| Patient | OpenMRS REST `/patient` | needs a minted OpenMRS ID (idgen) + subject_id as a 2nd identifier; fhir2 create 422s |
+| Encounter | OpenMRS REST `/encounter` | radiology encounter type + "Radiology Ordering Provider" role |
+| **RadiologyOrder** | **direct SQL** (orders + test_order + radiology_order) | fhir2 ServiceRequest create 400s; module has NO REST create. Proven in the #70 E2E |
+| Observation (labs) | fhir2 `/Observation` | needs a NUMERIC concept + a FHIR-valid instant (`+00:00`, not `+0000`) |
+| Condition (problems) | OpenMRS REST `/condition` | fhir2 Condition create 500s |
+| MedicationRequest (meds) | **direct SQL** (orders + drug_order, plus drug/concept provisioning) | fhir2 create 400s and there is no REST create. Presence-only orders; fhir2 reads them back as MedicationRequest |
+| DiagnosticReport (report) | fhir2 `/DiagnosticReport` | seed `preliminary` basedOn the order, flip to `final` |
+
+## The join, end to end (why the order must be a module RadiologyOrder)
+
+Post-#70 the orchestrator ingest resolves a study's order via the module's
+`radiologyorder?accessionNumber=` (fhir2 cannot search ServiceRequest by accession). So the order
+MUST be a module RadiologyOrder, and one accession value ties everything:
+
+```
+DICOM AccessionNumber  ==  orders.accession_number  ==  study_id (e.g. s56699142)
+        |                          |                           |
+  dicom_fixup                RadiologyOrder                report basedOn
+        |                    (fhir2: ServiceRequest/<order uuid>)     |
+  Orthanc -> wf         <-- ingest resolves by accession -->   poller joins on basedOn
+```
+
+Verified end to end with the tooling: loader creates patient+encounter+order for accession
+`s68proof1` (priority `stat`), DICOM pushed, the orchestrator resolved it (triage scored **URGENT**
+from the priority) and parked at the read gate, then `report_seeder finalize s68proof1` flipped the
+seeded report to `final` and the poller released the gate.
+
+## Tooling (scripts/mimic/, committed; MIMIC data stays off-repo per the DUA)
+
+- `dicom_fixup.py` -- inject AccessionNumber(=study_id) + StudyDescription; keep StudyInstanceUID.
+- `omrs_client.py` -- the mixed write client (fhir2 + OpenMRS REST + SQL).
+- `manifest.py` + `sample_cohort.json` -- the cohort schema + a synthetic sample.
+- `load_cohort.py` -- FHIR-first load (patient/encounter/order/EHR/report), then DICOM.
+- `report_seeder.py` -- `finalize <accession>` rehearsal cue.
+- `fetch.py` -- selective PhysioNet S3 pull (needs credentialed AWS).
+- `registry_corpus.py` -- export loaded (modality, StudyDescription) for the selection test (#64).
+
+## Prerequisite: provision the missing concepts
+
+The demo dictionary has no chest-x-ray concept and no numeric lab concepts, so
+`bootstrap_radiology_concept.py` (direct SQL at stable UUID5s, mirroring the presign bootstrap)
+provisions them before a load: "Chest radiograph" (order/report; set `MIMIC_ORDER_CONCEPT_UUID` to
+it) and "Serum creatinine" / "Estimated GFR" (Numeric, `allow_decimal=1`, so decimal lab values are
+accepted). `load_cohort` maps the manifest's LOINC lab codes onto these via `LAB_LOINC_TO_CONCEPT`.
+Verified: after the bootstrap, the sample cohort loads 3/3 with orders, labs, problems and seeded
+reports.
+
+## Meds and the order reason (closed in tooling)
+
+**Meds** load as presence-only drug orders via SQL (`ensure_drug` provisions a Drug-class concept
+plus a `drug` row at stable UUID5s; `insert_drug_order` writes orders + drug_order). fhir2 surfaces
+them as MedicationRequest, which is what the anticoagulant med-flag rules read. No dose or schedule
+is fabricated. The SQL is schema-verified against OpenMRS core 2.x; live-verify on the o3 stack
+before a real cohort load, the way the #70 E2E proved the radiology-order path.
+
+**Order reasonCode** is wired end to end. The resolver half landed on main as #81: it reads the
+order reason Concept's ICD-10 reference-term mappings into StudyContext `order.reasonCode`. The ETL
+half is `ensure_order_reason`: one Diagnosis-class Concept per manifest code set (stable UUID5 on
+the sorted codes), one SAME-AS mapping per code, against the dictionary's ICD-10 source (matched by
+the resolver's own normalisation and created only when absent). `load_cohort` passes it into
+`orders.order_reason`, so a J93*/J95.811 manifest reason fires the pneumothorax-detect slice on the
+order. Reason provisioning is best-effort: a failure degrades to a reason-less order and never
+costs the join.
+
+## Known gaps (remaining)
+
+1. **DB access for the SQL order path.** The loader connects to mariadb (pymysql). Run it as a
+   one-shot container on the compose network (mariadb/openmrs by service name), the way the #68
+   E2E ran it -- do not publish the DB port.
+2. **MIMIC-IV DUA.** A separate PhysioNet signature from MIMIC-CXR; sign early or criterion 3
+   (labs/meds/problems) has no data.
+3. **Live rehearsal of the new SQL paths.** Drug orders and the ICD-10 reason provisioning are
+   unit-tested but not yet exercised against the o3 stack; run the sample cohort there before the
+   real load.
