@@ -17,7 +17,8 @@
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile otel up -d
 #   Jaeger UI:              http://localhost:16686/   (one trace per study, across all agents)
 
-# Injected into every app service. Empty by default => tracing fully off (see tracing_enabled()).
+# Injected into the study-trace app services (worklist-api, off the trace path, does not
+# carry it). Empty by default => tracing fully off (see tracing_enabled()).
 x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
@@ -237,12 +238,13 @@ services:
       spring.datasource.password: ""
       spring.datasource.driverClassName: org.h2.Driver
       spring.jpa.properties.hibernate.dialect: ca.uhn.fhir.jpa.model.dialect.HapiFhirH2Dialect
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/fhir/metadata"]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 90s
+    # NO healthcheck -- deliberately. hapiproject/hapi is distroless (the entrypoint is `java`
+    # itself; no curl, no shell), so ANY exec-form probe fails with "executable file not found"
+    # and the container sits permanently `unhealthy` while serving fine (the previous curl check
+    # did exactly that, and once #69 gated dependents on service_healthy, nothing downstream
+    # could ever start). Readiness lives where a probe can actually run: the on-call seed polls
+    # /fhir/metadata before writing, and the agent's ledger client is lazy behind Temporal's
+    # unbounded COMMUNICATE retry.
     restart: unless-stopped
     volumes:
       - comms-ledger-data:/data/hapi
@@ -392,8 +394,68 @@ services:
       - worklist-api-db:/var/lib/lhrad
     depends_on: [orthanc]
     restart: unless-stopped
-  # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`
-  # (external image, added when it runs).
+  # The Communications Agent (CritCom, #52) -- the terminal COMMUNICATE stage's target. Until #69
+  # this was only a note, `communications:8106` resolved to nothing, and every study parked forever
+  # at COMMUNICATE retrying it (the stage's retry is deliberately unbounded); sign-off ladder pages
+  # failed too. Reads clinical context from fhir2 (read-only), writes Communication/Task to the
+  # comms ledger, resolves on-call from the directory the one-shot below seeds.
+  communications:
+    build:
+      context: .
+      dockerfile: agents/communications/Dockerfile
+    ports: ["8106:8106"]
+    environment:
+      # #28 tracing: the study-trace app services share this anchor (worklist-api, off the
+      # trace path, does not), and the terminal COMMUNICATE stage must not be the one hop that
+      # goes dark in a study's trace.
+      <<: *otel-env
+      COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
+      FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
+      FHIR2_BASIC_USER: admin
+      FHIR2_BASIC_PASS: Admin123
+      # Read-only fhir2 consumer (ServiceRequest.requester): the #67 read-transport guard refuses
+      # plaintext-to-remote reads without an opt-in, and this hop is plaintext http to the
+      # in-compose openmrs (see the orchestrator's FHIR2_ALLOW_INSECURE_WRITE note; a real
+      # deployment uses an https FHIR2_BASE_URL). Inert until #67 merges; needed after.
+      FHIR2_ALLOW_INSECURE_READ: "1"
+      # Ack windows are env-overridable per deployment (a tertiary centre's Cat1 window is not a
+      # rural clinic's); the showcase runs the clinical defaults (Cat1 60m / Cat2 24h / escalated
+      # loops 60m), so none are overridden here.
+    depends_on:
+      comms-ledger:
+        # service_started, NOT service_healthy: the distroless HAPI image cannot host a probe
+        # (see comms-ledger above), so a health gate here never opens. The agent tolerates a
+        # still-booting ledger -- its client is lazy and COMMUNICATE retries unbounded.
+        condition: service_started
+    restart: unless-stopped
+
+  # One-shot on-call directory seed (#69): one general-radiology Practitioner + an active
+  # PractitionerRole tagged `on-call` in the LEDGER (PractitionerRole is ledger-native; fhir2
+  # implements neither it nor Communication). PUT at known ids -> idempotent per `up`, same
+  # contract as presign-concept-bootstrap. A single rota deliberately sidesteps the specialty-
+  # routing gap (#58). Without this, an unacknowledged critical result is UNESCALATABLE: the agent
+  # reports "no on-call provider is configured in the ledger" rather than paging nobody silently.
+  comms-oncall-seed:
+    image: python:3.11-slim@sha256:baf89808ec37adeaab83cec287adb4a2afa4a11c1d51e961c7ec737877e61af6   # pinned (#72)
+    environment:
+      COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
+    volumes:
+      - ./docker/comms-ledger/seed_oncall.py:/opt/seed_oncall.py:ro
+    command:
+      - sh
+      - -c
+      - "pip install --quiet --no-cache-dir httpx==0.27.2 && python /opt/seed_oncall.py"
+    depends_on:
+      comms-ledger:
+        # service_started, NOT service_healthy (no probe fits the distroless HAPI image -- see
+        # comms-ledger above); the seed does its own readiness wait against /fhir/metadata.
+        # One-shot, no restart: if it exits nonzero the on-call directory is empty (or partial,
+        # if it died mid-PUT) and `up -d` will not say so -- `docker compose logs
+        # comms-oncall-seed` holds the evidence. The
+        # agent still tells the truth downstream (an unacknowledged critical result reports
+        # escalated:false, empty directory named as the reason).
+        condition: service_started
+    restart: "no"
 
 volumes:
   mariadb-data:
