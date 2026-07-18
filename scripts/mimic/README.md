@@ -23,7 +23,8 @@ python bootstrap_radiology_concept.py           # -> set MIMIC_ORDER_CONCEPT_UUI
 # 1. fetch only the cohort's studies from PhysioNet S3 (off-repo dest, DUA)
 python fetch.py my_cohort.json /secure/mimic-dl
 
-# 2. FHIR first: patients, encounters, RadiologyOrders, EHR packet, seeded preliminary reports
+# 2. FHIR first: patients, encounters, RadiologyOrders (with ICD-10-mapped order reasons),
+#    EHR packet (labs, problems, presence-only drug orders), seeded preliminary reports
 python load_cohort.py my_cohort.json --concept $MIMIC_ORDER_CONCEPT_UUID
 
 # 3. fix up + push DICOM (per study: accession = study_id), which starts each workflow

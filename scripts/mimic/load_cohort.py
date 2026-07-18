@@ -32,7 +32,18 @@ def load_study(c: OmrsClient, s: CohortStudy, concept_uuid: str, when_iso: str =
 
     patient = c.create_patient(s.subject_id, gender=s.labels.get("gender", "U"))
     encounter = c.create_encounter(patient, when_iso)
-    order = c.insert_radiology_order(patient, encounter, accession, concept_uuid, priority=s.priority)
+    # Order reason (#68 gap 4): an ICD-10-mapped Concept, read back by the #81 resolver into
+    # StudyContext order.reasonCode. Best-effort like the resolver itself: a reason failure
+    # degrades to a reason-less order and must never cost the order or the join.
+    reason_uuid = None
+    if s.reason_codes:
+        display = next((p.display for p in s.problems if p.code in s.reason_codes and p.display), "")
+        try:
+            reason_uuid = c.ensure_order_reason(list(s.reason_codes), display)
+        except Exception as e:  # noqa: BLE001
+            summary.setdefault("warnings", []).append(f"order reason {s.reason_codes}: {e}")
+    order = c.insert_radiology_order(patient, encounter, accession, concept_uuid,
+                                     priority=s.priority, reason_concept_uuid=reason_uuid)
     summary.update(patient=patient, encounter=encounter, order=order)
 
     # EHR packet -- best-effort: a missing concept mapping must not strand the study.
@@ -49,9 +60,19 @@ def load_study(c: OmrsClient, s: CohortStudy, concept_uuid: str, when_iso: str =
             summary["ehr"]["problems"] += 1
         except Exception as e:  # noqa: BLE001
             summary.setdefault("warnings", []).append(f"problem {prob.code}: {e}")
-    # meds: fhir2 cannot create MedicationRequest and OpenMRS drug orders need a drug-concept model;
-    # left as a documented follow-up (see docs/mimic-cxr-mapping.md). Counted as skipped.
-    summary["ehr"]["meds_skipped"] = len(s.meds)
+    # meds (#68 gap 3): presence-only drug orders via SQL, so fhir2 surfaces them as
+    # MedicationRequest and the anticoagulant med-flag rules see them. Best-effort like labs.
+    for med in s.meds:
+        name = med.display or med.code
+        if not name:
+            summary.setdefault("warnings", []).append("med with no display/code skipped")
+            continue
+        try:
+            drug = c.ensure_drug(name)
+            c.insert_drug_order(patient, encounter, drug)
+            summary["ehr"]["meds"] += 1
+        except Exception as e:  # noqa: BLE001
+            summary.setdefault("warnings", []).append(f"med {name}: {e}")
 
     report = c.seed_diagnostic_report(
         patient, order, concept_uuid,

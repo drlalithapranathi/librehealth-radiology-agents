@@ -46,6 +46,32 @@ NA_DATATYPE = "8d4a4c94-c2cc-11de-8d13-0010c6dffd0f"
 NUMERIC_DATATYPE = "8d4a4488-c2cc-11de-8d13-0010c6dffd0f"
 RADIOLOGY_CLASS = "8caa332c-efe4-4025-8b18-3398328e1323"   # Radiology/Imaging Procedure
 TEST_CLASS = "8d4907b2-c2cc-11de-8d13-0010c6dffd0f"        # Test
+DIAGNOSIS_CLASS = "8d4918b0-c2cc-11de-8d13-0010c6dffd0f"   # Diagnosis (order reasons)
+DRUG_CLASS = "8d490dfc-c2cc-11de-8d13-0010c6dffd0f"        # Drug (med concepts)
+SAME_AS_MAP_TYPE = "35543629-7d8c-11e1-909d-c80aa9edcf4e"  # concept_map_type SAME-AS
+
+# The ICD-10 source the #81 resolver matches on (any source whose normalised name starts
+# "ICD10"; the live CIEL dictionary calls it "ICD-10-WHO"). ensure_order_reason get-or-creates a
+# source by that same normalisation and only falls back to creating this one when none exists.
+ICD10_SOURCE_UUID = _u("lh-radiology.mimic.icd10-source.v1")
+
+
+def reason_concept_uuid(codes: list[str]) -> str:
+    """Stable UUID for the order-reason Concept carrying this ICD-10 code set. Sorted, so the
+    same set always lands on the same concept regardless of manifest ordering."""
+    return _u("lh-radiology.mimic.order-reason." + "+".join(sorted(codes)) + ".v1")
+
+
+def reason_term_uuid(code: str) -> str:
+    return _u(f"lh-radiology.mimic.icd10-term.{code}.v1")
+
+
+def drug_concept_uuid(name: str) -> str:
+    return _u(f"lh-radiology.mimic.drug-concept.{name.strip().lower()}.v1")
+
+
+def drug_uuid(name: str) -> str:
+    return _u(f"lh-radiology.mimic.drug.{name.strip().lower()}.v1")
 
 CONCEPTS = [
     {"uuid": CHEST_RADIOGRAPH_UUID, "name": "Chest radiograph",

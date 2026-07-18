@@ -15,7 +15,7 @@ fhir2 cannot create the resources the ETL needs most. What actually works, per r
 | **RadiologyOrder** | **direct SQL** (orders + test_order + radiology_order) | fhir2 ServiceRequest create 400s; module has NO REST create. Proven in the #70 E2E |
 | Observation (labs) | fhir2 `/Observation` | needs a NUMERIC concept + a FHIR-valid instant (`+00:00`, not `+0000`) |
 | Condition (problems) | OpenMRS REST `/condition` | fhir2 Condition create 500s |
-| MedicationRequest (meds) | (none yet) | fhir2 400s; OpenMRS drug orders need a drug-concept model -- follow-up |
+| MedicationRequest (meds) | **direct SQL** (orders + drug_order, plus drug/concept provisioning) | fhir2 create 400s and there is no REST create. Presence-only orders; fhir2 reads them back as MedicationRequest |
 | DiagnosticReport (report) | fhir2 `/DiagnosticReport` | seed `preliminary` basedOn the order, flip to `final` |
 
 ## The join, end to end (why the order must be a module RadiologyOrder)
@@ -57,17 +57,30 @@ accepted). `load_cohort` maps the manifest's LOINC lab codes onto these via `LAB
 Verified: after the bootstrap, the sample cohort loads 3/3 with orders, labs, problems and seeded
 reports.
 
+## Meds and the order reason (closed in tooling)
+
+**Meds** load as presence-only drug orders via SQL (`ensure_drug` provisions a Drug-class concept
+plus a `drug` row at stable UUID5s; `insert_drug_order` writes orders + drug_order). fhir2 surfaces
+them as MedicationRequest, which is what the anticoagulant med-flag rules read. No dose or schedule
+is fabricated. The SQL is schema-verified against OpenMRS core 2.x; live-verify on the o3 stack
+before a real cohort load, the way the #70 E2E proved the radiology-order path.
+
+**Order reasonCode** is wired end to end. The resolver half landed on main as #81: it reads the
+order reason Concept's ICD-10 reference-term mappings into StudyContext `order.reasonCode`. The ETL
+half is `ensure_order_reason`: one Diagnosis-class Concept per manifest code set (stable UUID5 on
+the sorted codes), one SAME-AS mapping per code, against the dictionary's ICD-10 source (matched by
+the resolver's own normalisation and created only when absent). `load_cohort` passes it into
+`orders.order_reason`, so a J93*/J95.811 manifest reason fires the pneumothorax-detect slice on the
+order. Reason provisioning is best-effort: a failure degrades to a reason-less order and never
+costs the join.
+
 ## Known gaps (remaining)
 
-1. **Meds have no create path.** fhir2 can't create MedicationRequest; OpenMRS drug orders need a
-   Drug/concept model. The anticoagulant med-flag story needs this built (follow-up).
-2. **reasonCode on the order (pneumothorax-detect slice).** #68 wants the order's ICD-10 reason
-   (J93*/J95.811) to fire the reason-code slice, but the #70 ingest resolver currently returns only
-   `priority`, not `reasonCode` (the module order reason is a Concept, not an ICD-10 code). To light
-   this up, the ETL must set the order reason as an ICD-10-mapped concept AND the resolver must
-   extract it. Tracked as a follow-up to the #70 resolver.
-3. **DB access for the SQL order path.** The loader connects to mariadb (pymysql). Run it as a
+1. **DB access for the SQL order path.** The loader connects to mariadb (pymysql). Run it as a
    one-shot container on the compose network (mariadb/openmrs by service name), the way the #68
    E2E ran it -- do not publish the DB port.
-4. **MIMIC-IV DUA.** A separate PhysioNet signature from MIMIC-CXR; sign early or criterion 3
+2. **MIMIC-IV DUA.** A separate PhysioNet signature from MIMIC-CXR; sign early or criterion 3
    (labs/meds/problems) has no data.
+3. **Live rehearsal of the new SQL paths.** Drug orders and the ICD-10 reason provisioning are
+   unit-tested but not yet exercised against the o3 stack; run the sample cohort there before the
+   real load.

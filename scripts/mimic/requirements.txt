@@ -3,3 +3,4 @@
 pydicom>=2.4        # DICOM read/fix-up
 boto3>=1.34         # selective pull from the PhysioNet S3 bucket (fetch tool)
 httpx>=0.27         # fhir2 / OpenMRS REST writes
+pymysql>=1.1        # direct-SQL paths: RadiologyOrder/drug orders/concept bootstrap

@@ -19,10 +19,10 @@ def collect(orthanc_base: str) -> list[dict]:
     with httpx.Client(timeout=30) as c:
         ids = c.get(f"{orthanc_base}/studies").json()
         for sid in ids:
-            tags = c.get(f"{orthanc_base}/studies/{sid}").json().get("MainDicomTags", {})
-            desc = tags.get("StudyDescription", "")
+            study = c.get(f"{orthanc_base}/studies/{sid}").json()
+            desc = study.get("MainDicomTags", {}).get("StudyDescription", "")
             # modality lives on series; read one series' modality
-            series = c.get(f"{orthanc_base}/studies/{sid}").json().get("Series", [])
+            series = study.get("Series", [])
             modality = ""
             if series:
                 modality = c.get(f"{orthanc_base}/series/{series[0]}").json() \
