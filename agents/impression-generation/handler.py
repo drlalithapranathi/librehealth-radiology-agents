@@ -22,7 +22,9 @@ work tracked separately on #26 (out of scope here).
 Input  : { studyContext, report?, ehrContext?, aiFindings? }
 Output : contracts/skills/impression.schema.json
 
-M2: replace the keyword scan with an LLM draft from report + ehrContext + aiFindings + priors.
+#77: `impressionText`/`recommendations` prose is LLM-authored (llm_draft.py) when config-gated
+on; `criticalFlags`/`structuredFindings` stay this deterministic keyword scan always -- criticality
+is never the LLM's call (see #78).
 """
 from __future__ import annotations
 import logging
@@ -30,6 +32,8 @@ import logging
 from radagent_common.fhir_client import Fhir2Client
 from radagent_common.negation import find_asserted_terms, scannable_text
 from radagent_common.tracing import now_iso
+
+from llm_draft import draft_impression
 
 AGENT_VERSION = "0.1.0"
 _log = logging.getLogger(__name__)
@@ -126,24 +130,40 @@ async def handle(skill_id: str, payload: dict) -> dict:
         for flag in critical_flags
     ]
 
-    if critical_flags:
+    # #77: LLM-authored prose when IMPRESSION_LLM_BASE_URL/MODEL are configured; unset (the
+    # default) or ANY failure falls back to the deterministic template below. The try/except here
+    # is a defense-in-depth backstop -- draft_impression() is contracted to never raise -- since
+    # this is the one read-path call that must never strand a sign-off on the LLM hosting choice.
+    try:
+        llm_draft = await draft_impression(
+            conclusion=conclusion,
+            finding_labels=finding_labels,
+            critical_flags=critical_flags,
+            ehr_context=payload.get("ehrContext") or {},
+        )
+    except Exception:  # noqa: BLE001 - advisory only; must never strand the read (#77)
+        _log.warning("impression LLM draft raised unexpectedly; falling back to the template")
+        llm_draft = None
+
+    if llm_draft is not None:
+        impression = llm_draft.impression_text
+        recommendations = [{"text": r} for r in llm_draft.recommendations]
+    elif critical_flags:
         impression = (
             f"Findings are consistent with {critical_flags[0]['label']}. "
             "Urgent clinical correlation and appropriate follow-up recommended."
         )
+        recommendations = [{"text": "Urgent clinical consultation recommended."}]
     else:
         impression = "No acute findings identified. Clinical correlation recommended."
+        recommendations = [{"text": "Routine follow-up as clinically indicated."}]
 
     return {
         "schemaVersion": "1.0.0",
         "workflowId": ctx["workflowId"],
         "impressionText": impression,
         "structuredFindings": structured_findings,
-        "recommendations": [
-            {"text": "Urgent clinical consultation recommended."}
-            if critical_flags else
-            {"text": "Routine follow-up as clinically indicated."}
-        ],
+        "recommendations": recommendations,
         "criticalFlags": critical_flags,
         "agentVersion": AGENT_VERSION,
         "generatedAt": now_iso(),

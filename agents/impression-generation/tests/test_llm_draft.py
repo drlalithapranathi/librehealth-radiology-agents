@@ -1,0 +1,233 @@
+"""Tests for llm_draft.draft_impression (#77).
+
+Uses httpx.MockTransport so every network call is intercepted -- never touches a real LLM
+endpoint. Covers: the default-off gate, the half-set misconfiguration warn-once-and-degrade,
+best-effort degrade-to-None on every failure mode (network, timeout, non-2xx, malformed JSON,
+empty recommendations, prose that ignores a confirmed critical flag), and the happy path.
+"""
+from __future__ import annotations
+
+import json as _json
+
+import httpx
+
+import llm_draft
+from llm_draft import LLMDraft, draft_impression
+
+_LLM_ENV = (
+    "IMPRESSION_LLM_BASE_URL", "IMPRESSION_LLM_MODEL",
+    "IMPRESSION_LLM_API_KEY", "IMPRESSION_LLM_TIMEOUT_SECONDS",
+    "IMPRESSION_LLM_ALLOW_INSECURE",
+)
+
+# Capture the real AsyncClient before any monkeypatch replaces it -- tests patch
+# llm_draft.httpx.AsyncClient, the same class object as this one (import httpx shares the ref).
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+CRITICAL_FLAGS = [{"label": "pneumothorax", "severity": "critical"}]
+
+
+def _clear(monkeypatch) -> None:
+    for k in _LLM_ENV:
+        monkeypatch.delenv(k, raising=False)
+
+
+def _configure(monkeypatch, base_url: str = "http://localhost:8000/v1", model: str = "test-model") -> None:
+    # Default to a loopback base URL: the transport guard allows it, so the behavioural tests below
+    # exercise the LLM path itself. The plaintext-remote guard is covered by its own tests.
+    monkeypatch.setenv("IMPRESSION_LLM_BASE_URL", base_url)
+    monkeypatch.setenv("IMPRESSION_LLM_MODEL", model)
+
+
+def _install(monkeypatch, transport: httpx.MockTransport) -> None:
+    monkeypatch.setattr(
+        "llm_draft.httpx.AsyncClient",
+        lambda **kw: _REAL_ASYNC_CLIENT(transport=transport, **kw),
+    )
+
+
+def _responding(status_code: int = 200, content: str = "") -> tuple[httpx.MockTransport, list[dict]]:
+    """A transport that answers every POST with a chat-completion envelope wrapping `content`,
+    recording each intercepted request for post-hoc assertions."""
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({"url": str(request.url), "body": _json.loads(request.content or b"{}")})
+        return httpx.Response(status_code, json={"choices": [{"message": {"content": content}}]})
+
+    return httpx.MockTransport(handler), seen
+
+
+async def test_disabled_when_unset(monkeypatch):
+    _clear(monkeypatch)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200)
+
+    _install(monkeypatch, httpx.MockTransport(handler))
+    out = await draft_impression(conclusion="", finding_labels="", critical_flags=[], ehr_context={})
+    assert out is None
+    assert calls["n"] == 0  # unset is the default -- no network call attempted at all
+
+
+async def test_misconfigured_half_set_warns_once_and_degrades(monkeypatch, caplog):
+    _clear(monkeypatch)
+    monkeypatch.setenv("IMPRESSION_LLM_BASE_URL", "http://llm-host:8000/v1")  # model left unset
+    monkeypatch.setattr(llm_draft, "_warned_misconfigured", False)
+    out = await draft_impression(conclusion="", finding_labels="", critical_flags=[], ehr_context={})
+    assert out is None
+    assert "must both be set" in caplog.text
+
+
+async def test_model_down_degrades_to_none(monkeypatch):
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _install(monkeypatch, httpx.MockTransport(refuse))
+    out = await draft_impression(
+        conclusion="no acute findings", finding_labels="", critical_flags=[], ehr_context={}
+    )
+    assert out is None
+
+
+async def test_timeout_degrades_to_none(monkeypatch):
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        raise httpx.TimeoutException("timed out", request=request)
+
+    _install(monkeypatch, httpx.MockTransport(slow))
+    out = await draft_impression(conclusion="", finding_labels="", critical_flags=[], ehr_context={})
+    assert out is None
+
+
+async def test_http_5xx_degrades_to_none(monkeypatch):
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    transport, _ = _responding(500, content="")
+    _install(monkeypatch, transport)
+    out = await draft_impression(conclusion="", finding_labels="", critical_flags=[], ehr_context={})
+    assert out is None
+
+
+async def test_malformed_json_degrades_to_none(monkeypatch, caplog):
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    transport, _ = _responding(200, content="not json at all")
+    _install(monkeypatch, transport)
+    out = await draft_impression(conclusion="", finding_labels="", critical_flags=[], ehr_context={})
+    assert out is None
+    assert "JSONDecodeError" in caplog.text
+
+
+async def test_empty_recommendations_degrades_to_none(monkeypatch, caplog):
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    content = '{"impressionText": "No acute findings.", "recommendations": []}'
+    transport, _ = _responding(200, content=content)
+    _install(monkeypatch, transport)
+    out = await draft_impression(conclusion="", finding_labels="", critical_flags=[], ehr_context={})
+    assert out is None
+    # The reason string distinguishes this from the other rejection kinds in production logs --
+    # previously every rejection logged identically as "malformed: ValueError" (#77 follow-up).
+    assert "malformed or empty recommendations" in caplog.text
+
+
+async def test_prose_not_mentioning_critical_flag_degrades_to_none(monkeypatch, caplog):
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    content = '{"impressionText": "No acute findings identified.", "recommendations": ["Routine follow-up."]}'
+    transport, _ = _responding(200, content=content)
+    _install(monkeypatch, transport)
+    out = await draft_impression(
+        conclusion="large pneumothorax", finding_labels="", critical_flags=CRITICAL_FLAGS, ehr_context={}
+    )
+    assert out is None
+    assert "prose does not reference any confirmed critical flag" in caplog.text
+
+
+async def test_success_returns_llm_draft(monkeypatch):
+    _clear(monkeypatch)
+    _configure(monkeypatch, model="test-model")
+    content = (
+        '{"impressionText": "Findings consistent with a right-sided pneumothorax.", '
+        '"recommendations": ["Urgent clinical correlation recommended."]}'
+    )
+    transport, seen = _responding(200, content=content)
+    _install(monkeypatch, transport)
+    out = await draft_impression(
+        conclusion="large right pneumothorax",
+        finding_labels="pneumothorax",
+        critical_flags=CRITICAL_FLAGS,
+        ehr_context={"activeProblems": [{"display": "COPD"}]},
+    )
+    assert out == LLMDraft(
+        impression_text="Findings consistent with a right-sided pneumothorax.",
+        recommendations=["Urgent clinical correlation recommended."],
+    )
+    assert len(seen) == 1
+    assert seen[0]["url"] == "http://localhost:8000/v1/chat/completions"
+    assert seen[0]["body"]["model"] == "test-model"
+    assert seen[0]["body"]["messages"][-1]["role"] == "user"
+
+
+async def test_plaintext_remote_refused_by_default(monkeypatch, caplog):
+    _clear(monkeypatch)
+    _configure(monkeypatch, base_url="http://llm-host:8000/v1")  # non-loopback plaintext
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    _install(monkeypatch, httpx.MockTransport(handler))
+    out = await draft_impression(
+        conclusion="large pneumothorax", finding_labels="pneumothorax",
+        critical_flags=CRITICAL_FLAGS, ehr_context={"activeProblems": [{"display": "COPD"}]},
+    )
+    assert out is None
+    assert calls["n"] == 0  # refused BEFORE any request leaves the process -- no PHI on the wire
+    assert "plaintext" in caplog.text.lower()
+
+
+async def test_plaintext_remote_allowed_with_optin(monkeypatch):
+    _clear(monkeypatch)
+    _configure(monkeypatch, base_url="http://llm-host:8000/v1")
+    monkeypatch.setenv("IMPRESSION_LLM_ALLOW_INSECURE", "1")
+    content = ('{"impressionText": "Findings consistent with a pneumothorax.", '
+               '"recommendations": ["Urgent clinical correlation."]}')
+    transport, seen = _responding(200, content=content)
+    _install(monkeypatch, transport)
+    out = await draft_impression(
+        conclusion="pneumothorax", finding_labels="pneumothorax",
+        critical_flags=CRITICAL_FLAGS, ehr_context={},
+    )
+    assert out is not None and len(seen) == 1  # opt-in lets it proceed
+
+
+async def test_optin_accepts_capitalised_true(monkeypatch):
+    # truthy set matches FHIR2_ALLOW_INSECURE_WRITE: True/YES/Yes all work, not just "1"
+    assert llm_draft._egress_transport_is_secure("https://remote/v1")
+    for val in ("1", "true", "True", "YES", "Yes"):
+        monkeypatch.setenv("IMPRESSION_LLM_ALLOW_INSECURE", val)
+        assert llm_draft._egress_transport_is_secure("http://llm-host:8000/v1"), val
+    monkeypatch.setenv("IMPRESSION_LLM_ALLOW_INSECURE", "no")
+    assert not llm_draft._egress_transport_is_secure("http://llm-host:8000/v1")
+
+
+async def test_https_remote_allowed_without_optin(monkeypatch):
+    _clear(monkeypatch)
+    _configure(monkeypatch, base_url="https://llm-host/v1")  # TLS -> always fine
+    content = ('{"impressionText": "Pneumothorax noted.", "recommendations": ["Correlate."]}')
+    transport, seen = _responding(200, content=content)
+    _install(monkeypatch, transport)
+    out = await draft_impression(
+        conclusion="pneumothorax", finding_labels="", critical_flags=CRITICAL_FLAGS, ehr_context={},
+    )
+    assert out is not None and len(seen) == 1
