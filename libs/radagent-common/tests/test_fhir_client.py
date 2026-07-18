@@ -1,9 +1,9 @@
 """Unit tests for Fhir2Client.poll_finalized_reports (issue #12).
 
 Mocks the fhir2 HTTP layer (no live server) and checks: the query pages by INCLUSIVE `_lastUpdated`
-(NOT the `status` param, which 400s on live fhir2), `status == final` is filtered client-side,
-Bundle `next` pages are followed, and the high-water cursor is the max lastUpdated across ALL
-entries. Each report is projected to a lean, PHI-free record.
+(NOT the `status` param, which 400s on live fhir2), the sign-off statuses (final/amended/corrected,
+#66) are filtered client-side, Bundle `next` pages are followed, and the high-water cursor is the
+max lastUpdated across ALL entries. Each report is projected to a lean, PHI-free record.
 """
 from __future__ import annotations
 
@@ -79,6 +79,32 @@ def test_poll_uses_inclusive_ge_filters_final_and_reports_high_water():
     assert high_water == "2026-06-27T12:31:00Z"
     assert set(reports[0]) == {"diagnosticReportId", "status", "serviceRequestRef",
                               "accessionNumber", "signedAt", "lastUpdatedCursor"}
+
+
+def test_poll_returns_addenda_amended_and_corrected_but_not_preliminary():
+    """RIS sign-off detection covers the FINAL sign-off AND later ADDENDA (#56 (a) / #66): an
+    amended or corrected DiagnosticReport is returned too, each carrying its status so the poller
+    routes it to report_addended. The pre-sign AI draft (`preliminary`, #26) stays excluded -- it is
+    not a human sign-off. High-water still advances across ALL entries, addenda included."""
+    client = Fhir2Client()
+    amended = {"resourceType": "DiagnosticReport", "id": "rep-amd", "status": "amended",
+               "meta": {"lastUpdated": "2026-06-27T14:00:00Z"}}
+    corrected = {"resourceType": "DiagnosticReport", "id": "rep-cor", "status": "corrected",
+                 "meta": {"lastUpdated": "2026-06-27T15:00:00Z"}}
+
+    async def fake_get(path, params=None):
+        return _bundle(_FINAL, amended, _PRELIM, corrected)
+
+    client._get = fake_get  # type: ignore[assignment]
+    reports, high_water = asyncio.run(client.poll_finalized_reports("2026-06-27T00:00:00Z"))
+
+    got = {r["diagnosticReportId"]: r["status"] for r in reports}
+    assert got == {
+        "DiagnosticReport/rep-1": "final",
+        "DiagnosticReport/rep-amd": "amended",
+        "DiagnosticReport/rep-cor": "corrected",
+    }, "addenda (amended/corrected) must be polled alongside final; preliminary must stay excluded"
+    assert high_water == "2026-06-27T15:00:00Z"
 
 
 def test_poll_follows_bundle_next_link():

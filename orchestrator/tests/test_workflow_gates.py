@@ -58,6 +58,9 @@ def _reset(verify_plan: list[tuple[str, bool]]) -> None:
 @activity.defn(name="call_agent_skill_activity")
 async def mock_call_agent(agent: str, skill_id: str, payload: dict) -> dict:
     if skill_id == "report.verify":
+        # Record which report each verify saw, so the addendum tests can prove the RE-verify ran
+        # against the CORRECTED report and not the original (setdefault: harmless for other tests).
+        _STATE.setdefault("verify_reports", []).append(payload.get("report"))
         plan = _STATE["verify_plan"]
         status, human = plan[min(_STATE["verify_i"], len(plan) - 1)]
         _STATE["verify_i"] += 1
@@ -366,4 +369,124 @@ def test_workflow_survives_worker_restart_during_gate():
                 await handle.signal(StudyWorkflow.report_finalized, {"diagnosticReportId": "DiagnosticReport/1"})
                 result = await handle.result()
         assert result["finalState"] == "ARCHIVED"  # resumed on the new worker
+    asyncio.run(scenario())
+
+
+# --- #56 (a) / #66: the RIS addendum flow -- a CORRECTED report re-verifies ------------------
+
+
+def test_an_addendum_reverifies_the_corrected_report_and_archives():
+    """#56 (a) / #66: a corrected report re-enters verification and can PASS.
+
+    The #57 override WAIVES an unchanged report; the addendum REPLACES it. A study parked at
+    AWAITING_SIGNOFF on a FAIL receives report_addended (the RIS poller's signal for an
+    amended/corrected DiagnosticReport), adopts the corrected report, re-verifies against it, and --
+    now that the content actually changed -- PASSes and archives through COMMUNICATE. This is exactly
+    the path #56 filed and #57 deliberately left open: a genuinely corrected report getting back
+    through the gate, instead of being stuck re-deriving the original FAIL.
+    """
+    FINAL = {"diagnosticReportId": "DiagnosticReport/1", "status": "final"}
+    CORRECTED = {"diagnosticReportId": "DiagnosticReport/1", "status": "corrected"}
+
+    async def scenario():
+        # First verify FAILs (-> gate); after the addendum the re-verify PASSes.
+        _reset([("FAIL", True), ("PASS", False)])
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with _worker(env):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT, id="wf-gate-addendum", task_queue=TASK_QUEUE
+                )
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                await handle.signal(StudyWorkflow.report_finalized, FINAL)
+                await _wait_state(handle, "AWAITING_SIGNOFF")   # the FAIL parked it at the gate
+                await handle.signal(StudyWorkflow.report_addended, CORRECTED)
+                result = await handle.result()
+
+        assert result["finalState"] == "ARCHIVED"
+        # It DID re-verify (unlike the #57 override, which never does): both verify calls ran...
+        assert _STATE["verify_i"] == 2, "the addendum did not trigger a re-verify"
+        # ...and the re-verify saw the CORRECTED report, not the original final one.
+        assert _STATE["verify_reports"][0] == FINAL
+        assert _STATE["verify_reports"][1] == CORRECTED
+        # The corrected report PASSed, so the study archived clean -- no escalation, no gate ack,
+        # no abandon: it left through the front door, not the escape hatch.
+        assert result["verification"]["verificationStatus"] == "PASS"
+        assert result["signoff"] == {}
+        assert _STATE["escalations"] == []
+        assert _STATE.get("abandoned", []) == []
+    asyncio.run(scenario())
+
+
+def test_an_addendum_that_arrives_before_any_finalized_report_satisfies_the_report_gate():
+    """A signed-then-corrected report whose FIRST poller sighting is already amended -- sign and
+    correct within one poll interval, a poller/fhir2 outage spanning both events, or a sign-off
+    predating a fresh-start cursor -- never produces report_finalized: the resource's status is
+    already amended. The addendum must satisfy the report gate itself, or the workflow sits at
+    AWAITING_RADIOLOGIST forever with the corrected report buffered (a reproduced strand: the
+    report IS signed in the RIS, and nothing was ever going to arrive)."""
+    CORRECTED = {"diagnosticReportId": "DiagnosticReport/1", "status": "amended"}
+
+    async def scenario():
+        _reset([("PASS", False)])
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with _worker(env):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT, id="wf-gate-addendum-first",
+                    task_queue=TASK_QUEUE
+                )
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                await handle.signal(StudyWorkflow.report_addended, CORRECTED)
+                result = await handle.result()
+
+        assert result["finalState"] == "ARCHIVED"
+        # Verified ONCE, against the corrected report -- the addendum served as the report event.
+        assert _STATE["verify_i"] == 1
+        assert _STATE["verify_reports"] == [CORRECTED]
+    asyncio.run(scenario())
+
+
+def test_an_addendum_that_still_fails_returns_to_the_gate_not_to_communicate():
+    """The addendum re-verifies HONESTLY: if the correction still FAILs, the study returns to the
+    gate rather than archiving. Only a report that genuinely passes leaves through verification; the
+    #57 override remains the escape hatch for a FAIL a human chooses to waive.
+
+    Here the corrected report still FAILs, so the study re-parks at AWAITING_SIGNOFF; a subsequent
+    override then releases it -- carrying the FAIL and the acknowledgement out on the record, and
+    NOT re-verifying again (that terminal property is #57's).
+    """
+    CORRECTED = {"diagnosticReportId": "DiagnosticReport/1", "status": "amended"}
+
+    async def scenario():
+        # initial FAIL -> gate; addendum re-verify still FAILs -> re-park; override is terminal.
+        _reset([("FAIL", True), ("FAIL", True)])
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with _worker(env):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT, id="wf-gate-addendum-refail", task_queue=TASK_QUEUE
+                )
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                await handle.signal(StudyWorkflow.report_finalized,
+                                    {"diagnosticReportId": "DiagnosticReport/1", "status": "final"})
+                await _wait_state(handle, "AWAITING_SIGNOFF")
+                await handle.signal(StudyWorkflow.report_addended, CORRECTED)
+                # the addendum's re-verify runs and still FAILs -> the study must return to the gate,
+                # not archive. Wait for that second verify, then confirm it is parked again.
+                for _ in range(200):
+                    if _STATE["verify_i"] >= 2:
+                        break
+                    await asyncio.sleep(0.02)
+                assert _STATE["verify_i"] == 2, "the addendum did not re-verify"
+                await _wait_state(handle, "AWAITING_SIGNOFF")   # re-parked on the still-FAIL
+                # a human then waives it (the escape hatch): terminal, no third verify.
+                await handle.signal(StudyWorkflow.signoff_acknowledged, {
+                    "acknowledgedBy": "Practitioner/dr-rao",
+                    "reason": "correction still flags; discussed with referrer, releasing",
+                    "acknowledgedAt": "2026-07-15T02:00:00Z"})
+                result = await handle.result()
+
+        assert result["finalState"] == "ARCHIVED"
+        assert _STATE["verify_i"] == 2, "the override re-verified (it must not)"
+        assert result["verification"]["verificationStatus"] == "FAIL"
+        assert result["signoff"]["status"] == "ACKNOWLEDGED"
+        assert result["signoff"]["acknowledgedBy"] == "Practitioner/dr-rao"
     asyncio.run(scenario())

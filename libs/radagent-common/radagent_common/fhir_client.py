@@ -441,18 +441,24 @@ class Fhir2Client:
         return None
 
     async def poll_finalized_reports(self, since_iso: str) -> tuple[list[dict], Optional[str]]:
-        """RIS sign-off detection. Returns (finalized records oldest-first, high-water cursor).
+        """RIS sign-off detection. Returns (sign-off records oldest-first, high-water cursor).
+
+        Covers the FINAL report (the radiologist's sign-off) AND any later ADDENDUM -- an
+        amended/corrected DiagnosticReport (#56 (a) / #66). Each record carries `status`, and the
+        poller routes on it: `final` -> report_finalized, `amended`/`corrected` -> report_addended.
+        An addendum re-enters this poll naturally: amending a report bumps its `_lastUpdated`, so it
+        reappears past the cursor as a fresh hit under the same id.
 
         `status` is NOT a searchable param on the live fhir2 (OpenMRS 5.7.9) —
         `DiagnosticReport?status=final` returns 400 (verified in the #3 spike) — so we page by
-        `_lastUpdated` and filter `status == final` client-side.
+        `_lastUpdated` and filter status client-side.
 
         Correctness of the cursor (issue #12 acceptance):
           * query `ge` (INCLUSIVE) + dedup by id in the poller, so a report sharing the boundary
             second is never lost to strict-greater (OpenMRS timestamps are second-precision);
           * follow every Bundle `next` link, so nothing is missed past page 1;
           * high-water = max `meta.lastUpdated` across ALL entries seen (any status, computed by
-            max not by trusting `_sort`), so the poller advances past non-final reports too.
+            max not by trusting `_sort`), so the poller advances past non-signed reports too.
         Records are lean + PHI-free (IDs + refs + cursor).
         """
         reports: list[dict] = []
@@ -468,7 +474,7 @@ class Fhir2Client:
                 updated = (resource.get("meta") or {}).get("lastUpdated")
                 if updated and (high_water is None or updated > high_water):
                     high_water = updated
-                if resource.get("status") == "final":
+                if resource.get("status") in _SIGNOFF_STATUSES:
                     reports.append(finalized_report_record(resource))
             target, params = _bundle_next_link(bundle), None  # next link is an absolute URL
         return reports, high_water
@@ -512,6 +518,13 @@ def _order_reason_codes(resource: dict) -> list[str]:
             if isinstance(code, str) and code and code not in codes:
                 codes.append(code)
     return codes
+
+
+# DiagnosticReport statuses the RIS poller treats as a sign-off event. `final` is the radiologist's
+# original sign-off (-> report_finalized); `amended`/`corrected` are addenda to an already-signed
+# report (-> report_addended, #56 (a) / #66). `preliminary` is deliberately excluded -- it is the
+# pre-sign AI draft (#26), not a human sign-off.
+_SIGNOFF_STATUSES = frozenset({"final", "amended", "corrected"})
 
 
 def finalized_report_record(report: dict) -> dict:
