@@ -105,7 +105,47 @@ def test_evicted_workflow_turns_failing_report_into_a_dead_letter():
     assert letter["reportId"] == "DiagnosticReport/r1"
     assert letter["workflowId"] == "wf_gone"
     assert letter["attempts"] == 1
+    assert letter["kind"] == "signoff-drop"   # a final report = a possibly lost SIGN-OFF
     assert ingress._store().failed_signal_for("DiagnosticReport/r1") is None  # tracking retired
+
+
+def test_a_post_archive_addendum_is_dead_lettered_as_what_it_is_not_as_a_lost_signoff():
+    """An amended/corrected report whose workflow already finished is NOT a lost signature --
+    it is a correction that was never re-verified, and /admin/dead-letters must say so (lead
+    ruling on the #66 audit): filing it as "signoff-drop" sent the operator hunting a signature
+    that was never lost. Same give-up sequence, honest kind + reason."""
+    ingress._index_workflow(_ctx("wf_done", accession="ACC-9"))
+    addendum = {**_report("DiagnosticReport/r9", "t9", accession="ACC-9"), "status": "amended"}
+
+    asyncio.run(ingress._process_batch(_RaisingClient(), [addendum], set()))  # attempt fails
+    ingress._store().evict_workflow("wf_done")                                # workflow finished
+    asyncio.run(ingress._process_batch(_FakeClient(), [addendum], set()))
+
+    (letter,) = ingress._store().dead_letters()
+    assert letter["kind"] == "post-archive-addendum"
+    assert "never re-verified" in letter["reason"]
+    assert "sign-off" not in letter["reason"]
+
+
+def test_a_signoff_that_failed_before_the_amendment_is_never_masked_as_an_addendum():
+    """The hostile re-verification's counter-case: the FINAL report's signal fails (outage), the
+    radiologist amends DURING the window, so every retry -- and the eventual eviction re-entry --
+    carries the amended version. The workflow never received its sign-off; classifying from the
+    CURRENT version's status would file this genuinely lost signature as a routine addendum (the
+    dangerous direction). The kind comes from the RECORDED failure history: a failed
+    report_finalized is 'final'-sticky, whatever version arrives later."""
+    ingress._index_workflow(_ctx("wf_stuck", accession="ACC-7"))
+    final = {**_report("DiagnosticReport/r7", "t7", accession="ACC-7"), "status": "final"}
+    amended = {**_report("DiagnosticReport/r7", "t7b", accession="ACC-7"), "status": "amended"}
+
+    asyncio.run(ingress._process_batch(_RaisingClient(), [final], set()))    # sign-off fails
+    asyncio.run(ingress._process_batch(_RaisingClient(), [amended], set()))  # retry = amended now
+    ingress._store().evict_workflow("wf_stuck")                              # terminated/reconciled
+    asyncio.run(ingress._process_batch(_FakeClient(), [amended], set()))
+
+    (letter,) = ingress._store().dead_letters()
+    assert letter["kind"] == "signoff-drop"       # the lost SIGN-OFF, not the amendment
+    assert letter["attempts"] == 2                # history spans both versions
 
 
 def test_dead_letter_is_idempotent_across_rescans():

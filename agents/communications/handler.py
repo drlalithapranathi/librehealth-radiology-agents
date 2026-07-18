@@ -6,10 +6,12 @@ The real CritCom (Critical-Results Communication) agent (#52). Three skills:
   - comms.escalate : an unacknowledged critical result goes to the on-call provider
 
 TWO DIFFERENT GATES. Do not confuse them, and do not double-page:
-  * #29's escalation ladder is the "radiologist didn't SIGN" gate. Its fired rung arrives here as
-    an `escalation` input slice on comms.dispatch. The ladder already chose who/how/how-loudly, so
-    those channels are dispatched VERBATIM and NO ack clock is opened -- this is the orchestrator
-    paging a human about a report that does not exist yet. There is nothing to acknowledge.
+  * #29's escalation ladder is the "radiologist hasn't RESOLVED the verification hold" gate: a
+    SIGNED report failed verification and sits at the sign-off gate awaiting its radiologist.
+    Its fired rung arrives here as an `escalation` input slice on comms.dispatch. The ladder
+    already chose who/how/how-loudly AND owns the cadence (Temporal durable timers fire the next
+    rung), so those channels are dispatched VERBATIM and NO ack clock is opened -- a comms-side
+    Task would put the same human on two clocks at once.
   * checkAck/escalate are the "physician didn't ACK a critical result" gate: a signed report whose
     critical finding was communicated, and nobody confirmed receipt. That loop is what the
     Communication/Task pair in the comms ledger tracks.
@@ -32,6 +34,7 @@ from radagent_common.fhir_client import Fhir2Client
 from radagent_common.tracing import now_iso
 
 from classifier import ACRCategory, classify, escalation_ack_minutes
+from routing import derive_specialty, out_of_specialty_fallback
 from tools import (
     ack_state,
     dispatch_communication,
@@ -87,8 +90,9 @@ async def _dispatch(payload: dict) -> dict:
     escalation = payload.get("escalation") or {}
     if escalation:
         # A fired sign-off ladder rung (#29) -- the OTHER gate. The ladder picked the channels, so
-        # send them as asked. No Communication, no ack clock: there is no signed report to
-        # acknowledge, and opening one here would put the same human on two clocks at once.
+        # send them as asked. No Communication, no ack clock: the ladder itself is the clock
+        # (Temporal owns the cadence and the next rung), and a comms-side Task would put the
+        # same human on two clocks at once.
         return _out(
             payload,
             dispatchStatus="SENT",
@@ -111,15 +115,24 @@ async def _dispatch(payload: dict) -> dict:
 
     patient_ref, order_ref = _refs(payload)
     recipient = await resolve_ordering_provider(_fhir(), order_ref)
+    out_of_specialty = False
     if not recipient:
         # No requester on the order (e.g. a study ingested unresolved, #11). A critical finding
-        # with nobody to tell must not be silently dropped -- go straight to on-call.
-        recipient = await resolve_on_call_provider(_ledger())
-        _log.warning("no requester on %s; addressing the critical result to on-call (%s)",
-                     order_ref or "<no order>", recipient)
+        # with nobody to tell must not be silently dropped -- go to on-call, narrowed to the
+        # study's specialty when one derives (#58: an intracranial bleed should page neuro call,
+        # not whoever the directory lists first).
+        specialty = derive_specialty(payload["studyContext"].get("study") or {})
+        resolution = await resolve_on_call_provider(
+            _ledger(), specialty=specialty, fallback=out_of_specialty_fallback())
+        recipient, out_of_specialty = resolution.reference, resolution.out_of_specialty
+        _log.warning("no requester on %s; addressing the critical result to on-call (%s%s)",
+                     order_ref or "<no order>", recipient,
+                     ", out of specialty" if out_of_specialty else "")
     if not recipient:
         # Nobody to tell, at all. SKIPPED is the honest answer -- reporting SENT would claim a page
-        # that never happened. The orchestrator's own #29 ladder still pages a human.
+        # that never happened. Nothing re-pages in response (the #29 ladder pages only at the
+        # post-sign verification hold, decoupled from dispatch): the miss lives in this log line
+        # and the workflow's record.
         _log.error("no recipient for a %s finding on %s", result.category.value, order_ref)
         return _out(
             payload,
@@ -136,6 +149,7 @@ async def _dispatch(payload: dict) -> dict:
         recipient_ref=recipient,
         acr_category=result.category.value,
         finding=result.finding,
+        out_of_specialty=out_of_specialty,
     )
     task, deadline = await open_ack_task(
         _ledger(),
@@ -201,6 +215,10 @@ async def _escalate(payload: dict) -> dict:
         # See classifier.escalation_ack_minutes (this replaces a payload.get("ackMinutes") read the
         # input schema could never satisfy -- @sunbiz on #52).
         ack_minutes=escalation_ack_minutes(),
+        # Same routing as dispatch's on-call fallback (#58): the escalated page aims at the
+        # study's own specialty rota first.
+        specialty=derive_specialty(payload["studyContext"].get("study") or {}),
+        fallback=out_of_specialty_fallback(),
     )
     return _out(payload, escalatedAt=now_iso(), **result)
 

@@ -11,6 +11,7 @@ Skipped when the orchestrator's deps (temporalio) aren't installed.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 
@@ -126,6 +127,30 @@ def test_build_context_falls_back_when_fhir2_down():
     # Never fail the PACS: still a valid StudyContext, just the UNRESOLVED placeholder.
     assert ctx["patient"] == {"fhirPatientId": "Patient/UNRESOLVED"}
     assert ctx["order"] == {}
+
+
+def test_a_resolver_failure_log_masks_credentials_embedded_in_urls(caplog):
+    """httpx exception text embeds the request URL. A deployment that configured Basic
+    credentials INTO the base URL (http://user:pass@host/...) must not have them echoed by the
+    resolve warning -- which fires on every DICOM arrival when the resolver is down (#67)."""
+    ingress._OPENMRS_REST = _FakeResolver(error=RuntimeError(
+        "Connect failed for url "
+        "'http://admin:Admin123@openmrs:8080/openmrs/ws/rest/v1/radiologyorder'"))
+    ingress._ORTHANC = _FakeOrthanc()
+    with caplog.at_level(logging.WARNING, logger="orchestrator.ingress"):
+        ctx = asyncio.run(ingress._build_study_context(dict(EVENT)))
+    assert ctx["patient"] == {"fhirPatientId": "Patient/UNRESOLVED"}
+    joined = " ".join(r.getMessage() for r in caplog.records)
+    assert "order resolution failed" in joined     # the reason still surfaces...
+    assert "Admin123" not in joined                # ...the credentials never do
+    assert "://***@openmrs" in joined
+    # a raw @ inside the password must mask whole (greedy to the last @ before the path)
+    assert ingress._redacted(RuntimeError(
+        "boom at 'http://admin:p@ssword@openmrs:8080/x'")) == "boom at 'http://***@openmrs:8080/x'"
+    # a query @ on a pathless URL must not swallow the hostname (over-mask direction)
+    assert ingress._redacted(RuntimeError(
+        "404 for http://openmrs:8080?email=jdoe@example.com")) == (
+        "404 for http://openmrs:8080?email=jdoe@example.com")
 
 
 def test_build_context_falls_back_on_miss():

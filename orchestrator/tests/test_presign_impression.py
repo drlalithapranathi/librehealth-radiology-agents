@@ -45,6 +45,7 @@ def _reset() -> None:
     _STATE["impression_calls"] = []
     _STATE["write_calls"] = []
     _STATE["write_should_fail"] = False
+    _STATE["write_should_refuse"] = False   # transport guard refusal (config error, not outage)
     _STATE["impression_should_fail"] = False
     # A real (M3) tool ran. The pre-sign write is GATED on this (#26): with the v1 registry every
     # finding is STUBBED, the impression falls through to its constant "no acute findings" text,
@@ -85,6 +86,9 @@ async def mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) 
 @activity.defn(name="write_presign_impression_activity")
 async def mock_write_presign(service_request_ref: str, patient_ref: str, impression_text: str) -> str:
     _STATE["write_calls"].append((service_request_ref, patient_ref, impression_text))
+    if _STATE["write_should_refuse"]:
+        from radagent_common.fhir_client import InsecureWriteTransportError
+        raise InsecureWriteTransportError("refusing a fhir2 write over plaintext HTTP")
     if _STATE["write_should_fail"]:
         raise RuntimeError("fhir2 write down")
     return "presign-draft-1"
@@ -175,10 +179,35 @@ def test_presign_write_failure_does_not_strand_the_read():
                     id="wf-presign-write-fail", task_queue=TASK_QUEUE,
                 )
                 await _wait_state(handle, "AWAITING_RADIOLOGIST")
-                assert _STATE["write_calls"]  # the write was attempted (and kept failing)
+                # Transient failure keeps its bounded retries: attempted, retried, gave up.
+                assert len(_STATE["write_calls"]) == 3
                 await handle.signal(StudyWorkflow.report_finalized, {"diagnosticReportId": "DiagnosticReport/1"})
                 result = await handle.result()
         assert result["finalState"] == "ARCHIVED"  # not stranded despite the persistent write failure
+    asyncio.run(scenario())
+
+
+def test_a_transport_guard_refusal_fails_fast_with_no_retries():
+    """InsecureWriteTransportError is a CONFIG error (#30): plaintext http to a non-loopback
+    fhir2 without the opt-in refuses identically on every attempt. The write policy declares it
+    non-retryable, so the draft is skipped after ONE attempt -- no retry budget burned re-asking
+    a question with a fixed answer -- and the human read is never stranded."""
+    async def scenario():
+        _reset()
+        _STATE["write_should_refuse"] = True
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with _worker(env):
+                handle = await env.client.start_workflow(
+                    StudyWorkflow.run, STUDY_CONTEXT_WITH_ORDER,
+                    id="wf-presign-guard-refusal", task_queue=TASK_QUEUE,
+                )
+                await _wait_state(handle, "AWAITING_RADIOLOGIST")
+                assert len(_STATE["write_calls"]) == 1   # ONE attempt: refused, not retried
+                await handle.signal(StudyWorkflow.report_finalized,
+                                    {"diagnosticReportId": "DiagnosticReport/1"})
+                result = await handle.result()
+        assert result["finalState"] == "ARCHIVED"        # best-effort: the read went on
+
     asyncio.run(scenario())
 
 

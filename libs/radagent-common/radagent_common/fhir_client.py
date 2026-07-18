@@ -60,9 +60,9 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 def _is_plaintext_remote(base_url: str) -> bool:
-    """Plaintext `http` to a non-loopback host: the transport that exposes anything sent on it. It
-    is the shape a write only takes with the insecure opt-in set, and the shape whose reads get no
-    protection from the write guard (see the read-transport TODO below)."""
+    """Plaintext `http` to a non-loopback host: the transport that exposes anything sent on it.
+    The shared predicate behind BOTH transport guards -- writes (_write_transport_is_secure, #30)
+    and reads (_read_transport_is_secure, #67) -- so the two policies cannot drift."""
     parsed = urlparse(base_url)
     return parsed.scheme != "https" and (parsed.hostname or "").lower() not in _LOOPBACK_HOSTS
 
@@ -76,22 +76,37 @@ def _write_transport_is_secure(base_url: str) -> bool:
     (local dev / unit tests) or the deployment has explicitly accepted the risk on a trusted
     internal network via FHIR2_ALLOW_INSECURE_WRITE. `https` is always fine.
 
-    This guards the WRITE only. Reads use the same base URL and the same HTTP Basic credentials but
-    are NOT gated here, so a read-heavy, write-inert deployment gets no transport protection from
-    this check -- securing the write does not secure the reads. Read-transport TLS is a separate
-    concern, outside #30's write-scoped review; see the TODO(M3) below.
+    This guards the WRITE only. Reads use the same base URL and the same HTTP Basic credentials;
+    they are gated by their own guard, _read_transport_is_secure below (#67), which shares this
+    function's predicate and inherits this opt-in when no read-specific one is set.
     """
     if not _is_plaintext_remote(base_url):
         return True  # https, or a loopback host
     return os.environ.get("FHIR2_ALLOW_INSECURE_WRITE", "").strip().lower() in {"1", "true", "yes"}
 
 
-# TODO(M3, #67): read-transport TLS. The guard above covers writes only. The read methods on
-# Fhir2Client return PHI -- demographics, conditions, allergies, medications, labs, and the
-# radiologist's narrative (get_report_conclusion) -- through `_get` over the SAME plaintext-capable
-# base URL and Basic credentials, ungated. The RIS poller reads every 30s, so a write-inert
-# deployment is exposed continuously. #30 is scoped to the write; refusing (or requiring TLS for)
-# plaintext reads to a remote host is tracked in #67 (not in the #30 N1/N3 follow-ups).
+def _read_transport_is_secure(url: str) -> bool:
+    """Is it safe to send a fhir2 READ to this URL (#67, the read side of #30's F2)?
+
+    Every read method returns PHI -- demographics, conditions, allergies, medications, labs, and
+    the radiologist's narrative (get_report_conclusion) -- and rides the SAME HTTP Basic
+    credentials as the write, so plaintext-to-remote exposes exactly what the write guard refuses
+    to expose. The RIS poller reads every 30s, so a write-inert deployment is exposed
+    CONTINUOUSLY; securing the write did nothing for it. Same predicate as the write guard
+    (`_is_plaintext_remote`) so the two policies cannot drift.
+
+    Opt-in: FHIR2_ALLOW_INSECURE_READ, DEFAULTING to FHIR2_ALLOW_INSECURE_WRITE when unset. The
+    trust statement is about the TRANSPORT, not the verb -- a deployment that already accepted
+    cleartext on this hop for writes (the compose stack does, explicitly) has accepted it for the
+    reads that ride the same wire, and keeps working unchanged. Setting FHIR2_ALLOW_INSECURE_READ
+    explicitly (e.g. "0") overrides that inheritance in either direction.
+    """
+    if not _is_plaintext_remote(url):
+        return True  # https, or a loopback host
+    opt_in = os.environ.get("FHIR2_ALLOW_INSECURE_READ")
+    if opt_in is None:
+        opt_in = os.environ.get("FHIR2_ALLOW_INSECURE_WRITE", "")
+    return opt_in.strip().lower() in {"1", "true", "yes"}
 
 
 class InsecureWriteTransportError(RuntimeError):
@@ -126,6 +141,45 @@ def _guard_write_transport(base_url: str) -> None:
         )
 
 
+class InsecureReadTransportError(RuntimeError):
+    """A fhir2 read refused because the transport is plaintext to a non-loopback host and the
+    insecure opt-in is not set (#67). Same shape and rationale as InsecureWriteTransportError:
+    a RuntimeError subclass, NAMED so an activity call site can mark it non-retryable by type
+    (`non_retryable_error_types=["InsecureReadTransportError"]`) -- a misconfigured transport is a
+    config error, not a transient fault, and the RIS poller must not burn its retry budget (or its
+    30s cadence) re-asking a question with a config-shaped answer."""
+
+
+# Hosts already warned about cleartext reads this process. The write path warns on EVERY write
+# (writes are rare and each is an auditable event); reads happen every 30s from the poller alone,
+# and a per-read warning is log spam that trains operators to ignore the message that matters.
+_INSECURE_READ_WARNED: set[str] = set()
+
+
+def _guard_read_transport(url: str) -> None:
+    if not _read_transport_is_secure(url):
+        # Host named (never the full URL: it could carry userinfo) so the operator fixes the
+        # RIGHT base URL -- this guard also fronts the OpenMRS REST surface (#70), whose URL may
+        # come from OPENMRS_REST_BASE_URL rather than FHIR2_BASE_URL.
+        raise InsecureReadTransportError(
+            f"refusing a PHI read over plaintext HTTP to non-loopback host "
+            f"{(urlparse(url).hostname or '')!r}: the response is PHI and the HTTP Basic "
+            "credentials travel with the request, both in cleartext. Use an https base URL "
+            "(FHIR2_BASE_URL, or OPENMRS_REST_BASE_URL for the REST surface), or set "
+            "FHIR2_ALLOW_INSECURE_READ=1 (or the existing FHIR2_ALLOW_INSECURE_WRITE=1, which "
+            "reads inherit) for a trusted internal network."
+        )
+    if _is_plaintext_remote(url):
+        host = (urlparse(url).hostname or "").lower()
+        if host not in _INSECURE_READ_WARNED:
+            _INSECURE_READ_WARNED.add(host)
+            _log.warning(
+                "fhir2 reads proceeding over PLAINTEXT http to %s under the insecure opt-in: PHI "
+                "and HTTP Basic credentials are in cleartext on this hop (warned once per process)",
+                host,
+            )
+
+
 class Fhir2Client:
     def __init__(self, base_url: Optional[str] = None, timeout: float = 15.0):
         self.base_url = (base_url or os.environ.get("FHIR2_BASE_URL", "http://openmrs:8080/openmrs/ws/fhir2/R4")).rstrip("/")
@@ -135,6 +189,9 @@ class Fhir2Client:
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict:
         # `path` may be a relative resource ("DiagnosticReport") or an absolute Bundle next-page URL.
         url = path if path.startswith("http") else f"{self.base_url}/{path.lstrip('/')}"
+        # Guard the URL actually fetched, not just base_url: a Bundle `next` link is absolute and
+        # server-authored, and PHI must not follow it onto a plaintext remote hop either (#67).
+        _guard_read_transport(url)
         async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
             r = await c.get(url, params=params)
             r.raise_for_status()
@@ -441,18 +498,24 @@ class Fhir2Client:
         return None
 
     async def poll_finalized_reports(self, since_iso: str) -> tuple[list[dict], Optional[str]]:
-        """RIS sign-off detection. Returns (finalized records oldest-first, high-water cursor).
+        """RIS sign-off detection. Returns (sign-off records oldest-first, high-water cursor).
+
+        Covers the FINAL report (the radiologist's sign-off) AND any later ADDENDUM -- an
+        amended/corrected DiagnosticReport (#56 (a) / #66). Each record carries `status`, and the
+        poller routes on it: `final` -> report_finalized, `amended`/`corrected` -> report_addended.
+        An addendum re-enters this poll naturally: amending a report bumps its `_lastUpdated`, so it
+        reappears past the cursor as a fresh hit under the same id.
 
         `status` is NOT a searchable param on the live fhir2 (OpenMRS 5.7.9) —
         `DiagnosticReport?status=final` returns 400 (verified in the #3 spike) — so we page by
-        `_lastUpdated` and filter `status == final` client-side.
+        `_lastUpdated` and filter status client-side.
 
         Correctness of the cursor (issue #12 acceptance):
           * query `ge` (INCLUSIVE) + dedup by id in the poller, so a report sharing the boundary
             second is never lost to strict-greater (OpenMRS timestamps are second-precision);
           * follow every Bundle `next` link, so nothing is missed past page 1;
           * high-water = max `meta.lastUpdated` across ALL entries seen (any status, computed by
-            max not by trusting `_sort`), so the poller advances past non-final reports too.
+            max not by trusting `_sort`), so the poller advances past non-signed reports too.
         Records are lean + PHI-free (IDs + refs + cursor).
         """
         reports: list[dict] = []
@@ -468,7 +531,7 @@ class Fhir2Client:
                 updated = (resource.get("meta") or {}).get("lastUpdated")
                 if updated and (high_water is None or updated > high_water):
                     high_water = updated
-                if resource.get("status") == "final":
+                if resource.get("status") in _SIGNOFF_STATUSES:
                     reports.append(finalized_report_record(resource))
             target, params = _bundle_next_link(bundle), None  # next link is an absolute URL
         return reports, high_water
@@ -512,6 +575,13 @@ def _order_reason_codes(resource: dict) -> list[str]:
             if isinstance(code, str) and code and code not in codes:
                 codes.append(code)
     return codes
+
+
+# DiagnosticReport statuses the RIS poller treats as a sign-off event. `final` is the radiologist's
+# original sign-off (-> report_finalized); `amended`/`corrected` are addenda to an already-signed
+# report (-> report_addended, #56 (a) / #66). `preliminary` is deliberately excluded -- it is the
+# pre-sign AI draft (#26), not a human sign-off.
+_SIGNOFF_STATUSES = frozenset({"final", "amended", "corrected"})
 
 
 def finalized_report_record(report: dict) -> dict:

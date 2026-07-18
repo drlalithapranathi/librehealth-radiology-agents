@@ -59,7 +59,11 @@ def _run_poller_for(iterations, monkeypatch):
 
 def test_failing_polls_warn_first_then_throttled(monkeypatch, caplog):
     async def failing_poll(cursor):
-        raise RuntimeError("simulated fhir2 401")
+        # URL-carrying exception text, like the real HTTPStatusError of the 401/#53 case: the
+        # warning must surface the reason WITHOUT the userinfo credentials (no exc_info -- the
+        # formatted traceback would end with the raw URL).
+        raise RuntimeError(
+            "401 for url 'http://admin:Admin123@openmrs:8080/openmrs/ws/fhir2/R4/DiagnosticReport'")
 
     monkeypatch.setattr(ingress.activities, "poll_finalized_reports", failing_poll)
     with caplog.at_level(logging.WARNING, logger="orchestrator.ingress"):
@@ -68,11 +72,15 @@ def test_failing_polls_warn_first_then_throttled(monkeypatch, caplog):
     stalled = [r for r in caplog.records if "sign-off detection is stalled" in r.getMessage()]
     # 25 consecutive failures, FAILED_POLLS_PER_WARNING=10 -> warned at #1, #10, #20 only:
     # visible immediately, throttled thereafter, never silent.
+    reason = ("RuntimeError: 401 for url "
+              "'http://***@openmrs:8080/openmrs/ws/fhir2/R4/DiagnosticReport'")
     assert [r.getMessage() for r in stalled] == [
-        "fhir2 poll failed (1 consecutive); sign-off detection is stalled",
-        "fhir2 poll failed (10 consecutive); sign-off detection is stalled",
-        "fhir2 poll failed (20 consecutive); sign-off detection is stalled",
+        f"fhir2 poll failed (1 consecutive; {reason}); sign-off detection is stalled",
+        f"fhir2 poll failed (10 consecutive; {reason}); sign-off detection is stalled",
+        f"fhir2 poll failed (20 consecutive; {reason}); sign-off detection is stalled",
     ]
+    assert all("Admin123" not in r.getMessage() for r in caplog.records)
+    assert not any(r.exc_info for r in stalled)   # no traceback tail to re-leak the raw URL
 
 
 def test_recovery_is_logged_and_counter_resets(monkeypatch, caplog):

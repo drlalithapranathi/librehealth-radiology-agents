@@ -27,6 +27,7 @@ from radagent_common import paths
 # Dead-letter kinds (the `kind` column). A dead letter is anything an operator must see and
 # reconcile by hand; the kind says which surface degraded.
 KIND_SIGNOFF_DROP = "signoff-drop"                          # a sign-off the poller gave up on (#29)
+KIND_POST_ARCHIVE_ADDENDUM = "post-archive-addendum"         # a correction whose workflow had already finished (#66)
 KIND_POLICY_LOAD_FAILURE = "escalation-policy-load-failure"  # the ladder collapsed to one page (#54)
 KIND_SIGNOFF_ABANDONED = "signoff-abandoned"                 # gate ran out of ladder, nobody acked (#57)
 
@@ -103,6 +104,16 @@ class IngressStore:
                 "ALTER TABLE dead_letters ADD COLUMN kind TEXT NOT NULL "
                 f"DEFAULT '{KIND_SIGNOFF_DROP}'"
             )
+        # A failure record must remember WHICH signal failed: the eventual dead letter is
+        # classified from this history, not from whatever version fhir2 serves at eviction time
+        # (a report amended DURING the outage would otherwise re-label a genuinely lost sign-off
+        # as an addendum -- the dangerous direction). Pre-migration rows default to 'final':
+        # classifying an unknown history as a possible lost sign-off is the safe error.
+        fs_columns = {row[1] for row in self._db.execute("PRAGMA table_info(failed_signals)")}
+        if "signal" not in fs_columns:
+            self._db.execute(
+                "ALTER TABLE failed_signals ADD COLUMN signal TEXT NOT NULL DEFAULT 'final'"
+            )
 
     # ---- report -> workflow join index -------------------------------------------
     def put_index(self, join_key: str, workflow_id: str) -> None:
@@ -136,13 +147,36 @@ class IngressStore:
 
     # ---- poll cursor (+ boundary dedup set) --------------------------------------
     def load_cursor(self) -> tuple[Optional[str], set[str]]:
-        """Return (cursor, signalled-ids-at-boundary). (None, set()) on a fresh store."""
+        """Return (cursor, signalled-ids-at-boundary). (None, set()) on a fresh store.
+
+        Upgrade shim: a store written before the version-keyed dedup (#66) holds BARE report
+        ids — rewrite them as id@cursor on load. For a store saved with an un-held cursor (the
+        quiet steady state) that key is exact: the pre-#66 prune kept only the boundary, whose
+        stamp IS the cursor. Without the rewrite, the first post-upgrade poll re-signals the
+        boundary report; if its workflow has meanwhile completed, that decays into a per-poll
+        "matched no waiting workflow" warning that never ages out on a quiet system, or — if
+        the index row is still pending reconciliation — a held cursor and a spurious
+        signoff-drop dead letter for a study that finished normally.
+
+        Known residual, kept deliberately: a store saved while the cursor was HELD by failing
+        signals (#29) may also hold ids whose true stamp is later than the cursor; those
+        migrate to a phantom key and their report re-signals once after the deploy — the
+        pre-shim behaviour for exactly those ids. The phantom key can only err toward
+        RE-delivery (it matches nothing real, and FHIR search returns one current version per
+        resource), never toward swallowing; a shim strong enough to silence that re-signal
+        (bare-id fallback matching) could swallow a genuine addendum, the one direction this
+        pipeline must never choose. FHIR ids cannot contain '@', so the marker is unambiguous.
+        The rewrite persists on the next save_cursor.
+        """
         row = self._db.execute(
             "SELECT cursor, signalled_ids FROM poller_state WHERE id = 1"
         ).fetchone()
         if not row:
             return None, set()
-        return row[0], set(json.loads(row[1] or "[]"))
+        cursor, ids = row[0], set(json.loads(row[1] or "[]"))
+        if cursor:
+            ids = {i if "@" in i else f"{i}@{cursor}" for i in ids}
+        return cursor, ids
 
     def save_cursor(self, cursor: str, signalled_ids: set[str]) -> None:
         self._db.execute(
@@ -160,14 +194,22 @@ class IngressStore:
     # lets the poller tell "was ours, workflow gone" apart from "never ours" — the former is a
     # dead letter a human must see, the latter is routine fhir2 noise. IDs only, never PHI.
 
-    def record_failed_signal(self, report_id: str, workflow_id: str, at_iso: str) -> None:
-        """Upsert one failed delivery attempt for a mapped report (attempts increment)."""
+    def record_failed_signal(self, report_id: str, workflow_id: str, at_iso: str,
+                             signal: str = "final") -> None:
+        """Upsert one failed delivery attempt for a mapped report (attempts increment).
+
+        `signal` is 'final' or 'addendum' -- which DELIVERY failed. It is 'final'-sticky across
+        versions: once a report_finalized delivery has failed, a later retry that happens to
+        carry the amended version must not re-label the record, because the thing still
+        undelivered is the sign-off."""
         self._db.execute(
-            "INSERT INTO failed_signals (report_id, workflow_id, first_seen, last_attempt) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO failed_signals (report_id, workflow_id, first_seen, last_attempt, signal) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(report_id) DO UPDATE SET workflow_id = excluded.workflow_id, "
-            "last_attempt = excluded.last_attempt, attempts = attempts + 1",
-            (report_id, workflow_id, at_iso, at_iso),
+            "last_attempt = excluded.last_attempt, attempts = attempts + 1, "
+            "signal = CASE WHEN failed_signals.signal = 'final' THEN 'final' "
+            "ELSE excluded.signal END",
+            (report_id, workflow_id, at_iso, at_iso, signal),
         )
         self._db.commit()
 
@@ -178,13 +220,13 @@ class IngressStore:
 
     def failed_signal_for(self, report_id: str) -> Optional[dict]:
         row = self._db.execute(
-            "SELECT report_id, workflow_id, first_seen, last_attempt, attempts "
+            "SELECT report_id, workflow_id, first_seen, last_attempt, attempts, signal "
             "FROM failed_signals WHERE report_id = ?", (report_id,)
         ).fetchone()
         if not row:
             return None
         return {"reportId": row[0], "workflowId": row[1], "firstSeen": row[2],
-                "lastAttempt": row[3], "attempts": row[4]}
+                "lastAttempt": row[3], "attempts": row[4], "signal": row[5]}
 
     def add_dead_letter(self, report_id: str, workflow_id: str, attempts: int,
                         reason: str, at_iso: str,
