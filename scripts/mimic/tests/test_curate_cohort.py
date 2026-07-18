@@ -94,6 +94,20 @@ def test_select_fills_buckets_without_double_counting():
     assert len(all_ids) == len(set(all_ids))
 
 
+def test_select_caps_studies_per_subject_except_priors():
+    cands = [
+        _cand("s1", "10", {"No Finding": 1}),
+        _cand("s2", "10", {"No Finding": 1}),
+        _cand("s3", "10", {"No Finding": 1}),   # third study of subject 10: capped out
+        _cand("s4", "11", {"No Finding": 1}),
+        _cand("s5", "10", {}, priors=["s1"]),   # priors bucket ignores the cap
+    ]
+    targets = {"normal": 3, "pneumothorax": 0, "effusion": 0, "priors": 1, "portable": 0}
+    chosen = C.select(cands, targets, max_per_subject=2)
+    assert [c.study_id for c in chosen["normal"]] == ["s1", "s2", "s4"]
+    assert [c.study_id for c in chosen["priors"]] == ["s5"]
+
+
 # --- manifest entry -------------------------------------------------------
 def test_manifest_entry_reason_and_priority():
     c = C.Candidate("s7", "20", report_text=REPORT_OK, sections=C.parse_sections(REPORT_OK),

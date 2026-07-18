@@ -241,32 +241,40 @@ def bucket_of(c: Candidate) -> Optional[str]:
     return None
 
 
-def select(cands: list, targets: dict) -> dict:
+def select(cands: list, targets: dict, max_per_subject: int = 2) -> dict:
     """Fill the composition buckets, each study counted once. Label buckets first (pneumothorax,
     effusion, normal), then the cross-cutting priors and portable quotas from what remains.
-    Returns {bucket: [Candidate]}."""
+    `max_per_subject` keeps the cohort from clumping on prolific subjects (the study list is
+    subject-ordered, so unbounded greedy selection drains one patient at a time); the priors
+    bucket is exempt since a priors story NEEDS same-subject studies. Returns {bucket: [Candidate]}."""
     chosen: dict[str, list] = {k: [] for k in targets}
     taken: set[str] = set()
+    per_subject: dict[str, int] = {}
+
+    def _take(bucket: str, c: Candidate, capped: bool = True) -> None:
+        if capped and per_subject.get(c.subject_id, 0) >= max_per_subject:
+            return
+        chosen[bucket].append(c)
+        taken.add(c.study_id)
+        per_subject[c.subject_id] = per_subject.get(c.subject_id, 0) + 1
+
     for bucket in ("pneumothorax", "effusion", "normal"):
         for c in cands:
             if len(chosen[bucket]) >= targets[bucket]:
                 break
             if c.study_id in taken or bucket_of(c) != bucket:
                 continue
-            chosen[bucket].append(c)
-            taken.add(c.study_id)
+            _take(bucket, c)
     for c in cands:
         if len(chosen["priors"]) >= targets["priors"]:
             break
         if c.study_id not in taken and c.prior_study_ids:
-            chosen["priors"].append(c)
-            taken.add(c.study_id)
+            _take("priors", c, capped=False)
     for c in cands:
         if len(chosen["portable"]) >= targets["portable"]:
             break
         if c.study_id not in taken and c.portable:
-            chosen["portable"].append(c)
-            taken.add(c.study_id)
+            _take("portable", c)
     return chosen
 
 
@@ -356,6 +364,8 @@ def main(argv=None) -> int:
     p.add_argument("--mimic-iv-root", default="", help="MIMIC-IV hosp/ root for the EHR slices "
                                                        "(omit to curate without labs/meds/problems)")
     p.add_argument("--out", required=True, help="manifest path, OFF this repo (DUA)")
+    p.add_argument("--max-per-subject", type=int, default=2,
+                   help="cap studies per subject outside the priors bucket (subject diversity)")
     for k, v in DEFAULT_TARGETS.items():
         p.add_argument(f"--{k}", type=int, default=v)
     args = p.parse_args(argv)
@@ -381,7 +391,7 @@ def main(argv=None) -> int:
 
     cands, skipped = build_candidates(study_list, chex, neg, meta, reports_root)
     targets = {k: getattr(args, k) for k in DEFAULT_TARGETS}
-    chosen = select(cands, targets)
+    chosen = select(cands, targets, max_per_subject=args.max_per_subject)
     picked = [c for bucket in chosen.values() for c in bucket]
     subjects = {c.subject_id for c in picked}
 
