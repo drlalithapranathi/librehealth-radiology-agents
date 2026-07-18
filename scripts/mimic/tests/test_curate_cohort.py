@@ -41,6 +41,23 @@ def test_rule_out_pneumothorax_heuristic():
 
 
 # --- ICD-10 ---------------------------------------------------------------
+def test_prescriptions_keep_therapeutic_drop_line_maintenance(tmp_path):
+    path = tmp_path / "prescriptions.csv"
+    path.write_text(
+        "subject_id,drug\n"
+        "10,Heparin Sodium\n"           # therapeutic drip: keep
+        "10,Heparin Flush (10 units/ml)\n"   # line flush: drop
+        "10,Warfarin\n"                 # keep
+        "11,Heparin Dwell (1000 Units/mL)\n"  # catheter dwell: drop
+        "11,Heparin (CRRT Machine Priming)\n"  # circuit priming: drop
+        "11,Acetaminophen\n"            # not an anticoagulant: drop
+        "12,Enoxaparin Sodium\n")       # keep
+    got = C.read_prescriptions(str(path), {"10", "11", "12"})
+    assert got["10"] == ["Heparin Sodium", "Warfarin"]
+    assert "11" not in got            # both 11 rows are line-maintenance
+    assert got["12"] == ["Enoxaparin Sodium"]
+
+
 def test_dot_icd10_normalises_mimic_codes():
     assert C.dot_icd10("J95811") == "J95.811"
     assert C.dot_icd10("J90") == "J90"          # 3-char codes take no dot

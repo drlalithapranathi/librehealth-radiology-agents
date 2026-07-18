@@ -45,6 +45,12 @@ EFFUSION_GROUP = ("Pleural Effusion", "Consolidation", "Edema")
 # about. Substring match against MIMIC-IV prescriptions.drug (lowercased).
 ANTICOAGULANTS = ("warfarin", "heparin", "enoxaparin", "apixaban", "rivaroxaban", "dabigatran",
                   "edoxaban", "fondaparinux", "argatroban", "bivalirudin")
+# But MIMIC prescriptions are dominated by heparin used for LINE MAINTENANCE, not for
+# anticoagulating the patient: line flushes, catheter dwells, CRRT/dialysis circuit heparin. Those
+# must not fire the med-flag story (a flush is not a bleeding-risk anticoagulant), so exclude any
+# drug string carrying these terms even when it matched an anticoagulant above.
+ANTICOAGULANT_EXCLUDE = ("flush", "lock", "dwell", "crrt", "priming", "hemodialysis", "dialysis",
+                         "catheter")
 CREATININE_ITEMID = "50912"           # MIMIC-IV labevents itemid -> LOINC 2160-0
 CREATININE_LOINC = "2160-0"
 
@@ -179,7 +185,8 @@ def read_prescriptions(path: str, subjects: set) -> dict:
             if subj not in subjects:
                 continue
             drug = (r.get("drug") or "").strip()
-            if any(a in drug.lower() for a in ANTICOAGULANTS):
+            low = drug.lower()
+            if any(a in low for a in ANTICOAGULANTS) and not any(x in low for x in ANTICOAGULANT_EXCLUDE):
                 bucket = out.setdefault(subj, [])
                 if drug not in bucket:
                     bucket.append(drug)
