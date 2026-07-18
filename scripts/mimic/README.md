@@ -78,6 +78,26 @@ python load_cohort.py ~/mimic-secure/cohort/v1/manifest.json --concept $MIMIC_OR
 the shared root must be readable ONLY by team members individually credentialed for BOTH MIMIC-CXR
 and MIMIC-IV; the store's ACLs enforce that, the tool cannot. Nothing MIMIC ever lands in the repo.
 
+### OneDrive / SharePoint (IU Secure M365)
+
+Works via the OneDrive sync client: point `--share-root` at a folder inside the local mount
+(macOS: `~/Library/CloudStorage/OneDrive-IndianaUniversity/<library>/mimic-showcase`) and add
+`--cloud`, which drops the POSIX perms/symlink metadata the CloudStorage filesystem rejects:
+
+```bash
+python share_cohort.py publish --cloud --name v1 \
+    --manifest /secure/cohort/showcase_cohort.json --dicom-root /secure/mimic-dl \
+    --share-root ~/Library/CloudStorage/OneDrive-IndianaUniversity/mimic-showcase
+# then WAIT for the sync client to finish uploading before anyone pulls
+python share_cohort.py pull --cloud --name v1 \
+    --share-root ~/Library/CloudStorage/OneDrive-IndianaUniversity/mimic-showcase --dest ~/mimic-secure
+```
+
+Notes: files may arrive as Files-On-Demand placeholders; the `pull` checksum pass forces full
+hydration, so let sync finish first. Keep the share name short (SharePoint path-length limits vs the
+deep `files/pXX/...` DICOM nesting). **Confirm with IU's data steward / UISO that Secure M365 is an
+approved location for PhysioNet credentialed data before using it** -- the tool cannot certify that.
+
 ## Proven
 
 The join-critical path is verified end to end on the o3 stack: loader-created RadiologyOrder ->

@@ -57,12 +57,19 @@ def _have_rsync() -> bool:
     return shutil.which("rsync") is not None
 
 
-def _sync_tree(src: str, dst: str) -> None:
-    """Mirror src/ -> dst/ (resumable). rsync when available, else a plain recursive copy."""
+def _sync_tree(src: str, dst: str, cloud: bool = False) -> None:
+    """Mirror src/ -> dst/ (resumable). rsync when available, else a plain recursive copy.
+
+    cloud=True targets a sync-client folder (OneDrive/SharePoint via ~/Library/CloudStorage, or a
+    Dropbox/Box mount): the CloudStorage filesystem rejects the POSIX perms/owner/symlink metadata
+    that `rsync -a` sets, so drop those and copy contents only (-rt). DICOM/JSON carry no symlinks,
+    so nothing is lost."""
     os.makedirs(dst, exist_ok=True)
     if _have_rsync():
-        subprocess.run(["rsync", "-a", "--partial", src.rstrip("/") + "/", dst.rstrip("/") + "/"],
-                       check=True)
+        flags = ["-rt", "--partial"] if cloud else ["-a", "--partial"]
+        if cloud:
+            flags += ["--no-perms", "--no-owner", "--no-group", "--no-links"]
+        subprocess.run(["rsync", *flags, src.rstrip("/") + "/", dst.rstrip("/") + "/"], check=True)
     else:
         shutil.copytree(src, dst, dirs_exist_ok=True)
 
@@ -127,9 +134,9 @@ def publish(args, p) -> int:
 
     shutil.copy2(args.manifest, os.path.join(target, "manifest.json"))
     if args.dicom_root and os.path.isdir(args.dicom_root):
-        _sync_tree(args.dicom_root, os.path.join(target, "dicom"))
+        _sync_tree(args.dicom_root, os.path.join(target, "dicom"), cloud=args.cloud)
     if args.inputs_root and os.path.isdir(args.inputs_root):
-        _sync_tree(args.inputs_root, os.path.join(target, "inputs"))
+        _sync_tree(args.inputs_root, os.path.join(target, "inputs"), cloud=args.cloud)
 
     provenance = {
         "name": args.name,
@@ -150,6 +157,8 @@ def publish(args, p) -> int:
     print(f"  studies: {len(studies)} | files checksummed: {count}")
     print(f"  dicom: {'yes' if provenance['dicom_included'] else 'no'} | "
           f"inputs: {'yes' if provenance['inputs_included'] else 'no'}")
+    if args.cloud:
+        print("  cloud mode: wait for the sync client to finish UPLOADING before anyone pulls.")
     print("\n" + DUA_NOTICE)
     print(f"\nEnsure {share_root} is readable ONLY by credentialed team members (chmod/ACLs).")
     return 0
@@ -162,7 +171,7 @@ def pull(args, p) -> int:
     if not os.path.isdir(source):
         p.error(f"cohort '{args.name}' not found under {share_root}")
     local = os.path.join(dest, "cohort", args.name)
-    _sync_tree(source, local)
+    _sync_tree(source, local, cloud=args.cloud)
 
     sumpath = os.path.join(local, "SHA256SUMS")
     if os.path.exists(sumpath):
@@ -193,11 +202,16 @@ def main(argv=None) -> int:
     pub.add_argument("--inputs-root", default="", help="optional: curation-input CSVs")
     pub.add_argument("--share-root", default=os.environ.get("MIMIC_SHARE_ROOT", ""))
     pub.add_argument("--name", default="v1", help="cohort version name under the share root")
+    pub.add_argument("--cloud", action="store_true",
+                     help="share root is a sync-client folder (OneDrive/SharePoint/Box): skip "
+                          "POSIX perms/symlinks the CloudStorage filesystem rejects")
 
     pl = sub.add_parser("pull", help="dev: sync the shared cohort to a local dir")
     pl.add_argument("--share-root", default=os.environ.get("MIMIC_SHARE_ROOT", ""))
     pl.add_argument("--name", default="v1")
     pl.add_argument("--dest", default=os.path.expanduser("~/mimic-secure"))
+    pl.add_argument("--cloud", action="store_true",
+                    help="share root is a sync-client folder (see publish --cloud)")
 
     args = p.parse_args(argv)
     if not args.share_root:

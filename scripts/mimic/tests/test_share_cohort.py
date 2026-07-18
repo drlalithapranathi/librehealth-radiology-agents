@@ -46,6 +46,19 @@ def test_publish_then_pull_roundtrip(tmp_path):
     assert (local / "dicom" / "files" / "p10" / "p10" / "s1" / "img.dcm").read_bytes() == b"DICM-fake-pixels"
 
 
+def test_cloud_mode_roundtrip(tmp_path):
+    """--cloud drops POSIX metadata but copies the same content (contents-only rsync)."""
+    manifest, dicom_root = _write_cohort(tmp_path / "curated")
+    share = tmp_path / "share"
+    assert S.main(["publish", "--manifest", str(manifest), "--dicom-root", str(dicom_root),
+                   "--share-root", str(share), "--name", "v1", "--cloud"]) == 0
+    dest = tmp_path / "dev"
+    assert S.main(["pull", "--share-root", str(share), "--name", "v1", "--dest", str(dest),
+                   "--cloud"]) == 0
+    got = (dest / "cohort" / "v1" / "dicom" / "files" / "p10" / "p10" / "s1" / "img.dcm")
+    assert got.read_bytes() == b"DICM-fake-pixels"
+
+
 def test_pull_detects_corruption(tmp_path):
     manifest, dicom_root = _write_cohort(tmp_path / "curated")
     share = tmp_path / "share"
