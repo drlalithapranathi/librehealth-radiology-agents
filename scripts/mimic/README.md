@@ -20,8 +20,14 @@ only the tooling and a synthetic `sample_cohort.json`.
 # 0. provision the concepts the demo dictionary lacks (CXR order/report + numeric labs); prints the UUID
 python bootstrap_radiology_concept.py           # -> set MIMIC_ORDER_CONCEPT_UUID to the printed value
 
-# 1. fetch only the cohort's studies from PhysioNet S3 (off-repo dest, DUA)
-python fetch.py my_cohort.json /secure/mimic-dl
+# 1a. curate the ~100-study cohort manifest from the label CSVs + reports + MIMIC-IV slices
+#     (composition: 30 normal / 25 pneumothorax / 20 effusion-consolidation-edema / 15 priors /
+#      10 portable; concordant chexpert+negbio labels only; manifest stays off-repo, DUA)
+python curate_cohort.py --cxr-root /secure/mimic-cxr --reports-root /secure/mimic-cxr-reports \
+    --mimic-iv-root /secure/mimic-iv --out /secure/cohort/my_cohort.json
+
+# 1b. fetch only the cohort's studies from PhysioNet S3 (off-repo dest, DUA)
+python fetch.py /secure/cohort/my_cohort.json /secure/mimic-dl
 
 # 2. FHIR first: patients, encounters, RadiologyOrders (with ICD-10-mapped order reasons),
 #    EHR packet (labs, problems, presence-only drug orders), seeded preliminary reports
