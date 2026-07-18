@@ -137,6 +137,16 @@ ACK_LOOP_CAP = 2 * ACK_ESCALATION_CAP + 2
 # transient outage self-heals rather than failing a study that cannot proceed without the result.
 BOUNDED_ACTIVITY_RETRY = RetryPolicy(maximum_attempts=3)
 
+# The pre-sign RIS write's policy additionally declares the transport guard's refusal
+# non-retryable: InsecureWriteTransportError (#30 / !57) is a CONFIG error -- plaintext http to a
+# non-loopback fhir2 without the explicit opt-in -- and retrying re-asks a question with a fixed
+# answer, three times, before the skip that was always going to be the outcome. The exception was
+# NAMED for exactly this wiring (see its docstring in radagent_common.fhir_client); Temporal
+# matches application errors against these strings by exception class name. Transient faults
+# (fhir2 down, timeouts) keep their bounded retries.
+PRESIGN_WRITE_RETRY = RetryPolicy(
+    maximum_attempts=3, non_retryable_error_types=["InsecureWriteTransportError"])
+
 
 def signoff_timeout_for(tier: str | None) -> timedelta:
     """Tier-dependent sign-off gate timeout (#23). Unknown/missing tier -> the lenient default."""
@@ -272,7 +282,7 @@ class StudyWorkflow:
                 ACT_WRITE_PRESIGN_IMPRESSION,
                 args=[service_request_ref, ctx["patient"]["fhirPatientId"], impression["impressionText"]],
                 start_to_close_timeout=SKILL_TIMEOUT,
-                retry_policy=BOUNDED_ACTIVITY_RETRY,
+                retry_policy=PRESIGN_WRITE_RETRY,  # guard refusal = config error, fail FAST (#30)
             )
         except ActivityError:
             workflow.logger.warning(
