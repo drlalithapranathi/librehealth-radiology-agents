@@ -41,21 +41,30 @@ def test_rule_out_pneumothorax_heuristic():
 
 
 # --- ICD-10 ---------------------------------------------------------------
-def test_prescriptions_keep_therapeutic_drop_line_maintenance(tmp_path):
+def test_prescriptions_keep_therapeutic_drop_prophylaxis(tmp_path):
     path = tmp_path / "prescriptions.csv"
     path.write_text(
-        "subject_id,drug\n"
-        "10,Heparin Sodium\n"           # therapeutic drip: keep
-        "10,Heparin Flush (10 units/ml)\n"   # line flush: drop
-        "10,Warfarin\n"                 # keep
-        "11,Heparin Dwell (1000 Units/mL)\n"  # catheter dwell: drop
-        "11,Heparin (CRRT Machine Priming)\n"  # circuit priming: drop
-        "11,Acetaminophen\n"            # not an anticoagulant: drop
-        "12,Enoxaparin Sodium\n")       # keep
+        "subject_id,drug,route\n"
+        "10,Heparin,IV\n"                    # IV drip: therapeutic, keep
+        "10,Heparin Flush (10 units/ml),IV\n"   # line flush: drop (excluded form)
+        "10,Warfarin,PO\n"                   # oral anticoagulant: keep
+        "11,Heparin,SC\n"                    # subcutaneous prophylaxis: drop
+        "11,Heparin (CRRT Machine Priming),IV\n"  # circuit priming: drop
+        "11,Acetaminophen,PO\n"              # not an anticoagulant: drop
+        "12,Enoxaparin Sodium,SC\n")         # LMWH: keep regardless of route
     got = C.read_prescriptions(str(path), {"10", "11", "12"})
-    assert got["10"] == ["Heparin Sodium", "Warfarin"]
-    assert "11" not in got            # both 11 rows are line-maintenance
+    assert got["10"] == ["Heparin", "Warfarin"]
+    assert "11" not in got               # SC heparin + circuit priming only
     assert got["12"] == ["Enoxaparin Sodium"]
+
+
+def test_is_therapeutic_anticoagulant_route_logic():
+    assert C.is_therapeutic_anticoagulant("Heparin", "IV")
+    assert not C.is_therapeutic_anticoagulant("Heparin", "SC")
+    assert not C.is_therapeutic_anticoagulant("Heparin Flush", "IV")   # form excluded
+    assert C.is_therapeutic_anticoagulant("Warfarin", "PO")            # route irrelevant
+    assert C.is_therapeutic_anticoagulant("Apixaban", "")              # DOAC, no route
+    assert not C.is_therapeutic_anticoagulant("Aspirin", "PO")         # antiplatelet, not anticoag
 
 
 def test_dot_icd10_normalises_mimic_codes():

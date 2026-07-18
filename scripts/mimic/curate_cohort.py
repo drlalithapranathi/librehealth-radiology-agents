@@ -41,16 +41,29 @@ CHEXPERT_LABELS = [
     "Pneumonia", "Pneumothorax", "Support Devices",
 ]
 EFFUSION_GROUP = ("Pleural Effusion", "Consolidation", "Edema")
-# Anticoagulants and low-molecular-weight heparins: the set the med-flag verification rules care
-# about. Substring match against MIMIC-IV prescriptions.drug (lowercased).
-ANTICOAGULANTS = ("warfarin", "heparin", "enoxaparin", "apixaban", "rivaroxaban", "dabigatran",
-                  "edoxaban", "fondaparinux", "argatroban", "bivalirudin")
-# But MIMIC prescriptions are dominated by heparin used for LINE MAINTENANCE, not for
-# anticoagulating the patient: line flushes, catheter dwells, CRRT/dialysis circuit heparin. Those
-# must not fire the med-flag story (a flush is not a bleeding-risk anticoagulant), so exclude any
-# drug string carrying these terms even when it matched an anticoagulant above.
+# THERAPEUTIC anticoagulants the med-flag verification rules care about (bleeding risk). These are
+# therapeutic at any route (oral warfarin/DOACs, LMWH, parenteral DTIs), matched as substrings of
+# MIMIC-IV prescriptions.drug (lowercased).
+NON_HEPARIN_ANTICOAGULANTS = ("warfarin", "enoxaparin", "apixaban", "rivaroxaban", "dabigatran",
+                              "edoxaban", "fondaparinux", "argatroban", "bivalirudin")
+# Heparin is the hard case: MIMIC prescriptions are dominated by heparin that is NOT anticoagulating
+# the patient -- subcutaneous DVT prophylaxis (near-universal inpatient), line flushes, catheter
+# dwells, CRRT/dialysis circuit heparin. Only an IV heparin DRIP is therapeutic. So heparin counts
+# only when the route is intravenous AND the drug string is not a line-maintenance form.
+IV_ROUTE_TOKENS = ("iv", "intravenous")
 ANTICOAGULANT_EXCLUDE = ("flush", "lock", "dwell", "crrt", "priming", "hemodialysis", "dialysis",
                          "catheter")
+
+
+def is_therapeutic_anticoagulant(drug: str, route: str) -> bool:
+    low = (drug or "").lower()
+    if any(x in low for x in ANTICOAGULANT_EXCLUDE):
+        return False
+    if any(a in low for a in NON_HEPARIN_ANTICOAGULANTS):
+        return True
+    if "heparin" in low:
+        return any(t in (route or "").lower() for t in IV_ROUTE_TOKENS)
+    return False
 CREATININE_ITEMID = "50912"           # MIMIC-IV labevents itemid -> LOINC 2160-0
 CREATININE_LOINC = "2160-0"
 
@@ -177,7 +190,9 @@ def read_diagnoses(path: str, subjects: set) -> dict:
 
 
 def read_prescriptions(path: str, subjects: set) -> dict:
-    """prescriptions -> {subject_id: [anticoagulant drug names, deduped]}."""
+    """prescriptions -> {subject_id: [therapeutic anticoagulant drug names, deduped]}. Prophylactic
+    subcutaneous heparin, line flushes and circuit heparin are excluded (see
+    is_therapeutic_anticoagulant); an IV heparin drip counts."""
     out: dict[str, list] = {}
     with _open_maybe_gz(path) as f:
         for r in csv.DictReader(f):
@@ -185,8 +200,7 @@ def read_prescriptions(path: str, subjects: set) -> dict:
             if subj not in subjects:
                 continue
             drug = (r.get("drug") or "").strip()
-            low = drug.lower()
-            if any(a in low for a in ANTICOAGULANTS) and not any(x in low for x in ANTICOAGULANT_EXCLUDE):
+            if is_therapeutic_anticoagulant(drug, r.get("route", "")):
                 bucket = out.setdefault(subj, [])
                 if drug not in bucket:
                     bucket.append(drug)
