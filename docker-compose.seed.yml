@@ -13,15 +13,17 @@
 # USAGE
 #   1. Capture a seed once, from a healthy clean boot:
 #        scripts/dump_openmrs_seed.sh
-#   2. Restore (the seed loads ONLY into an empty mariadb-data volume, so start from -v):
-#        docker compose down -v
+#   2. Restore (the seed loads ONLY into an empty mariadb-data volume -- empty THAT volume,
+#      not all of them; `down -v` also works but wipes the comms ledger + ingress store):
+#        docker compose down
+#        docker volume rm lh-radiology-agents_mariadb-data
 #        docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d
 #
 # The seed blob is data, not code, and is gitignored (it will carry MIMIC/PHI later, per the DUA).
 services:
   mariadb:
     # mariadb runs /docker-entrypoint-initdb.d/*.sql.gz ONLY on first init (empty datadir), against
-    # the MARIADB_DATABASE (openmrs). A stale volume silently skips it -- hence `down -v` above.
+    # the MARIADB_DATABASE (openmrs). A stale volume silently skips it -- hence removing the mariadb volume above.
     volumes:
       - ./docker/openmrs/seed/openmrs-seed.sql.gz:/docker-entrypoint-initdb.d/openmrs-seed.sql.gz:ro
 

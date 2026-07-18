@@ -17,7 +17,8 @@
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 docker compose --profile otel up -d
 #   Jaeger UI:              http://localhost:16686/   (one trace per study, across all agents)
 
-# Injected into every app service. Empty by default => tracing fully off (see tracing_enabled()).
+# Injected into the study-trace app services (worklist-api, off the trace path, does not
+# carry it). Empty by default => tracing fully off (see tracing_enabled()).
 x-otel-env: &otel-env
   OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
@@ -32,6 +33,14 @@ services:
     #     registry.gitlab.com/librehealth/radiology/lh-radiology/o3:o3   (docker pull, no auth)
     #   Build from source instead (module developers): clone lh-radiology on the o3 branch as a
     #   sibling of this repo, then `docker compose build openmrs` (uses the build: block below).
+    # NOT digest-pinned (#72) -- deliberately (jaeger, opt-in otel profile, also rides its tag). o3:o3 is a single
+    # moving tag rebuilt per lh-radiology pipeline, and GitLab's registry garbage-collects
+    # manifests that lose their tag: a pinned digest 404s (MANIFEST_UNKNOWN) after the next
+    # upstream push, so on any fresh host `up` cannot pull and the whole stack is dead (verified
+    # live against the registry -- the previously pinned digest is already gone). The digest pin
+    # only ever worked here via the local image cache + pull_policy: missing. Drift protection
+    # for this image needs an immutable per-commit tag from lh-radiology CI (upstream change);
+    # until then the tag rides, and a digest would be worse than drift.
     image: registry.gitlab.com/librehealth/radiology/lh-radiology/o3:o3
     pull_policy: missing                  # `up` pulls the published image; build only on `compose build`
     build:
@@ -67,7 +76,7 @@ services:
       start_period: 180s     # Liquibase + concept-dictionary import + module startup
 
   mariadb:
-    image: mariadb:10.11
+    image: mariadb:10.11@sha256:5a5c675881ef3fd1c1da9b0a3bfd6ee82edbe39cd9e32e06be18034c37235e0e   # pinned (#72)
     environment:
       MARIADB_ROOT_PASSWORD: openmrs
       MARIADB_DATABASE: openmrs
@@ -91,7 +100,7 @@ services:
   # UUID we need to be stable across deployments. See docker/openmrs/README.md
   # and docs/presign-concept.md for the full rationale.
   presign-concept-bootstrap:
-    image: python:3.11-slim
+    image: python:3.11-slim@sha256:baf89808ec37adeaab83cec287adb4a2afa4a11c1d51e961c7ec737877e61af6   # pinned (#72)
     depends_on:
       openmrs:
         condition: service_healthy
@@ -116,7 +125,7 @@ services:
   # image ships the Python plugin (v7.1) built-in and auto-enables it as soon as
   # a PythonScript setting is present in the config (docker/orthanc/orthanc.json).
   orthanc:
-    image: orthancteam/orthanc:latest   # TODO: pin a version
+    image: orthancteam/orthanc:latest@sha256:fdb2bd7c80fab08578b5d3080f125eb9336994781a6e5f512fb962dca1414c30   # pinned to digest (#72)
     ports: ["8042:8042", "4242:4242"]
     environment:
       # Where the plugin POSTs the OrthancStableStudyEvent. Must be http(s);
@@ -158,7 +167,7 @@ services:
 
   # --- Temporal (durable orchestration engine, for the agent system) ------------
   temporal:
-    image: temporalio/auto-setup:1.24.2   # TODO: pin to your target Temporal version
+    image: temporalio/auto-setup:1.24.2@sha256:10e8c557ace5fa4aa99217637e7b9969316e89b929a3bfb117853a5417eef25c   # pinned to digest (#72)
     ports: ["7233:7233"]
     environment:
       DB: postgres12
@@ -169,14 +178,14 @@ services:
     depends_on: [temporal-postgresql]
 
   temporal-postgresql:
-    image: postgres:16
+    image: postgres:16@sha256:fe03a7605299a34ddf5e4f285dff78c3d7190a576b3c6b46f2fcff69f4bffd54   # pinned (#72)
     environment:
       POSTGRES_USER: temporal
       POSTGRES_PASSWORD: temporal
     volumes: ["temporal-pg-data:/var/lib/postgresql/data"]
 
   temporal-ui:
-    image: temporalio/ui:2.30.1           # TODO: pin
+    image: temporalio/ui:2.30.1@sha256:1833a44628b7866a139f81bd1bdd1e568f22de0999bbf5b7f52645faa82043c7   # pinned to digest (#72)
     ports: ["8088:8080"]
     environment:
       TEMPORAL_ADDRESS: temporal:7233
@@ -191,10 +200,12 @@ services:
   # content is always read from fhir2, never copied into this ledger. See
   # libs/radagent-common/radagent_common/comms_ledger.py.
   #
-  # H2 in-memory by default (hapi.fhir.* defaults): fine for the dev stack, wiped on `down`. A
-  # deployment points HAPI at a real database — this is a clinical-communication audit trail.
+  # DURABLE audit trail (#72): the comms ledger is the clinical-communication record, so it must
+  # survive `docker compose down && up`. HAPI defaults to in-memory H2 (wiped on down); here it is
+  # backed by a FILE-based H2 under a named volume (spring.datasource.* + volumes below). A real
+  # deployment points HAPI at a managed database instead.
   comms-ledger:
-    image: hapiproject/hapi:v7.4.0
+    image: hapiproject/hapi:v7.4.0@sha256:f34b41f5002665f384cf344da2d8e653025bd095aa37aa6f5a9d6dc0dac75684   # pinned (#72)
     ports: ["8108:8080"]
     environment:
       # R4 to match every other FHIR surface in the stack (fhir2 is R4).
@@ -215,19 +226,59 @@ services:
       # Verified end-to-end against this HAPI image (create + for-alias + read-modify-write +
       # search-by-based-on + audit join, all green).
       hapi.fhir.auto_create_placeholder_reference_targets: "true"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/fhir/metadata"]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 90s
+      # DURABLE storage (#72): override HAPI's default in-memory H2 with a FILE-based H2 under the
+      # comms-ledger-data volume, so Communication/Task audit records survive `down && up`.
+      # DB_CLOSE_DELAY=-1 keeps the DB open between pooled connections; DB_CLOSE_ON_EXIT=FALSE keeps
+      # the file intact on JVM shutdown. The comms-ledger.mv.db file under /data/hapi is what
+      # persists. Live-verified on the demo stack; needs comms-ledger-init below (the image runs as
+      # uid 65532 and cannot write a root-owned fresh volume -- found as a live crash-loop:
+      # AccessDeniedException on /data/hapi/comms-ledger.trace.db, 23 restarts).
+      spring.datasource.url: "jdbc:h2:file:/data/hapi/comms-ledger;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE"
+      spring.datasource.username: sa
+      spring.datasource.password: ""
+      spring.datasource.driverClassName: org.h2.Driver
+      spring.jpa.properties.hibernate.dialect: ca.uhn.fhir.jpa.model.dialect.HapiFhirH2Dialect
+    # NO healthcheck -- deliberately. hapiproject/hapi is distroless (the entrypoint is `java`
+    # itself; no curl, no shell), so ANY exec-form probe fails with "executable file not found"
+    # and the container sits permanently `unhealthy` while serving fine (the previous curl check
+    # did exactly that, and once #69 gated dependents on service_healthy, nothing downstream
+    # could ever start). Readiness lives where a probe can actually run: the on-call seed polls
+    # /fhir/metadata before writing, and the agent's ledger client is lazy behind Temporal's
+    # unbounded COMMUNICATE retry.
     restart: unless-stopped
+    volumes:
+      - comms-ledger-data:/data/hapi
+    depends_on:
+      comms-ledger-init:
+        condition: service_completed_successfully
+
+  # One-shot volume-permission init for the ledger (#72). The hapi image is distroless and runs as
+  # uid 65532 (nonroot), but a freshly created named volume is root-owned -- so the file-H2 above
+  # crash-loops on AccessDeniedException before its first write (observed live: 23 restarts).
+  # Same one-shot idiom as presign-concept-bootstrap: runs to completion each `up`, idempotent.
+  # Hardened to its minimum authority: it must run as root to chown, so everything else is taken
+  # away -- no network, no capability beyond CAP_CHOWN, a read-only root fs (the volume is its only
+  # writable surface), and no privilege escalation. Its whole life is one chown, then exit.
+  comms-ledger-init:
+    image: alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b   # pinned (#72); digest wins, tag is a label
+    command: ["chown", "-R", "65532:65532", "/data/hapi"]
+    restart: "no"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - comms-ledger-data:/data/hapi
 
   # --- Tracing backend (#28), opt-in: `docker compose --profile otel up` -----------
   # Jaeger all-in-one = OTLP receiver + storage + UI in one container. It only starts under the
   # `otel` profile, so the default stack is byte-for-byte unchanged. 4318 = OTLP/HTTP, which is
   # what init_tracing()'s exporter speaks (opentelemetry.exporter.otlp.proto.http).
   jaeger:
+    # Explicit version (acceptable per #72): opt-in via the `otel` profile, so it is not in the
+    # default demo path. Digest-pin this too if the showcase ever runs with tracing on.
     image: jaegertracing/all-in-one:1.62.0
     profiles: ["otel"]
     environment:
@@ -277,7 +328,15 @@ services:
       # be an address the paged human can actually reach (not the compose-internal hostname).
       SIGNOFF_OVERRIDE_TOKEN: dev-signoff-override-secret
       SIGNOFF_OVERRIDE_URL: http://localhost:8090/signoff/{workflowId}/override
+      # DURABLE ingress store (#72): the report->workflow join index, poll cursor, and dead letters
+      # (orchestrator/ingress_store.py) default to a path INSIDE the container. A restart during the
+      # hours-long read gate would then silently lose the sign-off join -- the radiologist signs, the
+      # poller matches nothing, and the study waits forever. Point it at the mounted volume below so
+      # the join survives a container restart (mirrors the worklist-api SQLite store pattern).
+      INGRESS_STORE_PATH: /data/ingress/ingress_state.db
     ports: ["8090:8090"]
+    volumes:
+      - ingress-store-data:/data/ingress
     depends_on: [temporal, openmrs, orthanc]
 
   worklist-triage:
@@ -350,11 +409,73 @@ services:
       - worklist-api-db:/var/lib/lhrad
     depends_on: [orthanc]
     restart: unless-stopped
-  # NOTE: the Communications Agent (existing, A2A + FastAPI) joins here as `communications:8106`
-  # (external image, added when it runs).
+  # The Communications Agent (CritCom, #52) -- the terminal COMMUNICATE stage's target. Until #69
+  # this was only a note, `communications:8106` resolved to nothing, and every study parked forever
+  # at COMMUNICATE retrying it (the stage's retry is deliberately unbounded); sign-off ladder pages
+  # failed too. Reads clinical context from fhir2 (read-only), writes Communication/Task to the
+  # comms ledger, resolves on-call from the directory the one-shot below seeds.
+  communications:
+    build:
+      context: .
+      dockerfile: agents/communications/Dockerfile
+    ports: ["8106:8106"]
+    environment:
+      # #28 tracing: the study-trace app services share this anchor (worklist-api, off the
+      # trace path, does not), and the terminal COMMUNICATE stage must not be the one hop that
+      # goes dark in a study's trace.
+      <<: *otel-env
+      COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
+      FHIR2_BASE_URL: http://openmrs:8080/openmrs/ws/fhir2/R4
+      FHIR2_BASIC_USER: admin
+      FHIR2_BASIC_PASS: Admin123
+      # Read-only fhir2 consumer (ServiceRequest.requester): the #67 read-transport guard refuses
+      # plaintext-to-remote reads without an opt-in, and this hop is plaintext http to the
+      # in-compose openmrs (see the orchestrator's FHIR2_ALLOW_INSECURE_WRITE note; a real
+      # deployment uses an https FHIR2_BASE_URL). Inert until #67 merges; needed after.
+      FHIR2_ALLOW_INSECURE_READ: "1"
+      # Ack windows are env-overridable per deployment (a tertiary centre's Cat1 window is not a
+      # rural clinic's); the showcase runs the clinical defaults (Cat1 60m / Cat2 24h / escalated
+      # loops 60m), so none are overridden here.
+    depends_on:
+      comms-ledger:
+        # service_started, NOT service_healthy: the distroless HAPI image cannot host a probe
+        # (see comms-ledger above), so a health gate here never opens. The agent tolerates a
+        # still-booting ledger -- its client is lazy and COMMUNICATE retries unbounded.
+        condition: service_started
+    restart: unless-stopped
+
+  # One-shot on-call directory seed (#69): one general-radiology Practitioner + an active
+  # PractitionerRole tagged `on-call` in the LEDGER (PractitionerRole is ledger-native; fhir2
+  # implements neither it nor Communication). PUT at known ids -> idempotent per `up`, same
+  # contract as presign-concept-bootstrap. A single rota deliberately sidesteps the specialty-
+  # routing gap (#58). Without this, an unacknowledged critical result is UNESCALATABLE: the agent
+  # reports "no on-call provider is configured in the ledger" rather than paging nobody silently.
+  comms-oncall-seed:
+    image: python:3.11-slim@sha256:baf89808ec37adeaab83cec287adb4a2afa4a11c1d51e961c7ec737877e61af6   # pinned (#72)
+    environment:
+      COMMS_LEDGER_BASE_URL: http://comms-ledger:8080/fhir
+    volumes:
+      - ./docker/comms-ledger/seed_oncall.py:/opt/seed_oncall.py:ro
+    command:
+      - sh
+      - -c
+      - "pip install --quiet --no-cache-dir httpx==0.27.2 && python /opt/seed_oncall.py"
+    depends_on:
+      comms-ledger:
+        # service_started, NOT service_healthy (no probe fits the distroless HAPI image -- see
+        # comms-ledger above); the seed does its own readiness wait against /fhir/metadata.
+        # One-shot, no restart: if it exits nonzero the on-call directory is empty (or partial,
+        # if it died mid-PUT) and `up -d` will not say so -- `docker compose logs
+        # comms-oncall-seed` holds the evidence. The
+        # agent still tells the truth downstream (an unacknowledged critical result reports
+        # escalated:false, empty directory named as the reason).
+        condition: service_started
+    restart: "no"
 
 volumes:
   mariadb-data:
   orthanc-db:
   temporal-pg-data:
   worklist-api-db:
+  ingress-store-data:      # orchestrator IngressStore SQLite (#72): the sign-off join must survive a restart
+  comms-ledger-data:       # comms-ledger HAPI file-based H2 (#72): the clinical-communication audit trail
