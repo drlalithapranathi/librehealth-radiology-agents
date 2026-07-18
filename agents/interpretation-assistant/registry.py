@@ -88,9 +88,23 @@ _MSK_JOINT_HEAD = re.compile(
     rf"\b(?:{_MSK_BONE})\s+heads?\b|\bheads?\s+of\s+(?:the\s+)?(?:{_MSK_BONE})\b"
 )
 
+# A TAVR-planning CT names the aorta without being a dissection study (#64, PI ruling
+# 2026-07-15): it is an elective aortic-stenosis valve/annulus sizing study, imaging the aorta
+# only for access planning, and that population is not the acute-dissection population -- running
+# a dissection detector on it is off-indication. `CT CARDIAC AORTIC ROOT` stays matched by the
+# same ruling: a type-A dissection genuinely involves the root.
+#
+# The exclusion is the adjacency bigram "tavr planning", NOT the bare device acronym -- same
+# lesson as the bone-head exclusion above: refusing the region on a word ANYWHERE is too blunt.
+# A post-TAVR surveillance CT of the aorta is aorta imaging in a population that CAN dissect,
+# and excluding on "tavr" alone would silently remove its dissection screen. A wrong exclusion
+# deletes screening; over-narrow beats over-broad here.
+_TAVR_PLANNING = re.compile(r"\btavr[\s-]+planning\b")
+
 _REGION_EXCLUSIONS: dict[str, re.Pattern[str]] = {
     "head":  _MSK_JOINT_HEAD,
     "brain": _MSK_JOINT_HEAD,
+    "aorta": _TAVR_PLANNING,
 }
 
 # Aliases match on WORD BOUNDARIES, unlike the plain-substring match on the key itself.

@@ -321,6 +321,11 @@ def test_an_unrelated_study_still_falls_back_to_the_generic_screen():
     ("CT", "CT FIBULAR HEAD",              ["generic-ct-screen"]),
     ("CT", "CT MANDIBULAR HEAD",           ["generic-ct-screen"]),
     ("MR", "MR RADIAL HEAD",               ["generic-mr-screen"]),
+    # a TAVR-planning CT is a valve/annulus sizing study, not a dissection study (#64, PI ruling
+    # 2026-07-15). "aortic" is in the name for access planning only; delete registry's aorta
+    # exclusion and this selects aortic-dissection-detect.
+    ("CT", "CT AORTIC VALVE TAVR PLANNING", ["generic-ct-screen"]),
+    ("CT", "CT AORTIC VALVE TAVR-PLANNING PROTOCOL", ["generic-ct-screen"]),
 ])
 def test_a_region_named_but_not_the_subject_does_not_select_its_tools(modality, description, expected):
     assert select_tools(modality, description) == expected
@@ -342,6 +347,12 @@ def test_a_region_named_but_not_the_subject_does_not_select_its_tools(modality, 
     ("CT", "CT HEAD ABDOMEN PELVIS FEMUR", ["ich-detect", "stroke-detect", "liver-lesion-detect"]),
     ("CT", "CT HEAD AND FEMUR TRAUMA",     ["ich-detect", "stroke-detect"]),
     ("CT", "CT BRAIN AND SHOULDER",        ["ich-detect", "stroke-detect"]),
+    # a dedicated aortic-root study keeps the dissection screen (#64, PI ruling: a type-A
+    # dissection genuinely involves the root -- "leave it")
+    ("CT", "CT CARDIAC AORTIC ROOT",       ["aortic-dissection-detect"]),
+    # the TAVR exclusion is the "tavr planning" bigram, not the bare acronym: post-TAVR
+    # surveillance of the aorta is a population that CAN dissect and keeps its screen
+    ("CT", "CT AORTA POST TAVR",           ["aortic-dissection-detect"]),
 ])
 def test_the_exclusions_do_not_cost_the_real_studies(modality, description, expected):
     """The exclusion refuses a region; it must not refuse the studies the region exists for."""
