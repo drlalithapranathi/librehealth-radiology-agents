@@ -2,7 +2,9 @@
 import pytest
 
 import handler
+import llm_draft
 from handler import handle
+from llm_draft import LLMDraft
 from radagent_common.validation import validate_skill_output
 
 SAMPLE_CONTEXT = {
@@ -123,6 +125,23 @@ def _reset_fhir():
     handler._FHIR = None
 
 
+_LLM_ENV = (
+    "IMPRESSION_LLM_BASE_URL", "IMPRESSION_LLM_MODEL",
+    "IMPRESSION_LLM_API_KEY", "IMPRESSION_LLM_TIMEOUT_SECONDS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_llm_draft(monkeypatch):
+    # No test in this file configures the LLM path via env (that's llm_draft's own test suite,
+    # test_llm_draft.py) -- clear it so "unset is the default" holds regardless of the dev shell.
+    for k in _LLM_ENV:
+        monkeypatch.delenv(k, raising=False)
+    handler.draft_impression = llm_draft.draft_impression
+    yield
+    handler.draft_impression = llm_draft.draft_impression
+
+
 async def test_fetches_conclusion_from_fhir2_by_report_id():
     # The lean finalized event carries no narrative (Golden rule 2); the handler must fetch the
     # report content from fhir2 by its id to detect a critical (#16).
@@ -186,3 +205,55 @@ async def test_postsign_merges_report_and_ai_findings_signals():
         {"studyContext": SAMPLE_CONTEXT, "report": report, "aiFindings": ai_findings},
     )
     assert out["criticalFlags"] == [{"label": "fracture", "severity": "critical"}]
+
+
+# --- #77: LLM-authored prose, config-gated with a template fallback ----------------------------
+
+async def test_llm_unset_by_default_produces_template_text():
+    # No IMPRESSION_LLM_* env set (see _reset_llm_draft) -- the deterministic template is the
+    # default, byte-for-byte the same text as before #77.
+    report = {"conclusion": "Findings show a large pneumothorax requiring urgent attention."}
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
+    assert out["impressionText"] == (
+        "Findings are consistent with pneumothorax. "
+        "Urgent clinical correlation and appropriate follow-up recommended."
+    )
+    assert out["recommendations"] == [{"text": "Urgent clinical consultation recommended."}]
+
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT})
+    assert out["impressionText"] == "No acute findings identified. Clinical correlation recommended."
+    assert out["recommendations"] == [{"text": "Routine follow-up as clinically indicated."}]
+
+
+async def test_llm_failure_degrades_to_template_output():
+    # The issue's required failure-injection test: model down -> template output, read proceeds.
+    async def _boom(**kwargs):
+        raise TimeoutError("model down")
+
+    handler.draft_impression = _boom
+    report = {"conclusion": "Findings show a large pneumothorax requiring urgent attention."}
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
+    validate_skill_output("impression.generate", out)  # best-effort: still a valid draft
+    assert out["impressionText"] == (
+        "Findings are consistent with pneumothorax. "
+        "Urgent clinical correlation and appropriate follow-up recommended."
+    )
+    assert out["criticalFlags"] == [{"label": "pneumothorax", "severity": "critical"}]
+
+
+async def test_llm_success_flows_into_handler_output_without_touching_critical_flags():
+    async def _fake_draft(**kwargs):
+        return LLMDraft(
+            impression_text="Findings consistent with a right-sided pneumothorax.",
+            recommendations=["Urgent clinical correlation recommended."],
+        )
+
+    handler.draft_impression = _fake_draft
+    report = {"conclusion": "Findings show a large pneumothorax requiring urgent attention."}
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
+    validate_skill_output("impression.generate", out)
+    assert out["impressionText"] == "Findings consistent with a right-sided pneumothorax."
+    assert out["recommendations"] == [{"text": "Urgent clinical correlation recommended."}]
+    # #78's deterministic derivation is untouched by an LLM draft being used.
+    assert out["criticalFlags"] == [{"label": "pneumothorax", "severity": "critical"}]
+    assert out["structuredFindings"] == [{"label": "pneumothorax", "severity": "critical"}]
