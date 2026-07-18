@@ -35,6 +35,73 @@ async def test_critical_keyword_sets_flags_and_conforms_to_contract():
     assert out["criticalFlags"] == [{"label": "pneumothorax", "severity": "critical"}]
 
 
+# --- negation-aware scan (#78) ----------------------------------------------------------------
+
+async def test_pertinent_negative_report_sets_no_critical_flags():
+    """#78 acceptance: a normal report written as pertinent negatives must NOT flag. Before the
+    negation window, "No pneumothorax, ..." matched \\bpneumothorax\\b, set criticalFlags, FAILed
+    verification, and parked every normal study at the sign-off gate."""
+    report = {"conclusion": "No pneumothorax, pleural effusion, or focal consolidation."}
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
+    validate_skill_output("impression.generate", out)
+    assert out["criticalFlags"] == []
+    assert out["impressionText"].startswith("No acute findings")
+
+
+async def test_stated_positive_finding_still_flags():
+    report = {"conclusion": "Large right-sided pneumothorax."}
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
+    assert out["criticalFlags"] == [{"label": "pneumothorax", "severity": "critical"}]
+
+
+async def test_indication_section_naming_the_suspicion_does_not_flag():
+    """#78 regression (reproduced): a production conclusion carries the full sectioned narrative, and the
+    INDICATION names the SUSPICION ("evaluate for pneumothorax") -- which is not a finding. Scanning
+    it re-flagged every normal study ordered to exclude the very thing it excluded."""
+    report = {"conclusion": ("INDICATION: Chest pain, evaluate for pneumothorax.\n"
+                             "FINDINGS: Lungs are clear.\n"
+                             "IMPRESSION: No pneumothorax.")}
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
+    assert out["criticalFlags"] == []
+
+
+async def test_a_positive_finding_in_the_findings_section_still_flags():
+    report = {"conclusion": ("INDICATION: Chest pain.\n"
+                             "FINDINGS: Large right-sided pneumothorax.\n"
+                             "IMPRESSION: Pneumothorax requiring intervention.")}
+    out = await handle("impression.generate", {"studyContext": SAMPLE_CONTEXT, "report": report})
+    assert out["criticalFlags"] == [{"label": "pneumothorax", "severity": "critical"}]
+
+
+async def test_negation_does_not_bleed_between_two_ai_finding_labels():
+    """#78 regression (reproduced): labels used to be space-joined into one clause, so a 'No hemorrhage' label
+    from one tool silenced a positive 'Mass ...' label from the next. Each label is its own scan."""
+    out = await handle("impression.generate", {
+        "studyContext": SAMPLE_CONTEXT,
+        "aiFindings": {"findings": [
+            {"toolId": "ich-detect", "status": "COMPLETE", "label": "No hemorrhage"},
+            {"toolId": "lung-nodule-detect", "status": "COMPLETE",
+             "label": "Mass in the left upper lobe (p=0.88)"},
+        ]},
+    })
+    assert out["criticalFlags"] == [{"label": "mass lesion", "severity": "critical"}]
+
+
+async def test_report_negation_does_not_suppress_a_positive_ai_finding():
+    """The report conclusion and the aiFindings labels are scanned SEPARATELY. A "no pneumothorax"
+    in the report must not bleed its negation across a POSITIVE pneumothorax the model reported
+    (#71 emits exactly that label) -- concatenating the two texts would have silenced a real find."""
+    out = await handle("impression.generate", {
+        "studyContext": SAMPLE_CONTEXT,
+        "report": {"conclusion": "No pneumothorax."},
+        "aiFindings": {"findings": [
+            {"toolId": "pneumothorax-detect", "status": "COMPLETE",
+             "label": "Pneumothorax (screening p=0.91); screening signal only, not a read"},
+        ]},
+    })
+    assert out["criticalFlags"] == [{"label": "pneumothorax", "severity": "critical"}]
+
+
 class _FakeFhir:
     """Stand-in for Fhir2Client.get_report_conclusion (no live server)."""
     def __init__(self, conclusion=None, error=None):
