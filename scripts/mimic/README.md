@@ -4,10 +4,20 @@ Loads a curated ~100-study MIMIC-CXR cohort into the demo stack. Design + write-
 `docs/mimic-cxr-mapping.md`. **No MIMIC data or manifests live in this repo (PhysioNet DUA)** --
 only the tooling and a synthetic `sample_cohort.json`.
 
+## Two roles
+
+The cohort is curated + fetched from PhysioNet **once** by a curator, published to a shared
+credentialed store, and everyone else **pulls** from there. Nobody re-downloads the 4.7 TB source.
+
+- **Curator** (steps 1a-3 below, then `share_cohort.py publish`): needs PhysioNet AWS access.
+- **Every other dev** (`share_cohort.py pull`, then load): needs only read access to the shared
+  store. They must still be individually PhysioNet-credentialed for **both** MIMIC-CXR and MIMIC-IV;
+  the store's ACLs must enforce that. See "Sharing" below.
+
 ## Prerequisites
 
 - `pip install -r requirements.txt` (pydicom, boto3, httpx, pymysql).
-- Credentialed PhysioNet AWS access for `fetch.py` (MIMIC-CXR **and** MIMIC-IV DUAs signed).
+- Curator only: credentialed PhysioNet AWS access for `fetch.py` (MIMIC-CXR **and** MIMIC-IV DUAs).
 - The concepts the demo dictionary lacks: run `bootstrap_radiology_concept.py` (provisions the
   chest-x-ray order/report concept + numeric creatinine/eGFR lab concepts), then set
   `MIMIC_ORDER_CONCEPT_UUID` to the printed Chest-radiograph UUID.
@@ -26,8 +36,16 @@ python bootstrap_radiology_concept.py           # -> set MIMIC_ORDER_CONCEPT_UUI
 python curate_cohort.py --cxr-root /secure/mimic-cxr --reports-root /secure/mimic-cxr-reports \
     --mimic-iv-root /secure/mimic-iv --out /secure/cohort/my_cohort.json
 
-# 1b. fetch only the cohort's studies from PhysioNet S3 (off-repo dest, DUA)
+# 1b. fetch only the cohort's studies from PhysioNet S3 (off-repo dest, DUA). For the PhysioNet
+#     S3 ACCESS POINTS, pass the ARN as the bucket and the project key prefix:
+#       MIMIC_CXR_BUCKET=arn:aws:s3:us-east-1:724665945834:accesspoint/mimic-cxr-v2-1-0-01\
+#       MIMIC_CXR_KEY_PREFIX=mimic-cxr/2.1.0/  AWS_PROFILE=physionet  python fetch.py ...
 python fetch.py /secure/cohort/my_cohort.json /secure/mimic-dl
+
+# 1c. CURATOR: publish the curated cohort to the shared credentialed store (see "Sharing"). Every
+#     other dev pulls from there instead of running 1a/1b.
+python share_cohort.py publish --manifest /secure/cohort/my_cohort.json \
+    --dicom-root /secure/mimic-dl --share-root $MIMIC_SHARE_ROOT --name v1
 
 # 2. FHIR first: patients, encounters, RadiologyOrders (with ICD-10-mapped order reasons),
 #    EHR packet (labs, problems, presence-only drug orders), seeded preliminary reports
@@ -42,6 +60,23 @@ python registry_corpus.py --out registry_corpus.json
 # 5. rehearsal sign-off cue (live demo: radiologists sign in the RIS instead)
 python report_seeder.py finalize s56699142
 ```
+
+## Sharing (other devs pull, never re-download)
+
+The curated cohort lives once on a shared **credentialed** store (IU Slate-Project / Geode / RED, or
+another access-controlled mount). Point `MIMIC_SHARE_ROOT` at it. Every dev with read access pulls
+the manifest + DICOMs and loads locally:
+
+```bash
+export MIMIC_SHARE_ROOT=/geode2/projects/<proj>/mimic-showcase   # the shared mount
+python share_cohort.py pull --name v1 --dest ~/mimic-secure       # rsync + SHA256 verify
+python load_cohort.py ~/mimic-secure/cohort/v1/manifest.json --concept $MIMIC_ORDER_CONCEPT_UUID
+# DICOMs are under ~/mimic-secure/cohort/v1/dicom/files/... -> dicom_fixup + push to Orthanc
+```
+
+`pull` uses rsync (resumable) and verifies every file against the published `SHA256SUMS`. **DUA:**
+the shared root must be readable ONLY by team members individually credentialed for BOTH MIMIC-CXR
+and MIMIC-IV; the store's ACLs enforce that, the tool cannot. Nothing MIMIC ever lands in the repo.
 
 ## Proven
 
