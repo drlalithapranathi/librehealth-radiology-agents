@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:lhrad:escalation-policy:1.0.0",
   "title": "EscalationPolicy",
-  "description": "Sign-off escalation matrix (#29). Per priority tier, an ordered ladder of levels the orchestrator climbs while a finalized report sits unsigned. Config/policy only -- roles, channels, timings; never PHI. The orchestrator owns the durable clock (Temporal) and maps each fired level onto a comms.dispatch; targetRole is resolved to a real recipient downstream (RIS on-call schedule / Communications Agent).",
+  "description": "Sign-off escalation matrix (#29). Per priority tier, an ordered ladder of levels the orchestrator climbs while a signed report's verification hold sits unresolved (#29). Config/policy only -- roles, channels, timings; never PHI. The orchestrator owns the durable clock (Temporal) and maps each fired level onto a comms.dispatch; targetRole is resolved to a real recipient downstream (RIS on-call schedule / Communications Agent).",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "defaultTier", "tiers"],

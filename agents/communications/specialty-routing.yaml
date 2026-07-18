@@ -1,0 +1,39 @@
+# Study -> subspecialty routing for critical-result on-call paging (#58) -- validated in CI
+# against contracts/specialty-routing.schema.json (scripts/validate_contracts.py).
+#
+# Clinical config, not code: which on-call rota should hear about a critical finding on a given
+# study. Rules are evaluated top to bottom and the FIRST match wins: a rule matches when the
+# study's modality is in `modalities` or its studyDescription contains any of `keywords`
+# (case-insensitive substring). A study no rule matches gets NO specialty -- the on-call search
+# runs unnarrowed, exactly the pre-#58 behaviour, so a site with one general rota is unaffected.
+#
+# `specialty` values must be the token a deployment tags its on-call PractitionerRoles with
+# (the ledger's PractitionerRole.specialty coding code; search_on_call_roles pushes it as the
+# FHIR `specialty` search param). The rules below are a STARTER TABLE for the dev/compose stack,
+# not a clinical ruling -- a real deployment reviews and edits this file (or points
+# SPECIALTY_ROUTING_PATH at its own).
+#
+# outOfSpecialtyFallback decides what happens when a specialty IS derived but nobody tagged for
+# it is on call. The two values fail in opposite directions (issue #58 item 3):
+#   any-on-call -- page whoever is on call and stamp the Communication out-of-specialty, so
+#                  someone hears it and the record says it was the wrong someone.
+#   none        -- page nobody from here: the dispatch reports the miss honestly (SKIPPED /
+#                  escalated: false) and the workflow archives it. NOTHING re-pages in response
+#                  -- the #29 ladder pages only at the post-sign verification hold, decoupled
+#                  from dispatch -- so a `none` site accepts that a miss is only as loud as its
+#                  log line and the workflow's record (the SKIPPED path writes no ledger entry).
+schemaVersion: "1.0.0"
+outOfSpecialtyFallback: any-on-call
+
+rules:
+  - specialty: breast
+    modalities: [MG]
+    keywords: [breast, mammo]
+  - specialty: neuro
+    keywords: [head, brain, spine, cervical, lumbar, cranial, skull, neck]
+  - specialty: chest
+    keywords: [chest, thorax, lung, pulmonary]
+  - specialty: body
+    keywords: [abdomen, abdominal, pelvis, liver, renal, kidney]
+  - specialty: msk
+    keywords: [shoulder, knee, hip, wrist, ankle, elbow, extremity, femur, humerus]

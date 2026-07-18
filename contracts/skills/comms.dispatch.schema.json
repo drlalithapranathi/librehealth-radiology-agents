@@ -29,7 +29,7 @@
         "PARTIAL",
         "SKIPPED"
       ],
-      "description": "SKIPPED = ACR Cat3/None: not a critical result, no page."
+      "description": "SKIPPED = no page went out: no resolvable recipient, or the routing policy declined to page out of specialty (#58). Routine results are SENT (to the EHR inbox); the workflow treats SKIPPED as no-ack-clock and archives."
     },
     "acrCategory": {
       "type": "string",
