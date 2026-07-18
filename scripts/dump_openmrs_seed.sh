@@ -24,4 +24,7 @@ docker exec "$MARIADB_CONTAINER" sh -c \
   | gzip > "$OUT"
 
 echo "wrote $OUT ($(du -h "$OUT" | cut -f1))"
-echo "restore with: docker compose down -v && docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d"
+echo "restore with: docker compose down \
+  && docker volume rm lh-radiology-agents_mariadb-data \
+  && docker compose -f docker-compose.yml -f docker-compose.seed.yml up -d"
+echo "(down -v also works but wipes the comms ledger + ingress store -- demo host: don't)"

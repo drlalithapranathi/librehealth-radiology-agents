@@ -38,12 +38,20 @@ class FakeFhir2:
 
 
 class FakeLedger:
-    """The comms ledger: Communication + Task + the on-call directory."""
+    """The comms ledger: Communication + Task + the on-call directory.
 
-    def __init__(self, on_call: str | None = "Practitioner/dr-oncall"):
+    The directory is one role: `on_call` is its practitioner, `on_call_specialty` its specialty
+    tag (None = untagged, a general rota). `on_call_searches` records every specialty_code the
+    agent searched with, so a test can assert the search really WAS narrowed (#58) -- not just
+    that the right person happened to come back."""
+
+    def __init__(self, on_call: str | None = "Practitioner/dr-oncall",
+                 on_call_specialty: str | None = None):
         self.communications: dict[str, Communication] = {}
         self.tasks: dict[str, Task] = {}
         self.on_call = on_call
+        self.on_call_specialty = on_call_specialty
+        self.on_call_searches: list[str | None] = []
         self._n = 0
 
     def _next(self, prefix: str) -> str:
@@ -72,7 +80,12 @@ class FakeLedger:
         return task
 
     async def search_on_call_roles(self, specialty_code: str | None = None):
+        """Mirrors the real search's contract: `specialty` is a server-side token filter, so a
+        role with NO specialty tag does not match a narrowed search."""
+        self.on_call_searches.append(specialty_code)
         if not self.on_call:
+            return []
+        if specialty_code and specialty_code != self.on_call_specialty:
             return []
         return [PractitionerRole(
             id="role-oncall",

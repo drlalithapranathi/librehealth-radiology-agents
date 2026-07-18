@@ -1,9 +1,9 @@
 """Unit tests for Fhir2Client.poll_finalized_reports (issue #12).
 
 Mocks the fhir2 HTTP layer (no live server) and checks: the query pages by INCLUSIVE `_lastUpdated`
-(NOT the `status` param, which 400s on live fhir2), `status == final` is filtered client-side,
-Bundle `next` pages are followed, and the high-water cursor is the max lastUpdated across ALL
-entries. Each report is projected to a lean, PHI-free record.
+(NOT the `status` param, which 400s on live fhir2), the sign-off statuses (final/amended/corrected,
+#66) are filtered client-side, Bundle `next` pages are followed, and the high-water cursor is the
+max lastUpdated across ALL entries. Each report is projected to a lean, PHI-free record.
 """
 from __future__ import annotations
 
@@ -21,6 +21,9 @@ from radagent_common.fhir_client import (
     finalized_report_record,
     _write_transport_is_secure,
     _guard_write_transport,
+    _guard_read_transport,
+    _read_transport_is_secure,
+    InsecureReadTransportError,
     InsecureWriteTransportError,
 )
 
@@ -79,6 +82,32 @@ def test_poll_uses_inclusive_ge_filters_final_and_reports_high_water():
     assert high_water == "2026-06-27T12:31:00Z"
     assert set(reports[0]) == {"diagnosticReportId", "status", "serviceRequestRef",
                               "accessionNumber", "signedAt", "lastUpdatedCursor"}
+
+
+def test_poll_returns_addenda_amended_and_corrected_but_not_preliminary():
+    """RIS sign-off detection covers the FINAL sign-off AND later ADDENDA (#56 (a) / #66): an
+    amended or corrected DiagnosticReport is returned too, each carrying its status so the poller
+    routes it to report_addended. The pre-sign AI draft (`preliminary`, #26) stays excluded -- it is
+    not a human sign-off. High-water still advances across ALL entries, addenda included."""
+    client = Fhir2Client()
+    amended = {"resourceType": "DiagnosticReport", "id": "rep-amd", "status": "amended",
+               "meta": {"lastUpdated": "2026-06-27T14:00:00Z"}}
+    corrected = {"resourceType": "DiagnosticReport", "id": "rep-cor", "status": "corrected",
+                 "meta": {"lastUpdated": "2026-06-27T15:00:00Z"}}
+
+    async def fake_get(path, params=None):
+        return _bundle(_FINAL, amended, _PRELIM, corrected)
+
+    client._get = fake_get  # type: ignore[assignment]
+    reports, high_water = asyncio.run(client.poll_finalized_reports("2026-06-27T00:00:00Z"))
+
+    got = {r["diagnosticReportId"]: r["status"] for r in reports}
+    assert got == {
+        "DiagnosticReport/rep-1": "final",
+        "DiagnosticReport/rep-amd": "amended",
+        "DiagnosticReport/rep-cor": "corrected",
+    }, "addenda (amended/corrected) must be polled alongside final; preliminary must stay excluded"
+    assert high_water == "2026-06-27T15:00:00Z"
 
 
 def test_poll_follows_bundle_next_link():
@@ -403,7 +432,10 @@ def test_find_presign_draft_none_when_no_preliminary_report():
 def test_auth_from_env_and_passed_to_httpx(monkeypatch):
     monkeypatch.setenv("FHIR2_BASIC_USER", "poller")
     monkeypatch.setenv("FHIR2_BASIC_PASS", "s3cret")
-    client = Fhir2Client()
+    # Loopback, not the default remote base: this test exercises a REAL _get (fake httpx), and the
+    # read-transport guard (#67) rightly refuses plaintext-to-remote -- credential passing is what
+    # is under test here, not transport policy (which has its own tests below).
+    client = Fhir2Client(base_url="http://127.0.0.1:8080/openmrs/ws/fhir2/R4")
     assert client._auth == ("poller", "s3cret")
 
     # The credential must reach the HTTP layer: live fhir2 401s every unauthenticated read,
@@ -863,6 +895,126 @@ def test_insecure_write_error_is_a_named_runtime_error_subclass():
         with pytest.raises(InsecureWriteTransportError) as ei:
             _guard_write_transport("http://openmrs:8080/openmrs/ws/fhir2/R4")
     assert ei.value.__class__.__name__ == "InsecureWriteTransportError"
+
+
+# --- read-transport guard (#67): the read side of #30's F2 -------------------------------------
+# Every read returns PHI over the same base URL and Basic credentials as the write; the RIS poller
+# reads every 30s, so a write-inert deployment is exposed CONTINUOUSLY. Reads therefore refuse
+# plaintext-to-remote exactly like writes -- same predicate, so the two policies cannot drift --
+# with the opt-in inherited from the write's (the trust statement is about the transport, not the
+# verb; the compose stack that already sets FHIR2_ALLOW_INSECURE_WRITE=1 keeps working unchanged).
+
+def test_read_transport_secure_allows_https_and_loopback():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_READ", None)
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        assert _read_transport_is_secure("https://openmrs.example.org/openmrs/ws/fhir2/R4")
+        assert _read_transport_is_secure("http://localhost:8080/openmrs/ws/fhir2/R4")
+        assert _read_transport_is_secure("http://127.0.0.1:8080/fhir2/R4")
+
+
+def test_read_transport_rejects_plaintext_to_a_remote_host():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_READ", None)
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        assert not _read_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+        assert not _read_transport_is_secure("http://fhir.hospital.example:8080/fhir2/R4")
+
+
+def test_reads_inherit_the_write_opt_in():
+    # THE compose-compat contract: a deployment that accepted cleartext on this hop for writes
+    # (FHIR2_ALLOW_INSECURE_WRITE=1, as docker-compose.yml sets) keeps its reads working without a
+    # second variable. Weaken this to a read-only opt-in and every existing stack's poller dies.
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_WRITE": "1"}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_READ", None)
+        assert _read_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+
+
+def test_explicit_read_opt_out_overrides_the_write_opt_in():
+    # An explicit FHIR2_ALLOW_INSECURE_READ wins over the inherited write value, in both directions.
+    with mock.patch.dict(
+        os.environ, {"FHIR2_ALLOW_INSECURE_WRITE": "1", "FHIR2_ALLOW_INSECURE_READ": "0"}, clear=False
+    ):
+        assert not _read_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_READ": "1"}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        assert _read_transport_is_secure("http://openmrs:8080/openmrs/ws/fhir2/R4")
+
+
+def test_a_plaintext_remote_read_is_refused_before_any_http_call():
+    # The refusal must happen BEFORE the request goes out -- refusing after sending would defeat
+    # the point. The fake httpx records every attempt; the guard must leave it untouched.
+    attempts: list[str] = []
+
+    class _RecordingClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None):
+            attempts.append(url)
+            raise AssertionError("the guard must refuse before any HTTP call")
+
+    import radagent_common.fhir_client as fhir_client_module
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_READ", None)
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with mock.patch.object(fhir_client_module.httpx, "AsyncClient", _RecordingClient):
+            client = Fhir2Client(base_url="http://openmrs:8080/openmrs/ws/fhir2/R4")
+            with pytest.raises(InsecureReadTransportError):
+                asyncio.run(client._get("DiagnosticReport"))
+    assert attempts == []
+
+
+def test_a_bundle_next_link_onto_a_plaintext_remote_is_refused_too():
+    # _get follows absolute, server-authored Bundle `next` URLs. The guard checks the URL actually
+    # fetched, so PHI cannot follow a next-link off a safe base onto a plaintext remote hop.
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_READ", None)
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        client = Fhir2Client(base_url=_LOOPBACK_BASE)  # base itself is fine
+        with pytest.raises(InsecureReadTransportError):
+            asyncio.run(client._get("http://fhir.hospital.example:8080/fhir2/R4?page=2"))
+
+
+def test_insecure_read_error_is_a_named_runtime_error_subclass():
+    # Same load-bearing properties as the write error: catchable as RuntimeError, non-retryable by
+    # type at an activity call site (temporalio keys ApplicationError.type off __class__.__name__).
+    assert issubclass(InsecureReadTransportError, RuntimeError)
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FHIR2_ALLOW_INSECURE_READ", None)
+        os.environ.pop("FHIR2_ALLOW_INSECURE_WRITE", None)
+        with pytest.raises(InsecureReadTransportError) as ei:
+            _guard_read_transport("http://openmrs:8080/openmrs/ws/fhir2/R4")
+    assert ei.value.__class__.__name__ == "InsecureReadTransportError"
+
+
+def test_insecure_optin_read_warns_once_per_process_per_host(caplog):
+    # The warn-once behavior is a design point (the poller reads every 30s; per-read warnings are
+    # alarm fatigue). Two guarded reads to the same host under the opt-in must produce exactly ONE
+    # audit line. A fresh host still gets its own line.
+    import radagent_common.fhir_client as fhir_client_module
+    fhir_client_module._INSECURE_READ_WARNED.clear()  # isolate from other tests in this process
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_READ": "1"}, clear=False):
+        with caplog.at_level(logging.WARNING, logger="radagent_common.fhir_client"):
+            _guard_read_transport("http://openmrs:8080/openmrs/ws/fhir2/R4")
+            _guard_read_transport("http://openmrs:8080/openmrs/ws/fhir2/R4")
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, [w.getMessage() for w in warnings]
+    assert "PLAINTEXT" in warnings[0].getMessage()
+    # ...and per-HOST, not once-per-process globally: a second host gets its own audit line. A
+    # regression collapsing the set to a global flag would silence the line for every host but
+    # the first while this suite stayed green.
+    with mock.patch.dict(os.environ, {"FHIR2_ALLOW_INSECURE_READ": "1"}, clear=False):
+        with caplog.at_level(logging.WARNING, logger="radagent_common.fhir_client"):
+            _guard_read_transport("http://fhir.other.example:8080/fhir2/R4")
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2, [w.getMessage() for w in warnings]
 
 
 def test_post_backstop_refuses_an_insecure_transport():

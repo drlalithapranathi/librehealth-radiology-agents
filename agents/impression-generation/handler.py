@@ -9,12 +9,15 @@ acute findings" rather than failing the post-sign safety-net.
 
 Pre-sign (#26): before a report exists, `report` is omitted/empty, so the only signal available
 is `aiFindings` (contracts/skills/interpretation.schema.json). Each COMPLETE finding's `label`
-is folded into the same critical-keyword scan as the report conclusion — STUBBED/ERROR findings
-carry no real label in v1 (real tools land in M3) and are excluded so a stub never fabricates a
-flag. Post-sign, both signals are scanned together, so an aiFindings hit still surfaces even if
-the conclusion text misses it. This keeps the handler's own I/O timing-agnostic; wiring the
-orchestrator to actually call this skill pre-sign and write the draft back into the RIS is
-orchestrator/shared-lib work tracked separately on #26 (out of scope here).
+runs through the same negation-aware critical-term scan as the report conclusion — but every
+signal is scanned SEPARATELY (the conclusion's finding-bearing sections, then each label on its
+own, #78), so a pertinent negative in one signal can never silence a positive in another.
+STUBBED/ERROR labels are excluded: a STUBBED label may describe a NEGATIVE screen or a referral
+code (not a model-asserted finding), and an ERROR label describes a failure -- only COMPLETE
+labels assert findings. Post-sign, an aiFindings hit still surfaces even if the conclusion
+text misses it. This keeps the handler's own I/O timing-agnostic; wiring the orchestrator to
+actually call this skill pre-sign and write the draft back into the RIS is orchestrator/shared-lib
+work tracked separately on #26 (out of scope here).
 
 Input  : { studyContext, report?, ehrContext?, aiFindings? }
 Output : contracts/skills/impression.schema.json
@@ -23,9 +26,9 @@ M2: replace the keyword scan with an LLM draft from report + ehrContext + aiFind
 """
 from __future__ import annotations
 import logging
-import re
 
 from radagent_common.fhir_client import Fhir2Client
+from radagent_common.negation import find_asserted_terms, scannable_text
 from radagent_common.tracing import now_iso
 
 AGENT_VERSION = "0.1.0"
@@ -75,14 +78,17 @@ async def _report_conclusion(report: dict) -> str:
         return ""
 
 
-def _complete_finding_labels(ai_findings: dict) -> str:
-    """Space-joined labels of COMPLETE findings (#26). STUBBED/ERROR findings carry no real
-    label in v1 (real tools land M3), so they're excluded to avoid fabricating a flag."""
-    return " ".join(
+def _complete_finding_labels(ai_findings: dict) -> list[str]:
+    """Labels of COMPLETE findings (#26), one entry per finding. STUBBED/ERROR labels are excluded:
+    a STUBBED label may describe a NEGATIVE screen or a referral code (not a model-asserted finding)
+    and an ERROR label a failure -- only COMPLETE labels assert findings. A LIST, not a joined
+    string: each label is scanned on its own, so a negation cue in one tool's label
+    ("No hemorrhage") can never bleed across and silence a positive term in the next tool's (#78)."""
+    return [
         finding.get("label") or ""
         for finding in ai_findings.get("findings", [])
         if finding.get("status") == "COMPLETE"
-    )
+    ]
 
 
 async def handle(skill_id: str, payload: dict) -> dict:
@@ -92,18 +98,27 @@ async def handle(skill_id: str, payload: dict) -> dict:
     ctx = payload["studyContext"]
     report = payload.get("report") or {}
     ai_findings = payload.get("aiFindings") or {}
-    conclusion = (await _report_conclusion(report)).lower()
-    finding_labels = _complete_finding_labels(ai_findings).lower()
+    conclusion = await _report_conclusion(report)
 
     # Deterministically detect critical findings from whichever signal is available (pre-sign:
     # aiFindings only; post-sign: report conclusion, plus aiFindings if also passed forward).
-    # Word-boundary match so "mass" does not fire on "massive" (negation like "no pneumothorax"
-    # is a known limit; the M2 LLM draft handles it).
-    scan_text = f"{conclusion} {finding_labels}"
+    # Negation-aware (#78): a real NORMAL report is pertinent negatives ("No pneumothorax, effusion,
+    # or consolidation"), and a bare keyword match flagged every one of them, FAILing verification
+    # and parking the whole normal cohort at the sign-off gate. Three scan rules, each of which a
+    # reproduced false flag or false silence forced:
+    #   * only the finding-bearing SECTIONS of the narrative are scanned (scannable_text): the
+    #     INDICATION names the suspicion ("evaluate for pneumothorax"), not a finding;
+    #   * every signal is scanned SEPARATELY -- the conclusion and EACH finding label -- so a
+    #     negation in one can never bleed across and silence a positive in another;
+    #   * word-boundary match, so "mass" never fires on "massive".
+    scan_texts = [scannable_text(conclusion)] + _complete_finding_labels(ai_findings)
+    hits: set[str] = set()
+    for text in scan_texts:
+        hits |= set(find_asserted_terms(text, _CRITICAL_KEYWORDS))
     critical_flags = [
         {"label": label, "severity": "critical"}
         for keyword, label in _CRITICAL_KEYWORDS.items()
-        if re.search(rf"\b{re.escape(keyword)}\b", scan_text)
+        if keyword in hits
     ]
 
     structured_findings = [

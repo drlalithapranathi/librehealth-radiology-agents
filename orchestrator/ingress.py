@@ -10,6 +10,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException
@@ -26,7 +27,12 @@ from radagent_common.validation import validate_skill_output
 from radagent_common.tracing import now_iso, new_trace_id, new_span_id, init_tracing, tracing_enabled
 from .state import TASK_QUEUE
 from .workflow import StudyWorkflow
-from .ingress_store import IngressStore, default_store_path
+from .ingress_store import (
+    KIND_POST_ARCHIVE_ADDENDUM,
+    KIND_SIGNOFF_DROP,
+    IngressStore,
+    default_store_path,
+)
 from . import activities
 
 TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
@@ -53,6 +59,17 @@ FAILED_POLLS_PER_WARNING = max(1, int(os.environ.get("INGRESS_FAILED_POLLS_PER_W
 
 _client: Client | None = None
 _log = logging.getLogger("orchestrator.ingress")
+
+# Greedy to the LAST @ before the path (so an un-encoded @ inside a password masks whole);
+# ? and # excluded so a query/fragment @ after a pathless host never swallows the hostname.
+_USERINFO_RE = re.compile(r"://[^/?#\s]+@")
+
+
+def _redacted(exc: BaseException) -> str:
+    """str(exc) with any URL userinfo masked -- exception text is the one place a
+    credentials-in-the-URL deployment would leak them into routine logs."""
+    return _USERINFO_RE.sub("://***@", str(exc))
+
 
 # Durable report->workflow index + poll cursor (#6): must survive an ingress restart during the
 # hours-long human-gate wait, or the sign-off is silently lost. Backed by SQLite at
@@ -181,8 +198,15 @@ async def _resolve_patient_order(accession: str | None) -> tuple[dict, dict]:
     if accession:
         try:
             resolved = await _openmrs_rest().resolve_radiology_order_by_accession(accession)
-        except Exception:  # noqa: BLE001 - OpenMRS down/unreachable must not fail the webhook
-            _log.warning("order resolution failed for accession %s; starting Patient/UNRESOLVED", accession)
+        except Exception as exc:  # noqa: BLE001 - OpenMRS down/unreachable must not fail the webhook
+            # The reason matters in the log: "connection refused" is an outage to wait out, but an
+            # InsecureReadTransportError (#67) is a config error that will fail EVERY ingest until
+            # someone fixes the base URL or sets the opt-in -- a reasonless warning hid that.
+            # Redacted: httpx errors embed the request URL, and a base URL configured with
+            # userinfo (http://user:pass@host/...) would put Basic credentials in this line on
+            # EVERY DICOM arrival.
+            _log.warning("order resolution failed for accession %s (%s: %s); starting "
+                         "Patient/UNRESOLVED", accession, type(exc).__name__, _redacted(exc))
             resolved = None
         if resolved:
             order = {"fhirServiceRequestId": resolved["fhirServiceRequestId"]}
@@ -249,10 +273,23 @@ def _workflow_id_for_report(report: dict) -> str | None:
     return None
 
 
+def _dedup_key(report: dict) -> str:
+    """Dedup identity for the boundary re-scan: report id PLUS its update stamp.
+
+    An addendum is the SAME resource re-returned with a bumped _lastUpdated (#66) -- keyed on the
+    bare id, a signed report's dedup entry permanently swallowed its own amendment on a quiet
+    system (and the kept-filter in _advance_cursor even refreshed the entry, because the
+    amendment's stamp sits at the new cursor), so report_addended never fired. The stamp makes
+    each observed VERSION its own event while the same-stamp boundary re-scan still dedups.
+    A string, not a tuple: the set round-trips through the store as JSON."""
+    return f"{report.get('diagnosticReportId')}@{report.get('lastUpdatedCursor') or ''}"
+
+
 async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]) -> tuple[set[str], list[dict]]:
-    """Signal each mapped, not-yet-signalled report to its waiting workflow; return (ids newly
-    signalled, mapped reports whose signal FAILED). Reports already signalled at the current
-    cursor (`skip_ids`) are deduped. A report with no known workflow is LOGGED and skipped.
+    """Signal each mapped, not-yet-signalled report to its waiting workflow; return (dedup keys
+    newly signalled, mapped reports whose signal FAILED). Report VERSIONS already signalled at the
+    current cursor (`skip_ids`, keyed by _dedup_key) are deduped. A report with no known workflow
+    is LOGGED and skipped.
 
     A failed report is returned rather than dropped so `_advance_cursor` can hold the cursor at
     it (#29): the inclusive ge-window then re-returns it next poll — a retry for free. The retry
@@ -265,30 +302,65 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
     failed: list[dict] = []
     for report in reports:
         report_id = report.get("diagnosticReportId")
-        if report_id in skip_ids:
+        if _dedup_key(report) in skip_ids:
             continue
         wf_id = _workflow_id_for_report(report)
         if not wf_id:
             was_failing = store.failed_signal_for(report_id) if report_id else None
             if was_failing:
+                # The kind must tell the truth about WHAT was dropped (lead ruling, #66 audit) --
+                # and the truth lives in the RECORDED failure history, not in whatever version
+                # fhir2 serves now: a report amended DURING the outage re-enters as `amended`,
+                # but if a report_finalized delivery ever failed, the thing still undelivered is
+                # the SIGN-OFF (classifying that as an addendum would hide a lost signature --
+                # the dangerous direction). Only a failure history that is addendum-only files as
+                # the post-archive addendum a human must re-verify by hand.
+                if was_failing.get("signal") == "addendum":
+                    kind = KIND_POST_ARCHIVE_ADDENDUM
+                    reason = ("addendum arrived after its workflow finished; the correction was "
+                              "never re-verified")
+                else:
+                    kind = KIND_SIGNOFF_DROP
+                    reason = "workflow evicted while its sign-off signal was still failing"
                 store.add_dead_letter(
                     report_id, was_failing["workflowId"], was_failing["attempts"],
-                    "workflow evicted while its sign-off signal was still failing", now_iso())
+                    reason, now_iso(), kind=kind)
                 store.clear_failed_signal(report_id)
-                _log.error("DEAD LETTER: sign-off %s for workflow %s dropped after %d failed "
-                           "attempt(s); see /admin/dead-letters", report_id,
+                _log.error("DEAD LETTER (%s): report %s for workflow %s dropped after %d failed "
+                           "attempt(s); see /admin/dead-letters", kind, report_id,
                            was_failing["workflowId"], was_failing["attempts"])
+            elif report.get("status") in ("amended", "corrected"):
+                # Unmapped addendum: no index row, no failure record -- either fhir2 noise for a
+                # study never tracked, or a correction arriving long after its workflow's rows
+                # were reconciled away (>~1h post-completion). The two are indistinguishable
+                # here, so no dead letter is fabricated -- but the log line names the second
+                # possibility so a grep can find it. Surfacing the long-tail case durably needs
+                # a retention design (lead decision pending).
+                _log.warning("amended/corrected report %s matched no waiting workflow (dropped; "
+                             "possible post-archive addendum for an already-reconciled study)",
+                             report_id)
             else:
                 _log.warning("finalized report %s matched no waiting workflow (dropped)", report_id)
             continue
+        # Route on status: a `final` report is the radiologist's sign-off (report_finalized, leaves
+        # AWAITING_RADIOLOGIST); an `amended`/`corrected` report is an addendum to an already-signed
+        # report (report_addended, re-verifies against the correction at the sign-off gate, #56 (a)
+        # / #66). The poll (fhir_client._SIGNOFF_STATUSES) returns both; the record carries `status`.
+        signal = (
+            StudyWorkflow.report_addended
+            if report.get("status") in ("amended", "corrected")
+            else StudyWorkflow.report_finalized
+        )
         try:
-            await client.get_workflow_handle(wf_id).signal(StudyWorkflow.report_finalized, report)
-            signalled.add(report_id)  # mapping is reclaimed on completion by _reconcile_index
+            await client.get_workflow_handle(wf_id).signal(signal, report)
+            signalled.add(_dedup_key(report))  # mapping is reclaimed on completion by _reconcile_index
             store.clear_failed_signal(report_id)  # delivered: retire any failure record
         except Exception:  # noqa: BLE001 - workflow gone/unreachable
             failed.append(report)
             if report_id:  # a report with no id can't be tracked; the held cursor still retries it
-                store.record_failed_signal(report_id, wf_id, now_iso())
+                store.record_failed_signal(
+                    report_id, wf_id, now_iso(),
+                    signal="addendum" if signal is StudyWorkflow.report_addended else "final")
             _log.warning("failed to signal workflow %s for report %s; will retry next poll", wf_id, report_id)
     return signalled, failed
 
@@ -303,8 +375,10 @@ def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], si
 
     Holding at the earliest failure keeps that report inside the ge-window so the next poll
     retries it; before, a later success in the same batch advanced the cursor past it and the
-    sign-off was silently lost. While held back, the dedup set keeps EVERY already-signalled id
-    at-or-after the cursor (not just the boundary), so the wider re-scan does not re-signal.
+    sign-off was silently lost. While held back, the dedup set keeps EVERY already-signalled
+    version key (_dedup_key, id@stamp) at-or-after the cursor (not just the boundary), so the
+    wider re-scan does not re-signal -- while an ADDENDUM, the same id at a NEWER stamp, is a
+    fresh key and still gets through (#66).
     (End-to-end delivery is still at-least-once — e.g. a crash after signal but before
     save_cursor replays the batch — which is safe because report_finalized is an idempotent
     overwrite; keep it that way.)
@@ -321,8 +395,8 @@ def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], si
     if not target or target == cursor:
         return cursor, signalled
     kept = {
-        r["diagnosticReportId"] for r in reports
-        if (r.get("lastUpdatedCursor") or "") >= target and r["diagnosticReportId"] in signalled
+        _dedup_key(r) for r in reports
+        if (r.get("lastUpdatedCursor") or "") >= target and _dedup_key(r) in signalled
     }
     return target, kept
 
@@ -422,14 +496,18 @@ async def _ris_poller() -> None:
             reports, high_water = await activities.poll_finalized_reports(cursor)
         except NotImplementedError:
             continue  # fhir2 client not wired in this environment
-        except Exception:  # noqa: BLE001 - keep the loop alive
+        except Exception as exc:  # noqa: BLE001 - keep the loop alive
             # Swallowing keeps the loop alive, but a fhir2 that is down (or rejecting our
             # credentials, #53) must not be silent: every failed poll is a window in which a
             # radiologist sign-off goes undetected. Warn on the first failure, then throttle.
+            # Type + redacted message, NOT exc_info: the formatted traceback ends with str(exc),
+            # and an HTTPStatusError embeds the full request URL -- with userinfo credentials in
+            # it if the deployment configured them that way (the 401/#53 case is exactly an
+            # HTTPStatusError, so the leak would fire precisely when credentials are wrong).
             consecutive_failures += 1
             if consecutive_failures == 1 or consecutive_failures % FAILED_POLLS_PER_WARNING == 0:
-                _log.warning("fhir2 poll failed (%d consecutive); sign-off detection is stalled",
-                             consecutive_failures, exc_info=True)
+                _log.warning("fhir2 poll failed (%d consecutive; %s: %s); sign-off detection is "
+                             "stalled", consecutive_failures, type(exc).__name__, _redacted(exc))
             continue
         if consecutive_failures:
             _log.warning("fhir2 poll recovered after %d consecutive failure(s)", consecutive_failures)
@@ -579,6 +657,10 @@ async def dead_letters() -> dict:
       acknowledged. The study was released to COMMUNICATE (so the finding that made verification
       FAIL still got dispatched) and archived, but its report carries a verification FAIL that no
       human ever signed off. Go and look at the study. This is the loudest row on this surface.
+    * `post-archive-addendum` (#66) — a correction (amended/corrected report) arrived for a
+      workflow that had already finished, and its delivery failed until the rows were reclaimed.
+      The pipeline never re-verified the corrected body: read the amended report in the RIS and
+      run the correction through review by hand.
     """
     letters = _store().dead_letters()
     return {"count": len(letters), "deadLetters": letters}

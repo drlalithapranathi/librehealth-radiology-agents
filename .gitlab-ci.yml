@@ -143,7 +143,9 @@ ris-poller-tests:
   # The FHIR test files are named EXPLICITLY rather than running the whole tests/ dir, because
   # the other files there need extras this job does not install. That means a new test file is
   # invisible to CI until it is added HERE -- so #52's comms-ledger + R4-model tests are listed
-  # below. A guard CI never runs is not a guard.
+  # below. A guard CI never runs is not a guard. test_negation.py (#78) is listed for the
+  # same reason: 50 tests guarding the critical-finding scanners' negation window -- the
+  # "never silence a pneumothorax" pins -- ran in NO lane before this line.
   extends: .default-rules
   stage: test
   image: python:3.11-slim
@@ -161,6 +163,9 @@ ris-poller-tests:
     - >
       python -m pytest
       libs/radagent-common/tests/test_fhir_client.py
+      libs/radagent-common/tests/test_negation.py
+      libs/radagent-common/tests/test_openmrs_rest.py
+      libs/radagent-common/tests/test_openmrs_rest_reason.py
       libs/radagent-common/tests/test_fhir_models.py
       libs/radagent-common/tests/test_comms_ledger.py
       libs/radagent-common/tests/test_orthanc_client.py

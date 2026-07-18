@@ -1,0 +1,259 @@
+"""Study -> subspecialty derivation and the out-of-specialty dial (#58).
+
+Behaviour tests run against their own tmp routing file (hermetic; the shipped table is clinical
+config a deployment edits). A couple of tests DO read the shipped specialty-routing.yaml -- they
+pin that the in-repo file is wired, parseable, and maps the canonical cases, on top of the CI
+schema validation in scripts/validate_contracts.py.
+"""
+import textwrap
+
+import yaml
+
+import routing
+from routing import FALLBACK_ANY_ON_CALL, derive_specialty, out_of_specialty_fallback
+
+
+def _point_at(monkeypatch, tmp_path, body: str):
+    p = tmp_path / "routing.yaml"
+    p.write_text(textwrap.dedent(body))
+    monkeypatch.setenv("SPECIALTY_ROUTING_PATH", str(p))
+    return p
+
+
+TABLE = """\
+    schemaVersion: "1.0.0"
+    outOfSpecialtyFallback: any-on-call
+    rules:
+      - specialty: breast
+        modalities: [MG]
+      - specialty: neuro
+        keywords: [head, brain]
+      - specialty: chest
+        keywords: [chest]
+"""
+
+
+# --- derivation -----------------------------------------------------------------------
+
+def test_modality_match_is_case_insensitive(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, TABLE)
+    assert derive_specialty({"modality": "mg"}) == "breast"
+
+
+def test_keyword_matches_inside_the_description_case_insensitively(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, TABLE)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT HEAD W/O CONTRAST"}) == "neuro"
+
+
+def test_first_matching_rule_wins(monkeypatch, tmp_path):
+    """'CT head and chest' hits both the neuro and chest rules; file order decides."""
+    _point_at(monkeypatch, tmp_path, TABLE)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head and chest"}) == "neuro"
+
+
+def test_an_empty_keyword_matches_nothing_not_everything(monkeypatch, tmp_path):
+    """`"" in description` is True for every non-empty description, so a live-edited table with
+    an empty keyword would silently route EVERY described study to that specialty. CI's
+    minLength only guards the in-repo file; the matcher itself must refuse the empty string."""
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: neuro
+            keywords: [""]
+    """)
+    assert derive_specialty({"modality": "US", "studyDescription": "US thyroid"}) is None
+
+def test_a_whitespace_only_keyword_matches_nothing_not_everything(monkeypatch, tmp_path):
+    '''" " is a substring of every multi-word description -- the same match-all disaster as ""
+    in a live-edited table, and it even passes the schema's minLength (one space IS a character);
+    the schema's \\S pattern now refuses it in-repo, and the matcher must refuse it live.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: neuro
+            keywords: [" "]
+    """)
+    assert derive_specialty({"modality": "US", "studyDescription": "US thyroid"}) is None
+
+
+def test_a_non_string_keyword_skips_the_rule_not_the_whole_table(monkeypatch, tmp_path):
+    '''A bare `123` in a live-edited table used to raise inside the scan and the blanket except
+    aborted EVERY later rule -- one junk entry silently un-narrowed the whole directory. The
+    junk entry must lose, not the table.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: msk
+            keywords: [123]
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_scalar_string_keywords_container_does_not_char_match_everything(monkeypatch, tmp_path):
+    '''`keywords: shoulder` (forgot the [list]) used to ITERATE CHARACTERS -- every single-char
+    substring matched, so the rule silently captured almost every described study with no
+    malformed-table log. A non-list container must contribute nothing; later rules still run.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: msk
+            keywords: shoulder
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_scalar_int_keywords_container_loses_the_rule_not_the_table(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: msk
+            keywords: 123
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_non_dict_rule_and_a_specialtyless_rule_each_lose_only_themselves(monkeypatch, tmp_path):
+    '''A stray string in `rules`, or a MATCHING rule with no `specialty`, used to abort the
+    whole scan via the (then table-level) except -- one junk entry un-narrowed the directory.
+    Each now costs only itself, logged, and the later valid rule still routes.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - "oops a bare string"
+          - keywords: ["head"]
+          - specialty: neuro
+            keywords: ["head"]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_a_scalar_rules_container_degrades_to_no_match(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules: 7
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head"}) is None
+
+
+def test_a_padded_modality_still_matches_after_stripping(monkeypatch, tmp_path):
+    '''Same rationale as padded keywords: " CT " must be a working rule -- the schema\'s \\S
+    pattern accepts it, so the matcher has to strip it or it is a CI-blessed dead rule.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: chest
+            modalities: [" CT "]
+    """)
+    assert derive_specialty({"modality": "CT"}) == "chest"
+
+
+def test_a_padded_keyword_still_matches_after_stripping(monkeypatch, tmp_path):
+    '''" head " must be a working rule, not a silently dead one: matching strips the keyword,
+    so hand-edited padding cannot make a description that plainly says "head" miss.'''
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - specialty: neuro
+            keywords: [" head "]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head w/o contrast"}) == "neuro"
+
+
+def test_unmatched_study_gets_no_specialty(monkeypatch, tmp_path):
+    """None = unnarrowed on-call search, the pre-#58 behaviour. A single general rota is
+    unaffected, and an unmapped study must never have a specialty invented for it."""
+    _point_at(monkeypatch, tmp_path, TABLE)
+    assert derive_specialty({"modality": "US", "studyDescription": "US thyroid"}) is None
+    assert derive_specialty({"modality": "CT"}) is None
+    assert derive_specialty({}) is None
+
+
+# --- the dial -------------------------------------------------------------------------
+
+def test_the_fallback_dial_reads_from_the_table(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: none
+        rules:
+          - specialty: neuro
+            keywords: [head]
+    """)
+    assert out_of_specialty_fallback() == "none"
+
+
+def test_an_unknown_dial_value_degrades_to_any_on_call(monkeypatch, tmp_path):
+    """The in-repo file is CI-validated; this guards a live edit or SPECIALTY_ROUTING_PATH
+    override. Of the two failure directions a typo could buy, the one where someone hears the
+    page is the right one."""
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: ask-the-pi
+        rules:
+          - specialty: neuro
+            keywords: [head]
+    """)
+    assert out_of_specialty_fallback() == FALLBACK_ANY_ON_CALL
+
+
+# --- config disasters must not silence a page -----------------------------------------
+
+def test_a_missing_routing_file_degrades_to_no_specialty_not_an_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("SPECIALTY_ROUTING_PATH", str(tmp_path / "does-not-exist.yaml"))
+    assert derive_specialty({"modality": "MG"}) is None
+    assert out_of_specialty_fallback() == FALLBACK_ANY_ON_CALL
+
+
+def test_an_unparseable_routing_file_degrades_the_same_way(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, "rules: [unclosed")
+    assert derive_specialty({"modality": "MG"}) is None
+    assert out_of_specialty_fallback() == FALLBACK_ANY_ON_CALL
+
+
+def test_a_file_that_parses_but_is_not_a_mapping_degrades_the_same_way(monkeypatch, tmp_path):
+    _point_at(monkeypatch, tmp_path, "- just\n- a\n- list\n")
+    assert derive_specialty({"modality": "MG"}) is None
+    assert out_of_specialty_fallback() == FALLBACK_ANY_ON_CALL
+
+
+def test_a_malformed_rule_degrades_instead_of_blocking_the_page(monkeypatch, tmp_path):
+    """A live-edited rule missing its `specialty` must not turn every dispatch into a crash
+    (a failed dispatch retries forever with no page sent). CI validates the in-repo table; this
+    guards the SPECIALTY_ROUTING_PATH override that bypasses it."""
+    _point_at(monkeypatch, tmp_path, """\
+        schemaVersion: "1.0.0"
+        outOfSpecialtyFallback: any-on-call
+        rules:
+          - keywords: [head]
+    """)
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head"}) is None
+
+
+# --- the shipped table ----------------------------------------------------------------
+
+def test_the_shipped_table_loads_and_maps_the_canonical_cases(monkeypatch):
+    """No env override: this reads agents/communications/specialty-routing.yaml itself. Loose on
+    purpose -- it pins that the file is wired and sane, not every keyword (that list is clinical
+    config under PI review, and CI already schema-validates it)."""
+    monkeypatch.delenv("SPECIALTY_ROUTING_PATH", raising=False)
+    assert routing._routing_path().is_file()
+    assert derive_specialty({"modality": "MG"}) == "breast"
+    assert derive_specialty({"modality": "CT", "studyDescription": "CT head"}) == "neuro"
+    # Assert on the RAW parsed value, not out_of_specialty_fallback(): that function coerces
+    # every garbage input to a valid dial, so asserting on its return can never fail.
+    raw = yaml.safe_load(routing._routing_path().read_text())
+    assert raw["outOfSpecialtyFallback"] in ("any-on-call", "none")

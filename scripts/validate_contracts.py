@@ -93,6 +93,25 @@ if _escalation_schema.exists() and _escalation_policy.exists():
                 if lv.get("repeat") and "repeatEveryMinutes" not in lv:
                     errors.append(f"[escalation-policy] tier {tier} level {lv['level']}: repeat requires repeatEveryMinutes")
 
+# 5. Specialty routing (#58): the comms agent's study->subspecialty table validates against its
+#    schema, plus the one cross-field invariant JSON Schema can't express cleanly: a rule with
+#    neither modalities nor keywords can never match, and a dead rule in a paging table is a
+#    config mistake someone meant to be real.
+_routing_schema = CONTRACTS / "specialty-routing.schema.json"
+_routing_table = ROOT / "agents" / "communications" / "specialty-routing.yaml"
+if _routing_schema.exists() and _routing_table.exists():
+    with _routing_table.open() as f:
+        routing = yaml.safe_load(f)
+    v = Draft202012Validator(_load(_routing_schema))
+    routing_errs = sorted(v.iter_errors(routing), key=lambda e: list(e.path))
+    for err in routing_errs:
+        errors.append(f"[specialty-routing] {list(err.path)} {err.message}")
+    if not routing_errs:
+        for i, rule in enumerate(routing.get("rules", [])):
+            if not rule.get("modalities") and not rule.get("keywords"):
+                errors.append(f"[specialty-routing] rule {i} ({rule.get('specialty')!r}) has no "
+                              "modalities and no keywords, so it can never match")
+
 if errors:
     print("CONTRACT VALIDATION FAILED:")
     for e in errors:
@@ -100,5 +119,5 @@ if errors:
     sys.exit(1)
 print(
     f"OK: {len(schema_files)} schemas, cards, {fixture_count} fixtures, "
-    "and the escalation policy validated."
+    "the escalation policy, and the specialty routing table validated."
 )
