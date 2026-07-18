@@ -305,6 +305,17 @@ def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 
+def _input_path(root: str, *names: str) -> Optional[str]:
+    """First existing input among the candidate names, each also tried with .gz (the PhysioNet
+    distributions ship gzipped and version-prefixed: mimic-cxr-2.0.0-chexpert.csv.gz)."""
+    for name in names:
+        for candidate in (name, name + ".gz"):
+            p = os.path.join(root, candidate)
+            if os.path.exists(p):
+                return p
+    return None
+
+
 def build_candidates(study_list: list, chex: dict, neg: dict, meta: dict,
                      reports_root: str) -> tuple:
     """Study list -> candidates with a parseable report, plus skip counters. Priors are derived
@@ -355,11 +366,18 @@ def main(argv=None) -> int:
 
     root = args.cxr_root
     reports_root = args.reports_root or root
-    chex = read_labels(os.path.join(root, "chexpert.csv"))
-    neg = read_labels(os.path.join(root, "negbio.csv"))
-    study_list = read_study_list(os.path.join(root, "cxr-study-list.csv"))
-    meta_path = os.path.join(root, "mimic-cxr-2.0.0-metadata.csv")
-    meta = read_metadata(meta_path) if os.path.exists(meta_path) else {}
+    chex_path = _input_path(root, "chexpert.csv", "mimic-cxr-2.0.0-chexpert.csv",
+                            "mimic-cxr-2.1.0-chexpert.csv")
+    neg_path = _input_path(root, "negbio.csv", "mimic-cxr-2.0.0-negbio.csv",
+                           "mimic-cxr-2.1.0-negbio.csv")
+    list_path = _input_path(root, "cxr-study-list.csv")
+    if not (chex_path and neg_path and list_path):
+        p.error(f"missing label/list CSVs under {root} (need chexpert, negbio, cxr-study-list)")
+    chex = read_labels(chex_path)
+    neg = read_labels(neg_path)
+    study_list = read_study_list(list_path)
+    meta_path = _input_path(root, "mimic-cxr-2.0.0-metadata.csv", "mimic-cxr-2.1.0-metadata.csv")
+    meta = read_metadata(meta_path) if meta_path else {}
 
     cands, skipped = build_candidates(study_list, chex, neg, meta, reports_root)
     targets = {k: getattr(args, k) for k in DEFAULT_TARGETS}
