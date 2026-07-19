@@ -150,3 +150,89 @@ def test_docker_compose_env_var_agrees_with_the_client_default():
         f"does not match fhir_client._DEFAULT_PRESIGN_REPORT_CONCEPT "
         f"({fhir_client._DEFAULT_PRESIGN_REPORT_CONCEPT})"
     )
+
+
+# --- #79: the critical-result notification concept, same three-way pin --------------------
+
+_SEED_NOTIFICATION = "lh-radiology.ai-critical-result-notification.v1"
+
+
+def test_notification_concept_uuid_is_the_documented_seed():
+    """Same guard as the presign concept: the client default must re-derive from the documented
+    seed, or a hand-typed value has replaced the derived one."""
+    from radagent_common import fhir_client
+
+    ns = uuid.uuid5(uuid.NAMESPACE_DNS, _SEED_NAMESPACE_DNS)
+    expected = str(uuid.uuid5(ns, _SEED_NOTIFICATION))
+    assert expected == fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT, (
+        f"documented-seed UUID5 derivation ({expected}) "
+        f"does not match fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT "
+        f"({fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT})"
+    )
+
+
+def test_notification_bootstrap_uuid_agrees_with_the_client_default():
+    """If these differ, the comms agent stamps an Observation with a concept the bootstrap never
+    provisioned -- fhir2 refuses the write, the channel result reports FAILED on every critical
+    dispatch, and the chart never sees a notification."""
+    from radagent_common import fhir_client
+
+    bootstrap = _load_bootstrap_module()
+    assert bootstrap.NOTIFICATION_CONCEPT_UUID == fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT, (
+        f"bootstrap.NOTIFICATION_CONCEPT_UUID ({bootstrap.NOTIFICATION_CONCEPT_UUID}) "
+        f"does not match fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT "
+        f"({fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT})"
+    )
+
+
+def test_notification_child_uuids_re_derive_from_the_documented_seeds():
+    bootstrap = _load_bootstrap_module()
+    ns = uuid.uuid5(uuid.NAMESPACE_DNS, _SEED_NAMESPACE_DNS)
+    expected_name = str(uuid.uuid5(ns, _SEED_NOTIFICATION + ".name.en"))
+    expected_desc = str(uuid.uuid5(ns, _SEED_NOTIFICATION + ".description.en"))
+    assert bootstrap.NOTIFICATION_CONCEPT_NAME_UUID == expected_name, (
+        f"bootstrap.NOTIFICATION_CONCEPT_NAME_UUID ({bootstrap.NOTIFICATION_CONCEPT_NAME_UUID}) "
+        f"does not match documented-seed derivation ({expected_name})"
+    )
+    assert bootstrap.NOTIFICATION_CONCEPT_DESCRIPTION_UUID == expected_desc, (
+        f"bootstrap.NOTIFICATION_CONCEPT_DESCRIPTION_UUID "
+        f"({bootstrap.NOTIFICATION_CONCEPT_DESCRIPTION_UUID}) "
+        f"does not match documented-seed derivation ({expected_desc})"
+    )
+
+
+def test_notification_concept_datatype_is_text():
+    """The notification Observation carries a valueString; fhir2 refuses an obs whose value does
+    not match its concept's datatype. The bootstrap must therefore provision this concept with
+    the Text datatype -- N/A (the presign stamp's datatype) would break every write."""
+    bootstrap = _load_bootstrap_module()
+    spec = next(s for s in bootstrap._CONCEPTS
+                if s["uuid"] == bootstrap.NOTIFICATION_CONCEPT_UUID)
+    assert spec["datatype_uuid"] == bootstrap.DATATYPE_TEXT_UUID, (
+        "the notification concept must be provisioned with the Text datatype; "
+        f"got {spec['datatype_uuid']}"
+    )
+
+
+def test_docker_compose_notification_env_var_agrees_with_the_client_default():
+    """FHIR2_CRITICAL_NOTIFICATION_CONCEPT on the communications service must equal the client
+    default, same three-way pin as the presign concept above."""
+    from radagent_common import fhir_client
+
+    text = COMPOSE_PATH.read_text(encoding="utf-8")
+    match = re.search(
+        r"^\s+FHIR2_CRITICAL_NOTIFICATION_CONCEPT:\s*([0-9a-f-]{36})\s*$",
+        text,
+        re.MULTILINE,
+    )
+    assert match is not None, (
+        "FHIR2_CRITICAL_NOTIFICATION_CONCEPT env var not found in docker-compose.yml "
+        "under the expected `      KEY: value` shape. If the env var was moved "
+        "or reformatted, update the regex here."
+    )
+    compose_uuid = match.group(1)
+    assert compose_uuid == fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT, (
+        f"docker-compose.yml FHIR2_CRITICAL_NOTIFICATION_CONCEPT ({compose_uuid}) "
+        f"does not match fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT "
+        f"({fhir_client._DEFAULT_CRITICAL_NOTIFICATION_CONCEPT})"
+    )

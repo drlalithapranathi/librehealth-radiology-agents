@@ -58,7 +58,13 @@ behaviour); the ordering-provider path never consults routing.
 - **v1:** the ACR classifier is deterministic — it reads Impression's `criticalFlags` and
   Verification's status, not the narrative (`classifier.py`). Channel delivery is still stubbed
   (no real EHR/pager/SMS I/O); what is real is the FHIR record of it.
-- **M3:** real channel delivery + the real Gemini ACR classifier behind the same `classify()`
+- **#79 (behind `EHR_INBOX_WRITE_ENABLED`, default off):** the `ehr-inbox` channel for a
+  CRITICAL result is real — `tools.deliver_critical_result_to_chart` writes an Observation into
+  fhir2 (dedicated authorship concept, ack-task-marker idempotency, best-effort: a failure is a
+  `FAILED` channel result, never a raise that would retry the dispatch and double-page). Routine
+  results and #29 rung pass-throughs never write. The flag stays off until the PI write-path
+  sign-off is recorded on #79; see `docs/ehr-inbox-notification.md`.
+- **M3:** real pager/SMS delivery + the real Gemini ACR classifier behind the same `classify()`
   signature (the pattern `interpretation-assistant/registry.py` uses).
 
 > ## Two gates. Do not double-page.
