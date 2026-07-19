@@ -1,0 +1,136 @@
+# The #75 hosted-showcase overlay: TLS in front, loopback everywhere else.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# What it does, mapped to #75's build items:
+#   1. Reverse proxy with TLS (caddy, digest-pinned) in front of OHIF/worklist, OpenMRS, and the
+#      ingress override surface (docker/caddy/Caddyfile). The agents' fhir2 hop moves to the
+#      https route and the plaintext opt-ins are WITHDRAWN (empty string = off for every guard),
+#      so the #30 transport condition holds by construction: a plaintext write attempt raises.
+#      In-cluster trust for Caddy's internal CA rides SSL_CERT_FILE -> the caddy data volume's
+#      root cert (Python's ssl honours it; live-verified against the running stack).
+#   3. Auth on exposed surfaces: the proxy login guards the viewer origin (proxy-level is
+#      acceptable for the demo, #75 item 3); OpenMRS keeps its own accounts; the override + A2A
+#      callback shared secrets become REQUIRED here (the base compose defaults them for dev).
+#   5. SIGNOFF_OVERRIDE_URL becomes the external https address a paged phone can reach.
+#   -  Every host port the base compose publishes is REBOUND TO 127.0.0.1: host-side ops tooling
+#      (MIMIC ETL to Orthanc, report seeder to fhir2, temporal-ui/jaeger over an SSH tunnel)
+#      keeps working unchanged, while off-box only caddy's 80/443 exist.
+#
+# NOT in this overlay (still open on #75, host-side or follow-up):
+#   2. The least-privilege fhir2 service account (an OpenMRS accounts task, #30's remaining
+#      condition) -- the env keeps FHIR2_BASIC_* so the switch is one value swap here.
+#   4. Radiologist OpenMRS accounts (seeded on the demo host).
+#   -  In-cluster Orthanc stays in anonymous mode as today: it is loopback+cluster-only after
+#      this overlay, and turning its auth on also means teaching the OHIF nginx hop and the
+#      ingress reader to send credentials -- a follow-up, documented in the doc below.
+#
+# See docs/hosted-tls-overlay.md for the run-book (rehearsal defaults, real-domain switch,
+# password hash generation, and the verification drill).
+
+services:
+  caddy:
+    image: caddy:2.8@sha256:226d1f059b75399fe19182893c7184591c07b97afc8dfcf44eeb80c9a77a530f   # pinned (#72 discipline)
+    ports:
+      - "80:80"        # ACME HTTP-01 + https redirect
+      - "443:443"
+    environment:
+      DEMO_DOMAIN: ${DEMO_DOMAIN:-localhost}
+      DEMO_TLS: ${DEMO_TLS:-internal}
+      DEMO_PROXY_USER: ${DEMO_PROXY_USER:-demo}
+      # Default hash = the rehearsal password "change-me" (see the Caddyfile header for how to
+      # generate a real one). The default must live HERE, not in the Caddyfile placeholder:
+      # compose always sets the container env (empty when the host var is unset), and Caddy's
+      # {$VAR:default} only applies to an UNSET var. $$ = compose's escaped literal $.
+      DEMO_PROXY_PASS_HASH: ${DEMO_PROXY_PASS_HASH:-$$2a$$14$$/PRg2Yczxuv8H9vj7zIc1ehMaac9ic3mDkS5z2MYojV1LG0JD.tjq}
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    # NOT the orchestrator: the agents depend on caddy (for the CA root their SSL_CERT_FILE
+    # points at), so caddy depending back would be a cycle. A proxied request to a still-booting
+    # upstream is just a 502 until it is up.
+    depends_on: [ohif, openmrs]
+    restart: unless-stopped
+
+  orchestrator:
+    depends_on:
+      caddy:
+        # The CA root the SSL_CERT_FILE below points at is minted on caddy's first start; the
+        # pollers tolerate (warn + retry) the brief window before it exists.
+        condition: service_started
+    environment:
+      # The fhir2 hop -- reads, the RIS poller, AND the #26 pre-sign write -- moves onto the
+      # https route, and the plaintext opt-in is WITHDRAWN: the #30 guard now enforces TLS
+      # instead of being waived. ("" reads as off for every guard in this repo.)
+      FHIR2_BASE_URL: https://caddy/openmrs/ws/fhir2/R4
+      FHIR2_ALLOW_INSECURE_WRITE: ""
+      SSL_CERT_FILE: /caddy-pki/caddy/pki/authorities/local/root.crt
+      # The override link a paged clinician taps must resolve from THEIR phone (#75 item 5) --
+      # the compose-internal hostname of the base file cannot. Routed back via /ingress (path
+      # stripped by the proxy).
+      SIGNOFF_OVERRIDE_URL: https://${DEMO_DOMAIN:-localhost}/ingress/signoff/{workflowId}/override
+      # Shared secrets stop defaulting the moment the stack is hosted: compose refuses to start
+      # without them rather than serving a reachable stack on dev tokens.
+      SIGNOFF_OVERRIDE_TOKEN: ${SIGNOFF_OVERRIDE_TOKEN:?hosted stack refuses the dev default -- set a real override token}
+      A2A_CALLBACK_TOKEN: ${A2A_CALLBACK_TOKEN:?hosted stack refuses unauthenticated A2A callbacks -- set a token}
+    volumes:
+      - caddy-data:/caddy-pki:ro
+    ports: !override ["127.0.0.1:8090:8090"]
+
+  communications:
+    depends_on:
+      caddy:
+        condition: service_started
+    environment:
+      # Read-only fhir2 consumer today (ServiceRequest.requester; the #79 chart write when its
+      # flag ever flips) -- same https route, opt-in withdrawn.
+      FHIR2_BASE_URL: https://caddy/openmrs/ws/fhir2/R4
+      FHIR2_ALLOW_INSECURE_READ: ""
+      SSL_CERT_FILE: /caddy-pki/caddy/pki/authorities/local/root.crt
+    volumes:
+      - caddy-data:/caddy-pki:ro
+    ports: !override ["127.0.0.1:8106:8106"]
+
+  ehr-assistant:
+    depends_on:
+      caddy:
+        condition: service_started
+    environment:
+      FHIR2_BASE_URL: https://caddy/openmrs/ws/fhir2/R4
+      FHIR2_ALLOW_INSECURE_READ: ""
+      SSL_CERT_FILE: /caddy-pki/caddy/pki/authorities/local/root.crt
+    volumes:
+      - caddy-data:/caddy-pki:ro
+    ports: !override ["127.0.0.1:8102:8102"]
+
+  # Everything below only rebinds the base file's published ports to loopback -- reachable for
+  # host-side ops (ETL, seeder, SSH-tunnelled UIs), invisible off-box.
+  openmrs:
+    ports: !override ["127.0.0.1:8080:8080"]
+  orthanc:
+    ports: !override ["127.0.0.1:8042:8042", "127.0.0.1:4242:4242"]
+  ohif:
+    ports: !override ["127.0.0.1:3000:80"]
+  temporal:
+    ports: !override ["127.0.0.1:7233:7233"]
+  temporal-ui:
+    ports: !override ["127.0.0.1:8088:8080"]
+  comms-ledger:
+    ports: !override ["127.0.0.1:8108:8080"]
+  worklist-triage:
+    ports: !override ["127.0.0.1:8101:8101"]
+  interpretation-assistant:
+    ports: !override ["127.0.0.1:8103:8103"]
+  impression-generation:
+    ports: !override ["127.0.0.1:8104:8104"]
+  report-verification:
+    ports: !override ["127.0.0.1:8105:8105"]
+  worklist-api:
+    ports: !override ["127.0.0.1:8107:8107"]
+  jaeger:
+    ports: !override ["127.0.0.1:16686:16686", "127.0.0.1:4318:4318"]
+
+volumes:
+  caddy-data:
+  caddy-config:
