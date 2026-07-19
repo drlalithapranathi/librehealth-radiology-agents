@@ -1,0 +1,185 @@
+"""The /ack/{task_id} surface (#79). TestClient + injected fakes, like test_api.py.
+
+The ordering property is the load-bearing one: signature BEFORE identity (a forged link never
+solicits credentials), identity BEFORE the ledger (an anonymous tap never reads the loop), and
+an already-closed loop is never re-written.
+"""
+from __future__ import annotations
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from radagent_common.ack_link import sign_ack_task
+from radagent_common.fhir_models import (
+    Communication,
+    CommunicationPayload,
+    Reference,
+    Task,
+    TaskStatus,
+)
+
+from main import create_app
+
+_SECRET = "ack-test-secret"
+
+
+class FakeLedger:
+    def __init__(self, task: Task | None = None):
+        self.task = task
+        self.completed: list[tuple[str, str]] = []
+        self.comm_reads: list[str] = []
+
+    async def get_task(self, task_id: str) -> Task:
+        if self.task is None:
+            req = httpx.Request("GET", f"http://ledger/fhir/Task/{task_id}")
+            raise httpx.HTTPStatusError(
+                "404", request=req, response=httpx.Response(404, request=req))
+        return self.task
+
+    async def get_communication(self, comm_id: str) -> Communication:
+        self.comm_reads.append(comm_id)
+        return Communication(
+            status="in-progress",
+            payload=[CommunicationPayload(contentString="pneumothorax")])
+
+    async def complete_ack_task(self, task_id: str, *, acknowledged_by: str,
+                                at_iso: str) -> Task:
+        self.completed.append((task_id, acknowledged_by))
+        done = self.task.model_copy(deep=True)
+        done.status = TaskStatus.COMPLETED
+        return done
+
+
+class FakeIdentity:
+    """Accepts exactly dr-ref/refpass; records every attempt so tests can pin WHEN identity is
+    even consulted."""
+
+    def __init__(self):
+        self.attempts: list[str] = []
+
+    async def whoami(self, username: str, password: str) -> str | None:
+        self.attempts.append(username)
+        if (username, password) == ("dr-ref", "refpass"):
+            return "Dr Referrer (uuid-ref)"
+        return None
+
+
+def _open_task(task_id: str = "task-7") -> Task:
+    return Task(id=task_id, status=TaskStatus.REQUESTED,
+                focus=Reference(reference="Communication/comm-1"))
+
+
+@pytest.fixture()
+def rig(monkeypatch):
+    monkeypatch.setenv("CRITCOM_ACK_HMAC_SECRET", _SECRET)
+    ledger = FakeLedger(task=_open_task())
+    identity = FakeIdentity()
+    client = TestClient(create_app(
+        orthanc=object(), assignment=object(),  # never touched by /ack
+        store=_NullStore(), ledger=ledger, identity=identity))
+    return client, ledger, identity
+
+
+class _NullStore:
+    def size(self) -> int:
+        return 0
+
+    def all(self) -> dict:
+        return {}
+
+
+def _sig(task_id: str = "task-7") -> str:
+    return sign_ack_task(task_id, _SECRET)
+
+
+def test_forged_signature_is_403_and_never_solicits_credentials(rig):
+    client, ledger, identity = rig
+    r = client.get("/ack/task-7", params={"sig": "not-a-real-signature"})
+    assert r.status_code == 403
+    assert identity.attempts == []          # no credential prompt for a forged link
+    assert ledger.completed == []
+
+
+def test_unconfigured_secret_fails_closed(rig, monkeypatch):
+    client, ledger, identity = rig
+    monkeypatch.delenv("CRITCOM_ACK_HMAC_SECRET", raising=False)
+    r = client.get("/ack/task-7", params={"sig": _sig()})
+    assert r.status_code == 403             # the surface does not exist without the secret
+
+
+def test_missing_credentials_get_a_basic_challenge(rig):
+    client, ledger, identity = rig
+    r = client.get("/ack/task-7", params={"sig": _sig()})
+    assert r.status_code == 401
+    assert r.headers["www-authenticate"].startswith("Basic")
+    assert ledger.completed == []
+
+
+def test_bad_credentials_are_rechallenged_and_touch_nothing(rig):
+    client, ledger, identity = rig
+    r = client.get("/ack/task-7", params={"sig": _sig()}, auth=("dr-ref", "wrong"))
+    assert r.status_code == 401
+    assert identity.attempts == ["dr-ref"]
+    assert ledger.completed == []
+
+
+def test_authenticated_tap_closes_the_loop_with_who(rig):
+    client, ledger, identity = rig
+    r = client.get("/ack/task-7", params={"sig": _sig()}, auth=("dr-ref", "refpass"))
+    assert r.status_code == 200
+    assert ledger.completed == [("task-7", "Dr Referrer (uuid-ref)")]
+    assert "acknowledged" in r.text.lower()
+    assert "Dr Referrer" in r.text
+    assert "pneumothorax" in r.text         # the finding label from the Communication
+
+
+def test_already_completed_is_idempotent(rig):
+    client, ledger, identity = rig
+    ledger.task = _open_task()
+    ledger.task.status = TaskStatus.COMPLETED
+    r = client.get("/ack/task-7", params={"sig": _sig()}, auth=("dr-ref", "refpass"))
+    assert r.status_code == 200
+    assert "already acknowledged" in r.text.lower()
+    assert ledger.completed == []           # never re-written
+
+
+def test_accepted_counts_as_acknowledged(rig):
+    """ack_state treats ACCEPTED as acknowledged; the surface must agree or a tap would
+    re-complete a loop the orchestrator already considers closed."""
+    client, ledger, identity = rig
+    ledger.task = _open_task()
+    ledger.task.status = TaskStatus.ACCEPTED
+    r = client.get("/ack/task-7", params={"sig": _sig()}, auth=("dr-ref", "refpass"))
+    assert r.status_code == 200
+    assert ledger.completed == []
+
+
+def test_unknown_task_is_404(rig):
+    client, ledger, identity = rig
+    ledger.task = None
+    r = client.get("/ack/task-404", params={"sig": _sig("task-404")},
+                   auth=("dr-ref", "refpass"))
+    assert r.status_code == 404
+
+
+def test_signature_for_another_task_does_not_open_this_one(rig):
+    """The prefix trap, at the surface: task-7's signature must not acknowledge task-70."""
+    client, ledger, identity = rig
+    r = client.get("/ack/task-70", params={"sig": _sig("task-7")}, auth=("dr-ref", "refpass"))
+    assert r.status_code == 403
+    assert ledger.completed == []
+
+
+def test_finding_fetch_failure_never_costs_the_ack(rig):
+    """The Communication read is garnish for the page; a ledger hiccup there must not fail the
+    acknowledgement itself."""
+    client, ledger, identity = rig
+
+    async def boom(comm_id):
+        raise RuntimeError("ledger hiccup")
+
+    ledger.get_communication = boom
+    r = client.get("/ack/task-7", params={"sig": _sig()}, auth=("dr-ref", "refpass"))
+    assert r.status_code == 200
+    assert ledger.completed == [("task-7", "Dr Referrer (uuid-ref)")]

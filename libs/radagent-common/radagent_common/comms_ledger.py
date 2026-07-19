@@ -142,6 +142,19 @@ class CommsLedgerClient:
         task.status = status
         return Task.model_validate(await self._put(f"Task/{resource_id}", _dump(task)))
 
+    async def complete_ack_task(self, resource_id: str, *, acknowledged_by: str,
+                                at_iso: str) -> Task:
+        """Close the loop AND say who closed it (#79's explicit ack): status -> COMPLETED, plus a
+        FHIR Annotation on `Task.note` naming the authenticated acknowledger. The note is the
+        audit fact the plain status flip cannot carry — `Task.owner` stays the INTENDED recipient,
+        so "sent to Dr A, acknowledged by Dr B" remains readable from one resource. Same
+        read-modify-write rationale as update_task_status."""
+        task = await self.get_task(resource_id)
+        task.status = TaskStatus.COMPLETED
+        task.note = list(task.note) + [
+            {"text": f"acknowledged by {acknowledged_by}", "time": at_iso}]
+        return Task.model_validate(await self._put(f"Task/{resource_id}", _dump(task)))
+
     async def search_tasks_for_communication(self, communication_id: str) -> list[Task]:
         bundle = await self._get("Task", {
             "focus": _ref("Communication", communication_id), "_sort": "-_lastUpdated"})

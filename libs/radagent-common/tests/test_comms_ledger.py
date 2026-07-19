@@ -274,3 +274,42 @@ def test_no_credentials_stays_unauthenticated(monkeypatch):
 def test_base_url_defaults_to_the_compose_service(monkeypatch):
     monkeypatch.delenv("COMMS_LEDGER_BASE_URL", raising=False)
     assert CommsLedgerClient().base_url == "http://comms-ledger:8080/fhir"
+
+
+def test_complete_ack_task_records_who_and_preserves_the_loop():
+    """#79's explicit ack: COMPLETED + a note naming the authenticated acknowledger, while
+    owner stays the INTENDED recipient -- "sent to Dr A, acknowledged by Dr B" must remain
+    readable from the one resource. Same PUT-replaces-everything hazard as update_task_status."""
+    client = CommsLedgerClient(base_url="http://ledger/fhir")
+    existing = Task(
+        id="task-1",
+        status=TaskStatus.REQUESTED,
+        focus=Reference(reference="Communication/comm-1"),
+        for_=Reference(reference="Patient/p1"),
+        owner=Reference(reference="Practitioner/dr-a"),
+        restriction=TaskRestriction(period=Period(end="2026-07-12T01:00:00Z")),
+        note=[{"text": "paged twice"}],
+    ).model_dump(mode="json", exclude_none=True, by_alias=True)
+    put: dict = {}
+
+    async def fake_get(path, params=None):
+        assert path == "Task/task-1"
+        return existing
+
+    async def fake_put(path, resource):
+        put.update(path=path, body=resource)
+        return resource
+
+    client._get = fake_get      # type: ignore[assignment]
+    client._put = fake_put      # type: ignore[assignment]
+    updated = asyncio.run(client.complete_ack_task(
+        "task-1", acknowledged_by="Dr B (uuid-b)", at_iso="2026-07-19T18:00:00+00:00"))
+
+    assert updated.status is TaskStatus.COMPLETED
+    body = put["body"]
+    assert body["status"] == "completed"
+    assert body["owner"] == {"reference": "Practitioner/dr-a"}          # intended recipient kept
+    assert body["restriction"]["period"]["end"].startswith("2026-07-12T01:00:00")
+    assert body["note"][0]["text"] == "paged twice"                     # earlier notes kept
+    assert body["note"][1] == {"text": "acknowledged by Dr B (uuid-b)",
+                               "time": "2026-07-19T18:00:00+00:00"}

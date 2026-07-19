@@ -70,8 +70,19 @@ Communication keeps the typed `ServiceRequest` reference.
 2. Transport: https route (#75) or an explicitly opted-in trusted network.
 3. Least-privilege fhir2 account (#30 condition; the same account work as the pre-sign draft).
 
+## The ack surface (slice 3, same branch line)
+
+The link in the chart entry resolves at the worklist-api's `GET /ack/{task_id}?sig=` route
+(`integrations/worklist-api/ack.py`): signature verified FIRST (a forged link never solicits
+credentials), then the human authenticates with their own OpenMRS account (HTTP Basic resolved
+through `/ws/rest/v1/session`), then the ledger Task closes with WHO on a `Task.note`
+(`complete_ack_task`) — `comms.checkAck` then reports COMPLETED and no escalation fires. Inert
+until `CRITCOM_ACK_HMAC_SECRET` is configured: producer-side no link is minted without it, and
+the verifier fails closed. `CRITCOM_ACK_BASE_URL` should be the externally-reachable route (for
+the #75 overlay: `https://<host>/reading-api`).
+
 ## Out of scope in this slice
 
-The ack endpoint (identity via the OpenMRS session, HMAC link — next slice), the Patient Flags
-banner (optional rendering, needs a criterion-type probe), ETL requester seeding (#68 side), and
-any orchestrator/contract change (`channelResults` already carries per-channel results).
+The Patient Flags banner (optional rendering, needs a criterion-type probe), ETL requester
+seeding (#68 side), and any orchestrator/contract change (`channelResults` already carries
+per-channel results).
