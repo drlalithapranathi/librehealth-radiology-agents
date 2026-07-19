@@ -115,7 +115,8 @@ async def handle(skill_id: str, payload: dict) -> dict:
     #   * every signal is scanned SEPARATELY -- the conclusion and EACH finding label -- so a
     #     negation in one can never bleed across and silence a positive in another;
     #   * word-boundary match, so "mass" never fires on "massive".
-    scan_texts = [scannable_text(conclusion)] + _complete_finding_labels(ai_findings)
+    finding_labels = _complete_finding_labels(ai_findings)
+    scan_texts = [scannable_text(conclusion)] + finding_labels
     hits: set[str] = set()
     for text in scan_texts:
         hits |= set(find_asserted_terms(text, _CRITICAL_KEYWORDS))
