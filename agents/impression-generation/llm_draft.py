@@ -31,6 +31,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from radagent_common.negation import find_asserted_terms
+
 _log = logging.getLogger(__name__)
 _warned_misconfigured = False
 
@@ -118,13 +120,20 @@ def _summarize_ehr_context(ehr_context: dict) -> str:
     """An explicit allowlist -- never a blanket json.dumps(ehr_context). `contrastFlags` and
     `medicationFlags` are additionalProperties:true in contracts/skills/ehr.schema.json, so a raw
     dump would silently forward whatever a future EHR Assistant change adds there to an external
-    endpoint, unreviewed."""
+    endpoint, unreviewed.
+
+    CODED entries only, for the same reason: fhir_client's projector (`_first_coding_value`)
+    falls back to the CodeableConcept's free `text` for the display when no coding carries a
+    code, so an UNCODED entry's display can be clinician-typed narrative -- which must not ride
+    to an external endpoint ("a code is a code", the `_order_reason_codes` rule). When a code IS
+    present the display is the coding's own terminology display, so it may travel."""
     problems = ", ".join(
-        p.get("display") or p.get("code", "") for p in ehr_context.get("activeProblems", []) if p
+        p.get("display") or p["code"]
+        for p in ehr_context.get("activeProblems", []) if p and p.get("code")
     )
     labs = ", ".join(
-        f"{lab.get('display') or lab.get('code', '')}: {lab.get('value', '')} {lab.get('unit', '')}".strip()
-        for lab in ehr_context.get("relevantLabs", []) if lab
+        f"{lab.get('display') or lab['code']}: {lab.get('value', '')} {lab.get('unit', '')}".strip()
+        for lab in ehr_context.get("relevantLabs", []) if lab and lab.get("code")
     )
     parts = []
     if problems:
@@ -195,17 +204,23 @@ def _parse_draft(content: str, critical_flags: list[dict]) -> LLMDraft:
         isinstance(r, str) and r.strip() for r in recommendations
     ):
         raise ValueError("malformed or empty recommendations")
-    # Criticality is never the LLM's call (#78 owns that derivation) -- so if a critical flag was
-    # already confirmed, the prose must at least name it. A conservative reject-and-fall-back-to-
-    # template here (same bias as #78's negation scanners: an over-flag is tolerated, a silent
-    # miss is not) beats risking prose that reads as reassuring next to a real critical finding.
-    # Verbatim substring match on purpose: prose that says "PTX" for a "pneumothorax" flag is
-    # rejected and falls back to the template. That is the conservative direction (a false reject
-    # costs deterministic prose, a false accept could read as reassuring next to a real finding), so
-    # the strictness is deliberate, not a gap.
+    # Criticality is never the LLM's call (#78 owns that derivation) -- so the prose must ASSERT
+    # every confirmed critical flag, checked with the SAME negation-aware, word-boundary matcher
+    # as the #78 scanners. Two failure shapes a bare substring test waves through, both rejected
+    # here: "No pneumothorax is identified." names the flag only to NEGATE it -- exactly the
+    # reassuring-prose-next-to-a-real-finding case this check exists for -- and prose naming one
+    # of two confirmed flags is silent about the other. A conservative reject falls back to the
+    # deterministic template (same bias as #78: an over-flag is tolerated, a silent miss is not).
+    # Verbatim label match stays deliberate: prose that says "PTX" for a "pneumothorax" flag is
+    # rejected -- a false reject costs deterministic prose, a false accept could read as
+    # reassuring next to a real finding.
     flag_labels = [f["label"].lower() for f in critical_flags if f.get("label")]
-    if flag_labels and not any(label in impression_text.lower() for label in flag_labels):
-        raise ValueError("prose does not reference any confirmed critical flag")
+    if flag_labels:
+        asserted = set(find_asserted_terms(impression_text, flag_labels))
+        missing = [label for label in flag_labels if label not in asserted]
+        if missing:
+            raise ValueError(
+                f"prose does not assert {len(missing)} of {len(flag_labels)} confirmed critical flag(s)")
     return LLMDraft(
         impression_text=impression_text.strip(),
         recommendations=[r.strip() for r in recommendations],
@@ -223,33 +238,40 @@ async def draft_impression(
         return None
     base_url, model, api_key, timeout = config
 
-    # No clinical text (report conclusion + EHR context) over plaintext HTTP to a remote host (#77).
-    # Best-effort like every other failure here: skip to the deterministic template rather than
-    # raise, so a transport misconfiguration never strands the read -- but the PHI never leaves.
-    if not _egress_transport_is_secure(base_url):
-        _log.warning(
-            "impression LLM draft skipped: refusing to POST report + EHR context over plaintext "
-            "HTTP to non-loopback host %s; use an https base URL, or set "
-            "IMPRESSION_LLM_ALLOW_INSECURE=1 for a trusted internal network",
-            urlparse(base_url).hostname,
-        )
-        return None
-    if _is_plaintext_remote(base_url):
-        # Proceeding only because of the insecure opt-in; leave an audit trail that clinical text
-        # went out in cleartext on this hop. Host only -- never the report or EHR content.
-        _log.warning(
-            "impression LLM draft proceeding over PLAINTEXT http to %s under "
-            "IMPRESSION_LLM_ALLOW_INSECURE: report conclusion + EHR context are in cleartext on this hop",
-            urlparse(base_url).hostname,
-        )
-
-    prompt = _build_prompt(
-        conclusion=conclusion,
-        labels_text=_labels_as_text(finding_labels),
-        critical_flags=critical_flags,
-        ehr_summary=_summarize_ehr_context(ehr_context),
-    )
+    # EVERYTHING from here sits under the never-raise ladder, the transport guard and prompt
+    # build included: urlparse raises ValueError on a malformed base URL (e.g. a junk port), and
+    # an unexpectedly-shaped ehr_context/critical_flags must degrade to the template exactly like
+    # a network failure would -- this module's contract is None, never a raise, and relying on
+    # handler.py's backstop to honour it would make that backstop load-bearing.
     try:
+        # No clinical text (report conclusion + EHR context) over plaintext HTTP to a remote host
+        # (#77). Best-effort like every other failure here: skip to the deterministic template
+        # rather than raise, so a transport misconfiguration never strands the read -- but the
+        # PHI never leaves.
+        if not _egress_transport_is_secure(base_url):
+            _log.warning(
+                "impression LLM draft skipped: refusing to POST report + EHR context over plaintext "
+                "HTTP to non-loopback host %s; use an https base URL, or set "
+                "IMPRESSION_LLM_ALLOW_INSECURE=1 for a trusted internal network",
+                urlparse(base_url).hostname,
+            )
+            return None
+        if _is_plaintext_remote(base_url):
+            # Proceeding only because of the insecure opt-in; leave an audit trail of what rides
+            # this hop in cleartext. Host only -- never the report or EHR content.
+            _log.warning(
+                "impression LLM draft proceeding over PLAINTEXT http to %s under "
+                "IMPRESSION_LLM_ALLOW_INSECURE: report conclusion, EHR context, and the "
+                "Authorization key (when set) are in cleartext on this hop",
+                urlparse(base_url).hostname,
+            )
+
+        prompt = _build_prompt(
+            conclusion=conclusion,
+            labels_text=_labels_as_text(finding_labels),
+            critical_flags=critical_flags,
+            ehr_summary=_summarize_ehr_context(ehr_context),
+        )
         content = await _chat_completion(base_url, model, api_key, timeout, prompt)
         return _parse_draft(content, critical_flags)
     except (httpx.InvalidURL, httpx.UnsupportedProtocol) as e:
