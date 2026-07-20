@@ -19,6 +19,13 @@ ROOT = Path(__file__).resolve().parents[1]
 AGENTS = ROOT / "agents"
 sys.path.insert(0, str(ROOT / "libs" / "radagent-common"))
 
+from radagent_common.fhir_models import (  # noqa: E402
+    CodeableConcept,
+    Coding,
+    PractitionerRole,
+    Reference,
+    ServiceRequest,
+)
 from radagent_common.validation import validate_skill_output  # noqa: E402
 
 
@@ -39,12 +46,49 @@ class _DemoFhir:
     async def get_report_conclusion(self, diagnostic_report_id: str) -> str:
         return "CT chest: large left tension pneumothorax."
 
+    async def get_service_request(self, ref: str) -> ServiceRequest | None:
+        if not ref:
+            return None
+        return ServiceRequest(
+            id=ref.split("/")[-1],
+            subject=Reference(reference="Patient/demo-1"),
+            requester=Reference(reference="Practitioner/demo-ordering"),
+        )
+
+
+class _DemoLedger:
+    """In-memory stand-in for the communications agent's FHIR ledger."""
+
+    def __init__(self) -> None:
+        self._next_id = 0
+
+    def _id(self, prefix: str) -> str:
+        self._next_id += 1
+        return f"{prefix}-{self._next_id}"
+
+    async def create_communication(self, communication):
+        communication.id = self._id("communication")
+        return communication
+
+    async def create_task(self, task):
+        task.id = self._id("task")
+        return task
+
+    async def search_on_call_roles(self, specialty_code: str | None = None):
+        return [
+            PractitionerRole(
+                id="role-oncall",
+                practitioner=Reference(reference="Practitioner/demo-oncall"),
+                code=[CodeableConcept(coding=[Coding(code="on-call")])],
+            )
+        ]
+
 
 async def run_fixture(fixture: Path, handlers: tuple) -> None:
     """Run and validate every pipeline hop for one StudyContext fixture."""
     ctx = json.loads(fixture.read_text())
     wf = ctx["workflowId"]
-    triage, ehr, interp, impression, verify = handlers
+    triage, ehr, interp, impression, verify, comms = handlers
 
     # 1) Pre-read fan-out (triage ‖ ehr ‖ interpretation)
     t, e, a = await asyncio.gather(
@@ -70,10 +114,26 @@ async def run_fixture(fixture: Path, handlers: tuple) -> None:
                        {"studyContext": ctx, "report": report_event, "impression": imp, "ehrContext": e, "aiFindings": a})
     validate_skill_output("report.verify", ver)
 
+    # 5) Communicate (last, matching StudyWorkflow.run)
+    dispatch = await comms(
+        "comms.dispatch",
+        {
+            "studyContext": ctx,
+            "report": report_event,
+            "impression": imp,
+            "verification": ver,
+        },
+    )
+    validate_skill_output("comms.dispatch", dispatch)
+
     tools = ",".join(tool["toolId"] for tool in a["toolsSelected"]) or "none"
+    channels = ",".join(
+        result["channel"] for result in dispatch.get("channelResults", [])
+    ) or "none"
     print(
         f"{fixture.name}: workflow={wf} triage={t['priorityTier']} "
-        f"tools={tools} verification={ver['verificationStatus']}"
+        f"tools={tools} verification={ver['verificationStatus']} "
+        f"comms={dispatch['dispatchStatus']} channels={channels}"
     )
 
 
@@ -93,11 +153,15 @@ async def main() -> int:
     triage = load_handler("worklist-triage")
     ehr = load_handler("ehr-assistant")
     interp = load_handler("interpretation-assistant")
+    demo_fhir = _DemoFhir()
     impression = load_handler("impression-generation")
-    impression.__globals__["_FHIR"] = _DemoFhir()  # inject the fhir2 the handler fetches from (#16)
+    impression.__globals__["_FHIR"] = demo_fhir  # inject the fhir2 the handler fetches from (#16)
     verify = load_handler("report-verification")
-    verify.__globals__["_FHIR"] = _DemoFhir()  # verify parses report.body from the same conclusion (#22)
-    handlers = triage, ehr, interp, impression, verify
+    verify.__globals__["_FHIR"] = demo_fhir  # verify parses report.body from the same conclusion (#22)
+    comms = load_handler("communications")
+    comms.__globals__["_FHIR"] = demo_fhir
+    comms.__globals__["_LEDGER"] = _DemoLedger()
+    handlers = triage, ehr, interp, impression, verify, comms
 
     failures = 0
     for fixture in fixtures:
