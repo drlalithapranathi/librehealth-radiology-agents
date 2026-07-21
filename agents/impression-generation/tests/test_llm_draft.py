@@ -149,7 +149,7 @@ async def test_prose_not_mentioning_critical_flag_degrades_to_none(monkeypatch, 
         conclusion="large pneumothorax", finding_labels="", critical_flags=CRITICAL_FLAGS, ehr_context={}
     )
     assert out is None
-    assert "prose does not reference any confirmed critical flag" in caplog.text
+    assert "prose does not assert 1 of 1 confirmed critical flag(s)" in caplog.text
 
 
 async def test_success_returns_llm_draft(monkeypatch):
@@ -231,3 +231,130 @@ async def test_https_remote_allowed_without_optin(monkeypatch):
         conclusion="pneumothorax", finding_labels="", critical_flags=CRITICAL_FLAGS, ehr_context={},
     )
     assert out is not None and len(seen) == 1
+
+
+# --- the flag-consistency check is negation-aware and exhaustive ----------------------
+
+def _draft_json(impression: str, recommendations: list[str] | None = None) -> str:
+    return _json.dumps({"impressionText": impression,
+                        "recommendations": recommendations or ["clinical correlation"]})
+
+
+async def test_negated_prose_is_rejected(monkeypatch):
+    """The reassuring-prose case the consistency check exists for: the draft NAMES the confirmed
+    flag only to negate it. A bare substring test accepts this; the negation-aware check must
+    not -- reassuring prose next to a real critical finding is the worst failure shape."""
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    transport, _ = _responding(
+        content=_draft_json("No pneumothorax is identified. Lungs are clear."))
+    _install(monkeypatch, transport)
+    out = await draft_impression(
+        conclusion="large right pneumothorax", finding_labels="pneumothorax",
+        critical_flags=CRITICAL_FLAGS, ehr_context={})
+    assert out is None
+
+
+async def test_prose_must_assert_every_confirmed_flag(monkeypatch):
+    """Two confirmed flags, prose asserting only one: silent about the other -> rejected. Prose
+    asserting both -> accepted."""
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    two_flags = [{"label": "pneumothorax", "severity": "critical"},
+                 {"label": "aortic dissection", "severity": "critical"}]
+
+    transport, _ = _responding(content=_draft_json("Large pneumothorax on the right."))
+    _install(monkeypatch, transport)
+    out = await draft_impression(conclusion="", finding_labels="",
+                                 critical_flags=two_flags, ehr_context={})
+    assert out is None
+
+    transport2, _ = _responding(content=_draft_json(
+        "Large pneumothorax on the right. Findings concerning for aortic dissection."))
+    _install(monkeypatch, transport2)
+    out2 = await draft_impression(conclusion="", finding_labels="",
+                                  critical_flags=two_flags, ehr_context={})
+    assert isinstance(out2, LLMDraft)
+
+
+async def test_flag_asserted_after_a_negated_mention_is_accepted(monkeypatch):
+    """The #78 matcher's any-occurrence-asserted semantics must carry over: prose that first
+    negates a small pneumothorax but asserts the remaining one is consistent, not a reject --
+    over-rejection would silently cost every nuanced draft."""
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    transport, _ = _responding(content=_draft_json(
+        "No small apical pneumothorax; however a large basal pneumothorax remains."))
+    _install(monkeypatch, transport)
+    out = await draft_impression(conclusion="", finding_labels="",
+                                 critical_flags=CRITICAL_FLAGS, ehr_context={})
+    assert isinstance(out, LLMDraft)
+
+
+# --- the never-raise contract holds without handler.py's backstop ---------------------
+
+async def test_malformed_base_url_never_raises(monkeypatch):
+    """urlparse raises ValueError on an invalid-IPv6 base URL, and that used to happen OUTSIDE
+    the try -- escaping a module whose whole contract is None-never-raise. The handler backstop
+    caught it in production, which made the backstop load-bearing; now the module honours its
+    own contract."""
+    _clear(monkeypatch)
+    _configure(monkeypatch, base_url="http://[::1oops/v1")
+    out = await draft_impression(conclusion="", finding_labels="",
+                                 critical_flags=[], ehr_context={})
+    assert out is None
+
+
+async def test_unexpected_ehr_context_shape_never_raises(monkeypatch):
+    """Prompt building sits under the ladder too: a list where a dict was expected degrades to
+    the template like any other failure."""
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    transport, _ = _responding(content=_draft_json("Clear lungs."))
+    _install(monkeypatch, transport)
+    out = await draft_impression(conclusion="", finding_labels="",
+                                 critical_flags=[], ehr_context=["not", "a", "dict"])
+    assert out is None
+
+
+# --- only CODED clinical context rides to the external endpoint -----------------------
+
+async def test_uncoded_ehr_entries_never_reach_the_prompt(monkeypatch):
+    """fhir_client's projector falls back to the CodeableConcept's free `text` for the display
+    when nothing is coded -- clinician-typed narrative. An uncoded entry must therefore be
+    dropped from the outbound prompt entirely; a coded entry's terminology display rides."""
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    transport, seen = _responding(content=_draft_json("Clear lungs."))
+    _install(monkeypatch, transport)
+    await draft_impression(
+        conclusion="", finding_labels="", critical_flags=[],
+        ehr_context={
+            "activeProblems": [
+                {"code": "J45.909", "display": "Asthma"},
+                {"code": "", "display": "pt anxious re spouse's diagnosis, see note"},
+            ],
+            "relevantLabs": [
+                {"code": "2160-0", "display": "Creatinine", "value": 1.1, "unit": "mg/dL"},
+                {"display": "free-text lab comment from the chart"},
+            ],
+        })
+    (request,) = seen
+    outbound = _json.dumps(request["body"])
+    assert "Asthma" in outbound and "Creatinine" in outbound
+    assert "anxious" not in outbound
+    assert "free-text lab comment" not in outbound
+
+
+async def test_json_fence_wrapped_response_is_accepted(monkeypatch):
+    """response_format support varies across OpenAI-compatible backends; a fenced-but-valid
+    draft must parse rather than fall back."""
+    _clear(monkeypatch)
+    _configure(monkeypatch)
+    fenced = "```json\n" + _draft_json("Large pneumothorax on the right.") + "\n```"
+    transport, _ = _responding(content=fenced)
+    _install(monkeypatch, transport)
+    out = await draft_impression(conclusion="", finding_labels="",
+                                 critical_flags=CRITICAL_FLAGS, ehr_context={})
+    assert isinstance(out, LLMDraft)
+    assert out.impression_text == "Large pneumothorax on the right."
