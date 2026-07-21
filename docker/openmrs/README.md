@@ -5,16 +5,26 @@ orchestrator relies on but that the o3 image itself does not ship.
 
 ## `bootstrap_presign_concept.py`
 
-Idempotent one-shot script that ensures the **AI pre-sign impression
-draft** concept exists in the OpenMRS concept dictionary at a stable,
-well-known UUID (`e3641471-3f25-57b4-ab27-a3ebc66e481e`). This concept
-is what `write_presign_impression` (issue #26) puts on
-`DiagnosticReport.code.coding[0].code` to authorship-stamp the AI's draft.
-Without it, the pre-sign write path 500s with a `codeRequired` error, and
-`_find_presign_draft`'s discriminator has nothing to match against.
+Idempotent one-shot script that ensures the AI authorship-stamp concepts
+exist in the OpenMRS concept dictionary at stable, well-known UUIDs (the
+file keeps its original name; it now provisions both):
+
+- **AI pre-sign impression draft** (`e3641471-3f25-57b4-ab27-a3ebc66e481e`)
+  — what `write_presign_impression` (issue #26) puts on
+  `DiagnosticReport.code.coding[0].code` to authorship-stamp the AI's
+  draft. Without it, the pre-sign write path 500s with a `codeRequired`
+  error, and `_find_presign_draft`'s discriminator has nothing to match
+  against.
+- **AI critical result notification** (`ea215431-5e85-5040-adf0-1da297c154c3`,
+  datatype Text) — what `write_critical_result_notification` (issue #79)
+  puts on `Observation.code` for the in-EHR critical-result notification.
+  Same failure mode without it, plus the datatype matters: the obs carries
+  a `valueString`, and fhir2 refuses a value that mismatches the concept's
+  datatype.
 
 For the "why a dedicated concept and not the CIEL Provisional Diagnosis"
-rationale, see [`docs/presign-concept.md`](../../docs/presign-concept.md).
+rationale, see [`docs/presign-concept.md`](../../docs/presign-concept.md);
+the same authorship argument covers both stamps.
 
 ### How the dev stack runs it
 

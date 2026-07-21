@@ -37,6 +37,7 @@ from classifier import ACRCategory, classify, escalation_ack_minutes
 from routing import derive_specialty, out_of_specialty_fallback
 from tools import (
     ack_state,
+    deliver_critical_result_to_chart,
     dispatch_communication,
     escalate_to_on_call,
     open_ack_task,
@@ -158,6 +159,20 @@ async def _dispatch(payload: dict) -> dict:
         owner_ref=recipient,
         ack_minutes=result.ack_minutes or 60,
     )
+    dispatched_at = now_iso()
+    # ehr-inbox goes real behind the #79 flag: the notification lands IN the chart (an Observation
+    # stamped with the dedicated concept), and the channel result reports what actually happened.
+    # Flag off (default) keeps the stubbed v1 claim unchanged. Runs AFTER the ledger writes so the
+    # chart entry can name the ack task; its failure never touches the page (best-effort).
+    inbox_status = await deliver_critical_result_to_chart(
+        _fhir(),
+        patient_ref=patient_ref,
+        service_request_ref=order_ref,
+        finding=result.finding,
+        accession=(payload["studyContext"].get("study") or {}).get("accessionNumber") or "",
+        ack_task_id=task.id or "",
+        sent_iso=dispatched_at,
+    )
     return _out(
         payload,
         dispatchStatus="SENT",
@@ -166,9 +181,9 @@ async def _dispatch(payload: dict) -> dict:
         taskId=task.id or "",
         deadline=deadline.isoformat(),
         recipient=recipient,
-        channelResults=[{"channel": _ROUTINE_CHANNEL, "status": "SENT"},
+        channelResults=[{"channel": _ROUTINE_CHANNEL, "status": inbox_status},
                         {"channel": _CRITICAL_CHANNEL, "status": "SENT"}],
-        dispatchedAt=now_iso(),
+        dispatchedAt=dispatched_at,
     )
 
 

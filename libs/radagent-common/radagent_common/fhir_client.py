@@ -54,6 +54,56 @@ def _presign_report_concept() -> str:
     return os.environ.get("FHIR2_PRESIGN_REPORT_CONCEPT", _DEFAULT_PRESIGN_REPORT_CONCEPT)
 
 
+# The critical-result notification concept (#79): the Observation.code authorship stamp on the
+# in-EHR notification the comms agent's ehr-inbox channel writes. Same lifecycle as the pre-sign
+# concept above -- provisioned at stack startup by docker/openmrs/bootstrap_presign_concept.py,
+# derived uuid5(uuid5(NAMESPACE_DNS, "librehealth.org"),
+# "lh-radiology.ai-critical-result-notification.v1"), drift-guarded by
+# tests/test_presign_concept_drift.py. Datatype Text, because the obs carries a valueString and
+# fhir2 refuses an obs whose value does not match its concept's datatype. A deployment that
+# provisions it elsewhere sets FHIR2_CRITICAL_NOTIFICATION_CONCEPT.
+_DEFAULT_CRITICAL_NOTIFICATION_CONCEPT = "ea215431-5e85-5040-adf0-1da297c154c3"
+
+
+def _critical_notification_concept() -> str:
+    return os.environ.get(
+        "FHIR2_CRITICAL_NOTIFICATION_CONCEPT", _DEFAULT_CRITICAL_NOTIFICATION_CONCEPT)
+
+
+def ehr_inbox_write_enabled() -> bool:
+    """#79 master switch for the in-EHR critical-result notification write. Default OFF: the
+    ehr-inbox channel keeps its stubbed v1 semantics until the PI write-path sign-off recorded on
+    #79 flips this in the deployment. Truthy set matches the other write gates byte-for-byte
+    (FHIR2_ALLOW_INSECURE_WRITE / ORTHANC_PRESIGN_WRITE_ENABLED) -- two switches with different
+    token sets is an operator trap (!73 review, item 3).
+    """
+    return os.environ.get("EHR_INBOX_WRITE_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _ack_task_marker(ack_task_id: str) -> str:
+    """The valueString segment naming the LIVE ack loop (comms.checkAck tracks this Task)."""
+    return f"ack task {ack_task_id}"
+
+
+def _notification_anchor(accession: str, ack_task_id: str) -> str:
+    """The idempotency anchor for the chart notification: one entry per critical result.
+
+    The ACCESSION, not the ack-task id, because only the accession is stable across a Temporal
+    retry of the dispatch: each retry re-mints the ledger Communication AND ack Task (new id), so
+    a task-id anchor could never match the previous attempt's entry and every retry would add a
+    chart entry. Anchored on the accession, a retry UPDATES the entry in place and it always
+    names the newest -- the live -- ack loop. Fallback for a study with no accession is the exact
+    ack-task segment (retry dedup is then lost, correlation is not).
+
+    Matching is by EXACT " | "-delimited segment, never substring: the comms ledger (HAPI JPA)
+    assigns sequential numeric Task ids, so "ack task 5" IS a substring of "ack task 52" and a
+    substring match would let one critical result's dispatch overwrite ANOTHER's chart entry
+    (found by adversarial review before first merge; pinned in the tests)."""
+    if accession:
+        return f"accession {accession}"
+    return _ack_task_marker(ack_task_id)
+
+
 _log = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -495,6 +545,118 @@ class Fhir2Client:
                 # own draft. Leave it alone.
                 continue
             return resource.get("id")
+        return None
+
+    async def write_critical_result_notification(
+        self,
+        *,
+        patient_ref: str,
+        finding: str,
+        accession: str,
+        ack_task_id: str,
+        sent_iso: str,
+    ) -> Optional[str]:
+        """Deliver a critical-result notification INTO the chart (#79): an Observation on the
+        patient, stamped with the dedicated notification concept, its valueString carrying the
+        finding label + accession + ack-task correlation. Never the report narrative -- the chart
+        gets a pointer, the ledger Communication stays the record of what was communicated.
+        Returns the Observation id, or None WITHOUT any I/O when EHR_INBOX_WRITE_ENABLED is off
+        (the default) -- the flag-off short-circuit-before-IO shape the Orthanc SC write (!73)
+        established.
+
+        The #26-class write conditions, and where each is enforced:
+          * best-effort/advisory -- the CALLER (tools.deliver_critical_result_to_chart) maps an
+            exception to a FAILED channel result and never re-raises past the dispatch: by then
+            the ledger Communication and ack Task exist, so failing the dispatch activity would
+            make Temporal retry it and page the same human twice;
+          * authorship-stamped -- the dedicated concept is the discriminator, and the idempotent
+            re-run (`_find_notification_obs`) updates ONLY an obs carrying our concept AND this
+            critical result's exact anchor segment (see `_notification_anchor`), so it can never
+            overwrite clinician-authored data or another result's entry;
+          * gated inert -- default-off flag, PI sign-off recorded on #79 before any deployment
+            flips it.
+
+        ONE chart entry per critical result: anchored on the accession, a dispatch retry (which
+        re-mints the ack loop) updates the entry in place so it names the live ack Task instead
+        of accumulating. Raises ValueError when accession AND ack_task_id are both empty -- an
+        uncorrelatable notification is not written, and the caller reports the channel FAILED.
+        """
+        if not ehr_inbox_write_enabled():
+            return None
+        if not accession and not ack_task_id:
+            raise ValueError(
+                "refusing an uncorrelatable chart notification: no accession and no ack task id")
+        # Guard up front, before the idempotency GET, so a refused write leaks no credentialed
+        # request (same hoist rationale as write_presign_impression).
+        _guard_write_transport(self.base_url)
+        patient = _typed_ref("Patient", patient_ref)
+        anchor = _notification_anchor(accession, ack_task_id)
+        segments = [finding]
+        if accession:
+            segments.append(f"accession {accession}")
+        if ack_task_id:
+            segments.append(_ack_task_marker(ack_task_id))
+        link_base = os.environ.get("CRITCOM_ACK_BASE_URL", "").rstrip("/")
+        if link_base and ack_task_id:
+            # The ack surface is a separate #79 slice; until a deployment sets its base URL the
+            # notification simply names the ack task, which comms.checkAck already tracks.
+            segments.append(f"ack link: {link_base}/ack/{ack_task_id}")
+        value = " | ".join(segments)
+        # NO `basedOn` here, deliberately: live fhir2 4.1.0 500s on ANY Observation write carrying
+        # it (HAPI-0389 NullPointerException in the translator; bisected live 2026-07-19 -- the
+        # identical resource minus basedOn is a 201). The order correlation rides in valueString as
+        # the accession (the pipeline's join key), and the ledger Communication keeps the typed
+        # ServiceRequest reference.
+        resource = {
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {
+                "coding": [{"code": _critical_notification_concept()}],
+                "text": "AI critical result notification",
+            },
+            "subject": {"reference": patient},
+            "effectiveDateTime": sent_iso,
+            "valueString": value,
+        }
+        existing_id = await self._find_notification_obs(patient, anchor)
+        if existing_id:
+            resource["id"] = existing_id
+            written = await self._put(f"Observation/{existing_id}", resource)
+        else:
+            written = await self._post("Observation", resource)
+        return written["id"]
+
+    async def _find_notification_obs(self, patient_ref: str, anchor: str) -> Optional[str]:
+        """OUR notification for this critical result, if an earlier dispatch attempt already
+        wrote one -- the idempotency key an update reuses instead of duplicating. Same authorship
+        logic as `_find_presign_draft`: an obs is ours only if it carries BOTH our concept in
+        code.coding AND the anchor as an EXACT " | "-delimited valueString segment. Anything else
+        on the patient -- labs, clinician-entered obs, another critical result's notification --
+        is left alone. Exact-segment, never substring: HAPI's sequential Task ids make
+        "ack task 5" a substring of "ack task 52" (see `_notification_anchor`).
+
+        Unlike the presign finder, subject-only search is NOT enough here: a real patient carries
+        a labs-heavy obs list (134 on the dev-stack probe patient) and fhir2 pages at 10, so ours
+        need not be on page 1. `code=<concept uuid>` narrows server-side -- verified to work on
+        live fhir2 4.1.0 (2026-07-19: subject+code returned exactly the stamped obs) -- and the
+        Bundle `next` links are followed anyway so a miss can never come from paging. The
+        client-side re-check stays authoritative for authorship."""
+        ours = _critical_notification_concept()
+        target: Optional[str] = "Observation"
+        params: dict[str, Any] | None = {"subject": patient_ref, "code": ours}
+        while target:
+            bundle = await self._get(target, params)
+            for entry in bundle.get("entry", []) or []:
+                resource = entry.get("resource") or {}
+                if resource.get("resourceType") != "Observation":
+                    continue
+                codes = [c.get("code") for c in ((resource.get("code") or {}).get("coding") or [])]
+                if ours not in codes:
+                    continue
+                if anchor not in (resource.get("valueString") or "").split(" | "):
+                    continue
+                return resource.get("id")
+            target, params = _bundle_next_link(bundle), None  # next link is an absolute URL
         return None
 
     async def poll_finalized_reports(self, since_iso: str) -> tuple[list[dict], Optional[str]]:

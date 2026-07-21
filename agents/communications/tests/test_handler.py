@@ -470,3 +470,75 @@ async def test_escalation_under_fallback_none_reports_the_miss_honestly(stores, 
     assert out["escalated"] is False
     assert "neuro" in out["reason"] and "out of specialty" in out["reason"]
     assert ledger.tasks[sent["taskId"]].status is TaskStatus.FAILED   # still not acknowledged
+
+
+# --- #79: the ehr-inbox channel goes real behind the flag -----------------------------
+
+async def test_inbox_write_disabled_keeps_the_stub_semantics(stores, monkeypatch):
+    """Default-off: channelResults byte-identical to the pre-#79 stub, and NO chart write. The
+    flag flip is a deployment decision gated on the PI sign-off recorded on #79 -- until then this
+    change must be invisible."""
+    monkeypatch.delenv("EHR_INBOX_WRITE_ENABLED", raising=False)   # hermetic vs the dev shell
+    fhir, _ = stores
+    out = await handle("comms.dispatch", {"studyContext": SAMPLE_CONTEXT, "impression": CRITICAL})
+    validate_skill_output("comms.dispatch", out)
+    assert [(c["channel"], c["status"]) for c in out["channelResults"]] == [
+        ("ehr-inbox", "SENT"), ("oncall-pager", "SENT")]
+    assert fhir.notifications_written == []
+
+
+async def test_inbox_write_enabled_delivers_the_notification_into_the_chart(stores, monkeypatch):
+    monkeypatch.setenv("EHR_INBOX_WRITE_ENABLED", "1")
+    fhir, _ = stores
+    ctx = {**SAMPLE_CONTEXT, "study": {**SAMPLE_CONTEXT["study"], "accessionNumber": "ACC-1"}}
+    out = await handle("comms.dispatch", {"studyContext": ctx, "impression": CRITICAL})
+    validate_skill_output("comms.dispatch", out)
+
+    assert [(c["channel"], c["status"]) for c in out["channelResults"]] == [
+        ("ehr-inbox", "SENT"), ("oncall-pager", "SENT")]
+    (written,) = fhir.notifications_written
+    assert written["ack_task_id"] == out["taskId"]     # the chart entry names ITS ack loop
+    assert written["finding"] == "aortic dissection"
+    assert written["accession"] == "ACC-1"             # the order correlation (no basedOn on obs)
+    assert written["patient_ref"] == "Patient/1"
+    assert written["sent_iso"] == out["dispatchedAt"]
+
+
+async def test_inbox_write_failure_reports_failed_and_never_costs_the_page(stores, monkeypatch):
+    """Best-effort is load-bearing: a chart-write failure must not raise past dispatch (the
+    orchestrator would retry the whole activity and page the same human twice) and must not be
+    reported as a delivered notification."""
+    monkeypatch.setenv("EHR_INBOX_WRITE_ENABLED", "1")
+    fhir, ledger = stores
+    fhir.fail_notification_write = True
+    out = await handle("comms.dispatch", {"studyContext": SAMPLE_CONTEXT, "impression": CRITICAL})
+    validate_skill_output("comms.dispatch", out)
+
+    assert out["dispatchStatus"] == "SENT"             # the page went out
+    assert out["taskId"] in ledger.tasks               # the ack clock is still open
+    assert [(c["channel"], c["status"]) for c in out["channelResults"]] == [
+        ("ehr-inbox", "FAILED"), ("oncall-pager", "SENT")]
+
+
+async def test_routine_result_never_writes_to_the_chart_even_when_enabled(stores, monkeypatch):
+    """#79 is CRITICAL-result delivery. A routine study writes nothing -- its signed report
+    already lives in the EHR, and notifying every normal would be chart noise (alert fatigue in
+    new clothes)."""
+    monkeypatch.setenv("EHR_INBOX_WRITE_ENABLED", "1")
+    fhir, _ = stores
+    out = await handle("comms.dispatch", {"studyContext": SAMPLE_CONTEXT})
+    validate_skill_output("comms.dispatch", out)
+    assert [c["channel"] for c in out["channelResults"]] == ["ehr-inbox"]
+    assert fhir.notifications_written == []
+
+
+async def test_escalation_rung_never_writes_to_the_chart_even_when_enabled(stores, monkeypatch):
+    """A #29 sign-off rung is the OTHER gate: its channels are dispatched verbatim and it has no
+    ack task for a chart entry to name. The #79 write must not leak into that path."""
+    monkeypatch.setenv("EHR_INBOX_WRITE_ENABLED", "1")
+    fhir, _ = stores
+    out = await handle("comms.dispatch",
+                       {"studyContext": SAMPLE_CONTEXT, "escalation": ESCALATION_RUNG})
+    validate_skill_output("comms.dispatch", out)
+    assert [c["channel"] for c in out["channelResults"]] == ["pager", "sms"]
+    assert fhir.notifications_written == []

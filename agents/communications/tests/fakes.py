@@ -7,6 +7,7 @@ escalation that leaves the original loop hanging open.
 """
 from __future__ import annotations
 
+from radagent_common.fhir_client import ehr_inbox_write_enabled
 from radagent_common.fhir_models import (
     CodeableConcept,
     Coding,
@@ -20,11 +21,13 @@ from radagent_common.fhir_models import (
 
 
 class FakeFhir2:
-    """fhir2: read-only clinical context."""
+    """fhir2: read-only clinical context, plus the #79 chart-notification write."""
 
     def __init__(self, requester: str | None = "Practitioner/dr-order"):
         self.requester = requester
         self.orders_read: list[str] = []
+        self.notifications_written: list[dict] = []
+        self.fail_notification_write = False
 
     async def get_service_request(self, ref: str):
         self.orders_read.append(ref)
@@ -35,6 +38,17 @@ class FakeFhir2:
             subject=Reference(reference="Patient/1"),
             requester=Reference(reference=self.requester) if self.requester else None,
         )
+
+    async def write_critical_result_notification(self, **kwargs):
+        """Mirrors the real client's contract: the EHR_INBOX_WRITE_ENABLED gate lives INSIDE the
+        write (None + zero I/O when off), so the handler tests exercise the same seam production
+        does -- a fake that ignored the flag would pass on a handler that forgot it exists."""
+        if not ehr_inbox_write_enabled():
+            return None
+        if self.fail_notification_write:
+            raise RuntimeError("fhir2 unreachable (test-injected)")
+        self.notifications_written.append(kwargs)
+        return f"obs-{len(self.notifications_written)}"
 
 
 class FakeLedger:

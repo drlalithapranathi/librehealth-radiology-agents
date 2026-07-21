@@ -163,6 +163,7 @@ ris-poller-tests:
     - >
       python -m pytest
       libs/radagent-common/tests/test_fhir_client.py
+      libs/radagent-common/tests/test_fhir_client_notification.py
       libs/radagent-common/tests/test_negation.py
       libs/radagent-common/tests/test_openmrs_rest.py
       libs/radagent-common/tests/test_openmrs_rest_reason.py

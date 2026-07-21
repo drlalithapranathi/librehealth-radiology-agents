@@ -161,6 +161,49 @@ async def dispatch_communication(
     return created
 
 
+async def deliver_critical_result_to_chart(
+    fhir: Fhir2Client,
+    *,
+    patient_ref: str,
+    service_request_ref: str,
+    finding: str,
+    accession: str,
+    ack_task_id: str,
+    sent_iso: str,
+) -> str:
+    """The ehr-inbox channel's status for a CRITICAL result: really deliver the notification into
+    the chart when the #79 write is enabled, and report what actually happened.
+
+    Flag off (the default): no I/O, returns "SENT" -- the stubbed v1 claim, byte-identical to the
+    pre-#79 behaviour. Flag on: "SENT" only when the Observation write landed, "FAILED" (plus an
+    exception log) when it raised. EVERY exception is swallowed here, deliberately including the
+    transport refusal the Orthanc SC write re-raises: by this point the ledger Communication and
+    ack Task exist, so raising would fail the whole dispatch activity, Temporal would retry it,
+    and the SAME human would be paged twice. A misconfigured deployment still surfaces -- every
+    critical dispatch logs the exception and records the FAILED channel result.
+    """
+    try:
+        # `service_request_ref` is for the log lines only: live fhir2 cannot take an Observation
+        # basedOn (translator NPE, see write_critical_result_notification), so the chart entry
+        # correlates by accession + ack-task marker instead.
+        obs_id = await fhir.write_critical_result_notification(
+            patient_ref=patient_ref,
+            finding=finding,
+            accession=accession,
+            ack_task_id=ack_task_id,
+            sent_iso=sent_iso,
+        )
+    except Exception:
+        _log.exception(
+            "ehr-inbox chart write failed for %s; the page and the ledger record stand",
+            service_request_ref)
+        return "FAILED"
+    if obs_id:
+        _log.info("critical-result notification Observation/%s written for %s",
+                  obs_id, service_request_ref)
+    return "SENT"
+
+
 async def open_ack_task(
     ledger: CommsLedgerClient,
     *,
