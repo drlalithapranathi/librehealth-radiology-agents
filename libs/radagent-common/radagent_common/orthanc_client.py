@@ -182,7 +182,7 @@ class OrthancClient:
         return (main_tags.get("StudyDescription") or "").strip()
 
     async def _get_bytes(self, path: str) -> bytes:
-        async with httpx.AsyncClient(timeout=self._timeout) as c:
+        async with httpx.AsyncClient(timeout=self._timeout, auth=self._auth) as c:
             r = await c.get(f"{self.base_url}/{path.lstrip('/')}")
             r.raise_for_status()
             return r.content
