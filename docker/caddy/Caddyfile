@@ -1,0 +1,48 @@
+# The #75 hosted-showcase front door: ONE TLS terminator for every radiologist-facing surface.
+# Pairs with docker-compose.tls.yml, which rebinds every other host port to 127.0.0.1 -- off-box,
+# only this proxy's 80/443 exist, and nothing is served plaintext.
+#
+# Knobs (all env, all defaulted for a localhost rehearsal):
+#   DEMO_DOMAIN          public name of the demo host (default: localhost).
+#   DEMO_TLS             "internal" (default) = Caddy's own CA -- used for rehearsals AND for the
+#                        in-cluster https hop the agents ride (they trust the CA via SSL_CERT_FILE,
+#                        see the overlay). On a public FQDN set it to an operator email and Caddy
+#                        switches to ACME/Let's Encrypt automatically.
+#   DEMO_PROXY_USER / DEMO_PROXY_PASS_HASH
+#                        proxy-level login for the viewer/worklist origin (#75 item 3 accepts
+#                        proxy-level auth for the demo). Generate a hash with:
+#                          docker run --rm caddy:2.8 caddy hash-password -p '<password>'
+#                        The default below is the REHEARSAL password "change-me" -- always
+#                        override it on a reachable host.
+
+https://{$DEMO_DOMAIN:localhost}, https://caddy {
+	tls {$DEMO_TLS:internal}
+
+	# RIS + fhir2. Deliberately NOT behind the proxy login: OpenMRS enforces its own accounts
+	# (radiologists sign under their own identity, #75 item 4), and the agents' fhir2 calls on
+	# this same route authenticate with FHIR2_BASIC_* against fhir2 itself. Stacking the proxy
+	# login here would break both.
+	handle /openmrs/* {
+		reverse_proxy openmrs:8080
+	}
+
+	# Sign-off override surface (#57): must be reachable from a paged clinician's PHONE, so it
+	# lives on the public route; the endpoint itself refuses anything without the override token
+	# (503 with none configured). handle_path strips /ingress, so the orchestrator sees the same
+	# /signoff/... paths it serves in-cluster.
+	handle_path /ingress/* {
+		reverse_proxy orchestrator:8090
+	}
+
+	# Everything else is the viewer origin. OHIF's nginx already fans out same-origin to
+	# /dicom-web (Orthanc) and /reading-api (worklist-api), so ONE proxy login guards the
+	# viewer, the images, and the reading worklist together.
+	handle {
+		# Both values always arrive via the compose overlay's env (which owns the rehearsal
+		# defaults -- Caddy's {$VAR:default} cannot apply because compose sets the vars).
+		basic_auth {
+			{$DEMO_PROXY_USER} {$DEMO_PROXY_PASS_HASH}
+		}
+		reverse_proxy ohif:80
+	}
+}
