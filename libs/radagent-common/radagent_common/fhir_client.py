@@ -14,6 +14,7 @@ import os
 from urllib.parse import urlparse
 import httpx
 
+from .ack_link import ack_secret, sign_ack_task
 from .fhir_models import DiagnosticReport, ServiceRequest
 
 
@@ -597,10 +598,14 @@ class Fhir2Client:
         if ack_task_id:
             segments.append(_ack_task_marker(ack_task_id))
         link_base = os.environ.get("CRITCOM_ACK_BASE_URL", "").rstrip("/")
-        if link_base and ack_task_id:
-            # The ack surface is a separate #79 slice; until a deployment sets its base URL the
-            # notification simply names the ack task, which comms.checkAck already tracks.
-            segments.append(f"ack link: {link_base}/ack/{ack_task_id}")
+        if link_base and ack_task_id and ack_secret():
+            # The ack surface (the worklist-api /ack route): the link carries an HMAC so a forged
+            # or enumerated task id never reaches the acknowledge flow; WHO acknowledged is
+            # separately the endpoint's job (radagent_common.ack_link has the split rationale).
+            # Base URL AND secret must both be configured, or no link is emitted -- an unsigned
+            # link is never minted.
+            segments.append(
+                f"ack link: {link_base}/ack/{ack_task_id}?sig={sign_ack_task(ack_task_id)}")
         value = " | ".join(segments)
         # NO `basedOn` here, deliberately: live fhir2 4.1.0 500s on ANY Observation write carrying
         # it (HAPI-0389 NullPointerException in the translator; bisected live 2026-07-19 -- the

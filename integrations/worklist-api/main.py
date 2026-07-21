@@ -45,9 +45,11 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from radagent_common.comms_ledger import CommsLedgerClient
 from radagent_common.orthanc_client import OrthancClient
 from radagent_common.tracing import now_iso
 
+from ack import OpenmrsIdentity, create_ack_router
 from assignment import AssignmentReader, NullAssignmentReader
 from store import PriorityStore
 
@@ -79,6 +81,8 @@ def create_app(
     orthanc: Optional[OrthancClient] = None,
     store: Optional[PriorityStore] = None,
     assignment: Optional[AssignmentReader] = None,
+    ledger: Optional[CommsLedgerClient] = None,
+    identity: Optional[OpenmrsIdentity] = None,
 ) -> FastAPI:
     app = FastAPI(title="LH-Radiology Worklist API")
 
@@ -86,6 +90,11 @@ def create_app(
     app.state.store = store or PriorityStore(
         os.environ.get("WORKLIST_STORE_PATH", "/var/lib/lhrad/worklist.sqlite"))
     app.state.assignment = assignment or NullAssignmentReader()
+
+    # The #79 ack surface (see ack.py). Inert until CRITCOM_ACK_HMAC_SECRET is configured:
+    # unsigned links are never minted producer-side and the verifier here fails closed.
+    app.include_router(create_ack_router(
+        ledger or CommsLedgerClient(), identity or OpenmrsIdentity()))
 
     @app.get("/healthz")
     async def healthz() -> dict:

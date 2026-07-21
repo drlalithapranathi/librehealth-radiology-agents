@@ -235,11 +235,15 @@ def test_concept_env_override_reaches_both_the_stamp_and_the_match(monkeypatch):
     assert put["code"]["coding"][0]["code"] == "deployment-specific-uuid"   # ...and stamped with it
 
 
-def test_ack_link_appended_only_when_base_url_configured(monkeypatch):
-    """The ack surface is a separate #79 slice; until CRITCOM_ACK_BASE_URL is set the notification
-    names the ack task without inventing a URL nothing serves."""
+def test_ack_link_needs_base_url_and_secret_and_is_signed(monkeypatch):
+    """The link appears only when the deployment configured BOTH the base URL and the HMAC secret
+    -- an unsigned link is never minted, and no URL is invented that nothing serves. When both
+    are set, the link carries this task's verifiable signature."""
+    from radagent_common.ack_link import verify_ack_task
+
     monkeypatch.setenv("EHR_INBOX_WRITE_ENABLED", "1")
     monkeypatch.delenv("CRITCOM_ACK_BASE_URL", raising=False)
+    monkeypatch.delenv("CRITCOM_ACK_HMAC_SECRET", raising=False)
     client, calls = _client()
     _write(client)
     ((_, plain),) = calls["post"]
@@ -248,8 +252,16 @@ def test_ack_link_appended_only_when_base_url_configured(monkeypatch):
     monkeypatch.setenv("CRITCOM_ACK_BASE_URL", "https://demo.example.org/worklist/")
     client2, calls2 = _client()
     _write(client2)
-    ((_, linked),) = calls2["post"]
-    assert "ack link: https://demo.example.org/worklist/ack/task-9" in linked["valueString"]
+    ((_, still_plain),) = calls2["post"]
+    assert "ack link" not in still_plain["valueString"]     # base URL alone is not enough
+
+    monkeypatch.setenv("CRITCOM_ACK_HMAC_SECRET", "test-secret")
+    client3, calls3 = _client()
+    _write(client3)
+    ((_, linked),) = calls3["post"]
+    assert "ack link: https://demo.example.org/worklist/ack/task-9?sig=" in linked["valueString"]
+    sig = linked["valueString"].rsplit("?sig=", 1)[1].split(" | ")[0]
+    assert verify_ack_task("task-9", sig, "test-secret")
 
 
 def test_idempotency_search_follows_bundle_paging(monkeypatch):

@@ -52,6 +52,22 @@ agent-tests:
         echo "== $a ==" && (cd "$a" && python -m pytest -q) || exit 1
       done
 
+worklist-api-tests:
+  # The worklist-api python suite ran in NO lane before the #79 ack surface landed here (the
+  # ohif-extension lane covers only the extension's vitest; agent-tests loops agents/*/ only).
+  # Same rationale as the ris-poller explicit list: a guard CI never runs is not a guard.
+  #
+  # WORKLIST_STORE_PATH: main.py builds the app at import time with a /var/lib default, so
+  # collection itself needs a writable path -- true for any environment that runs this suite.
+  extends: .default-rules
+  stage: test
+  image: python:3.11-slim
+  variables:
+    WORKLIST_STORE_PATH: /tmp/worklist-tests.sqlite
+  script:
+    - pip install -e libs/radagent-common pytest pytest-asyncio fastapi httpx
+    - cd integrations/worklist-api && python -m pytest -q
+
 a2a-factory-import:
   # Issue #2 acceptance #3: the app extras install and radagent_common.a2a imports cleanly
   # against the pinned a2a-sdk. (agent-tests deliberately runs WITHOUT this extra to keep
@@ -164,6 +180,7 @@ ris-poller-tests:
       python -m pytest
       libs/radagent-common/tests/test_fhir_client.py
       libs/radagent-common/tests/test_fhir_client_notification.py
+      libs/radagent-common/tests/test_ack_link.py
       libs/radagent-common/tests/test_negation.py
       libs/radagent-common/tests/test_openmrs_rest.py
       libs/radagent-common/tests/test_openmrs_rest_reason.py

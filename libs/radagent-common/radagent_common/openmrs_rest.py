@@ -69,6 +69,13 @@ def _icd10_reason_codes(order_reason: Optional[dict]) -> list[str]:
     return codes
 
 
+def rest_base_url() -> str:
+    """Public alias of `_default_rest_base` for other in-repo consumers (the worklist-api ack
+    surface resolves acknowledger identity against `{base}/session`), so the derivation stays
+    single-sourced instead of copied."""
+    return _default_rest_base()
+
+
 def _default_rest_base() -> str:
     """Derive the OpenMRS REST base from FHIR2_BASE_URL so no new env/compose wiring is needed:
     `.../ws/fhir2/R4` -> `.../ws/rest/v1`. Overridable with OPENMRS_REST_BASE_URL."""
