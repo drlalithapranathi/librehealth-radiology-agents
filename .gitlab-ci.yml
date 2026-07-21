@@ -65,7 +65,7 @@ worklist-api-tests:
   variables:
     WORKLIST_STORE_PATH: /tmp/worklist-tests.sqlite
   script:
-    - pip install -e libs/radagent-common pytest fastapi httpx
+    - pip install -e libs/radagent-common pytest pytest-asyncio fastapi httpx
     - cd integrations/worklist-api && python -m pytest -q
 
 a2a-factory-import:
