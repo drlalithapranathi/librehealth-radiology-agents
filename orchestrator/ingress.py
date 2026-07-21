@@ -38,7 +38,7 @@ from . import activities
 TEMPORAL_TARGET = os.environ.get("TEMPORAL_TARGET", "temporal:7233")
 POLL_INTERVAL_S = int(os.environ.get("RIS_POLL_INTERVAL_S", "30"))
 # Shared secret for A2A push callbacks (#24): agents echo it in X-A2A-Notification-Token.
-# Empty (the default) accepts unauthenticated callbacks — dev/compose posture, same as the
+# Empty (the default) accepts unauthenticated callbacks â€" dev/compose posture, same as the
 # Orthanc webhook; set it in any deployment that leaves the compose network.
 A2A_CALLBACK_TOKEN = os.environ.get("A2A_CALLBACK_TOKEN", "")
 # Shared secret for the sign-off override (#57). REQUIRED, unlike the two above: those endpoints
@@ -52,7 +52,7 @@ SIGNOFF_REASON_MAX = int(os.environ.get("SIGNOFF_REASON_MAX", "500"))
 # workflows that completed/terminated without ever delivering a report.
 RECONCILE_EVERY_POLLS = int(os.environ.get("INGRESS_RECONCILE_EVERY_POLLS", "120"))
 # A failing fhir2 poll is warned on the first failure, then every Nth, so a persistent outage
-# (fhir2 down, credentials rejected — #53) stays visible without flooding the log every poll.
+# (fhir2 down, credentials rejected â€" #53) stays visible without flooding the log every poll.
 # Clamped to >= 1: a 0 would make the throttle modulo raise inside the poller's own exception
 # handler, permanently killing the loop the throttle exists to keep observable.
 FAILED_POLLS_PER_WARNING = max(1, int(os.environ.get("INGRESS_FAILED_POLLS_PER_WARNING", "10")))
@@ -82,7 +82,7 @@ def _default_store_path() -> str:
     """Absolute + CWD-independent, so a restart from any working directory finds the same DB.
 
     Delegates to ingress_store so the worker's dead-letter activity (#54) resolves the SAME file
-    from the other process in this container — one store, one /admin/dead-letters.
+    from the other process in this container â€" one store, one /admin/dead-letters.
     """
     return default_store_path()
 
@@ -292,11 +292,11 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
     is LOGGED and skipped.
 
     A failed report is returned rather than dropped so `_advance_cursor` can hold the cursor at
-    it (#29): the inclusive ge-window then re-returns it next poll — a retry for free. The retry
+    it (#29): the inclusive ge-window then re-returns it next poll â€" a retry for free. The retry
     naturally stops when the workflow is truly gone: reconciliation evicts its index row and the
     report re-enters as unmapped. Failed attempts are tracked durably so that final unmapped
-    re-entry is recognized as OURS and captured as a dead letter (#29) — a permanently dropped
-    sign-off a human must see — instead of blending into the routine "never ours" fhir2 noise."""
+    re-entry is recognized as OURS and captured as a dead letter (#29) â€" a permanently dropped
+    sign-off a human must see â€" instead of blending into the routine "never ours" fhir2 noise."""
     store = _store()
     signalled: set[str] = set()
     failed: list[dict] = []
@@ -367,7 +367,7 @@ async def _process_batch(client: Client, reports: list[dict], skip_ids: set[str]
 
 def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], signalled: set[str],
                     failed: list[dict] | None = None) -> tuple[str, set[str]]:
-    """Advance to the high-water mark — but never past a mapped report whose signal failed (#29).
+    """Advance to the high-water mark â€" but never past a mapped report whose signal failed (#29).
 
     ge{cursor} re-returns reports at the boundary second, so we remember which of those we already
     signalled and drop the rest (older ids fall out of the query window). If the high-water didn't
@@ -379,8 +379,8 @@ def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], si
     version key (_dedup_key, id@stamp) at-or-after the cursor (not just the boundary), so the
     wider re-scan does not re-signal -- while an ADDENDUM, the same id at a NEWER stamp, is a
     fresh key and still gets through (#66).
-    (End-to-end delivery is still at-least-once — e.g. a crash after signal but before
-    save_cursor replays the batch — which is safe because report_finalized is an idempotent
+    (End-to-end delivery is still at-least-once â€" e.g. a crash after signal but before
+    save_cursor replays the batch â€" which is safe because report_finalized is an idempotent
     overwrite; keep it that way.)
     """
     floor = None
@@ -404,8 +404,8 @@ def _advance_cursor(cursor: str, high_water: str | None, reports: list[dict], si
 async def _is_open(client: Client, wf_id: str) -> bool:
     """Whether a workflow is still running. Only an AFFIRMATIVE answer counts as closed: a
     NOT_FOUND (workflow truly gone) or a successful describe showing a non-RUNNING status.
-    UNREACHABLE IS NOT CLOSED (#29): during a Temporal outage — the very condition that makes
-    signals fail and the poller hold its cursor — a reconcile sweep would otherwise evict every
+    UNREACHABLE IS NOT CLOSED (#29): during a Temporal outage â€" the very condition that makes
+    signals fail and the poller hold its cursor â€" a reconcile sweep would otherwise evict every
     index row, turning each held retry into a permanent sign-off loss and stranding every other
     in-flight study. On a transport error we assume open, keep the row, and let a later sweep
     decide."""
@@ -439,7 +439,7 @@ async def _reconcile_index(client: Client) -> int:
 
 # Real-time nudge (#25): the RIS-side hook (OpenMRS module hook or an Atomfeed bridge) POSTs to
 # /webhooks/ris/event and the poller sweeps NOW instead of waiting out the interval. The cursor
-# sweep stays the single source of truth — a nudge carries no data and can be lost, duplicated,
+# sweep stays the single source of truth â€" a nudge carries no data and can be lost, duplicated,
 # or fired spuriously without affecting correctness; interval polling remains the fallback.
 # Lazily created so importing this module has no side effect; tests reset `_WAKE`.
 _WAKE: asyncio.Event | None = None
@@ -454,7 +454,7 @@ def _wake_event() -> asyncio.Event:
 
 async def _sleep_or_nudge(seconds: float) -> bool:
     """Wait for the next sweep: a full interval, or sooner if the RIS event webhook nudges.
-    Returns True when nudged. A nudge that lands DURING a sweep is not lost — the event stays
+    Returns True when nudged. A nudge that lands DURING a sweep is not lost â€" the event stays
     set until consumed here, so bursts coalesce into exactly one immediate re-sweep."""
     wake = _wake_event()
     try:
@@ -524,7 +524,7 @@ async def _ris_poller() -> None:
 async def lifespan(app: FastAPI):
     # Fail fast on an invalid FHIR2_BASIC_* pair (#53). Every live consumer constructs the
     # client inside a swallow-and-continue path, where the constructor's ValueError would
-    # masquerade as an fhir2 outage forever — startup is the only place it can be loud.
+    # masquerade as an fhir2 outage forever â€" startup is the only place it can be loud.
     Fhir2Client()
     poller = asyncio.create_task(_ris_poller())
     yield
@@ -539,7 +539,7 @@ app = FastAPI(title="LH-Radiology Orchestrator Ingress", lifespan=lifespan)
 #
 # Instrumented HERE, at import, and NOT inside the lifespan: instrument_app() injects ASGI
 # middleware, and by the time the lifespan body runs Starlette has already built and cached its
-# middleware stack — the call would be silently ignored and the ingress would export no spans at
+# middleware stack â€" the call would be silently ignored and the ingress would export no spans at
 # all (no error, no warning). The HTTPX instrumentation is process-global, so it rides along.
 if tracing_enabled():
     init_tracing("orchestrator-ingress")
@@ -561,9 +561,47 @@ async def ris_event() -> dict:
 
     Deliberately takes NO payload: the fhir2 cursor sweep remains the single source of truth,
     so this endpoint is PHI-free, idempotent, and safe for the RIS side to fire on any event
-    (or never — interval polling is the unchanged fallback)."""
+    (or never â€" interval polling is the unchanged fallback)."""
     _wake_event().set()
     return {"nudged": True}
+
+
+@app.post("/events/ohif-opened", status_code=202)
+async def ohif_opened_event(body: dict) -> dict:
+    """OHIF extension reports a study opened by the radiologist (#73 item 1).
+
+    Best-effort observability sink for the ohif.study.opened event. Producer is
+    integrations/ohif-extension/src/api/eventClient.ts, wired on the WorkList row click.
+    Consumer TODAY is the ingress log stream â€" the acceptance criterion for #73 item 1
+    is "recorded by the ingress (visible in logs/store)" and log capture satisfies that
+    for the demo. A future pre-read-assist consumer could grow durable store persistence
+    at that time; not gilding it here means no new schema, no new migration risk, and
+    zero coupling between "extension can post" and "downstream reader exists".
+
+    Wire shape: contracts/events/ohif-opened.schema.json.
+
+    Behavior:
+      * Validates the payload against the schema. Failure -> 400. Producer treats any
+        non-2xx as `console.warn` and never blocks navigation, so this is diagnostic only.
+      * Returns 202 on success. Producer is fire-and-forget; body is not read.
+
+    Deliberately does NOT signal a workflow: this endpoint would otherwise couple the
+    viewer's open-click to the orchestrator's Temporal runtime for no current benefit.
+    The extension's own doc calls this "publish is visibility, not correctness";
+    keeping the endpoint side-effect-thin honors that.
+    """
+    try:
+        validate_against(body, paths.contracts_dir() / "events" / "ohif-opened.schema.json")
+    except Exception as exc:  # ContractError from validate_against
+        raise HTTPException(status_code=400, detail=f"schema: {exc}")
+    _log = logging.getLogger("orchestrator.ingress.ohif")
+    _log.info(
+        "ohif.study.opened accepted study=%s radiologist=%s at=%s",
+        body["studyInstanceUID"],
+        body.get("radiologistId") or "-",
+        body["openedAt"],
+    )
+    return {"accepted": True, "studyInstanceUID": body["studyInstanceUID"]}
 
 
 @app.post("/signoff/{workflow_id}/override", status_code=202)
@@ -646,18 +684,18 @@ async def dead_letters() -> dict:
     """Everything the pipeline permanently gave up on. Rows carry IDs only (lean-reference, no
     PHI). Empty is the healthy state; anything here needs a human. Read `kind`:
 
-    * `signoff-drop` (#29) — the RIS delivered a finalized report, it mapped to a workflow, every
+    * `signoff-drop` (#29) â€" the RIS delivered a finalized report, it mapped to a workflow, every
       signal attempt failed, and the workflow closed before one landed. Reconcile the study in the
       RIS against the orchestrator's history.
-    * `escalation-policy-load-failure` (#54) — a sign-off gate could not load its escalation
+    * `escalation-policy-load-failure` (#54) â€" a sign-off gate could not load its escalation
       ladder, so it fell back to a single flat page. The study is still escalated and readable, but
       escalation is DEGRADED until the policy is fixed: check escalation-policy.yaml and any
       ESCALATION_POLICY_PATH override.
-    * `signoff-abandoned` (#57) — a sign-off gate paged its whole escalation ladder and NOBODY
+    * `signoff-abandoned` (#57) â€" a sign-off gate paged its whole escalation ladder and NOBODY
       acknowledged. The study was released to COMMUNICATE (so the finding that made verification
       FAIL still got dispatched) and archived, but its report carries a verification FAIL that no
       human ever signed off. Go and look at the study. This is the loudest row on this surface.
-    * `post-archive-addendum` (#66) — a correction (amended/corrected report) arrived for a
+    * `post-archive-addendum` (#66) â€" a correction (amended/corrected report) arrived for a
       workflow that had already finished, and its delivery failed until the rows were reclaimed.
       The pipeline never re-verified the corrected body: read the amended report in the RIS and
       run the correction through review by hand.
@@ -670,9 +708,9 @@ async def dead_letters() -> dict:
 # POSTs the result (artifactUpdate) and the terminal state (statusUpdate) as SEPARATE callbacks.
 # In-memory on purpose: entries are popped at the terminal event. If the artifact half is lost
 # (one un-retried POST, or an ingress restart between the two), the surviving terminal COMPLETED
-# has no result to relay and is reported to the workflow as a failure — the workflow re-runs the
+# has no result to relay and is reported to the workflow as a failure â€" the workflow re-runs the
 # skill (bounded; see StudyWorkflow._call_push). Size-capped oldest-first because a task whose
-# terminal never arrives would otherwise leak its parts forever — and because with the token
+# terminal never arrives would otherwise leak its parts forever â€" and because with the token
 # unset (dev posture) this endpoint is unauthenticated, an uncapped dict is a free memory-DoS.
 # Tests reset this dict.
 _PUSH_PARTS: dict[str, list] = {}
@@ -690,8 +728,8 @@ async def a2a_push_callback(
 
     Non-terminal events are acknowledged and ignored; the artifact event's data parts are
     buffered; the terminal event is relayed to the workflow as a `skill_completed` signal keyed
-    by taskId. The workflowId and skillId ride in the callback URL — minted by
-    start_agent_skill_activity — so no task->workflow index is needed. A well-behaved agent
+    by taskId. The workflowId and skillId ride in the callback URL â€" minted by
+    start_agent_skill_activity â€" so no task->workflow index is needed. A well-behaved agent
     validated its output before emitting it, but this endpoint may be reachable by others (the
     token is optional), so a delivered result is re-validated against the skill's contract here
     and relayed as a failure if it doesn't conform. A relay the workflow never receives (dropped
