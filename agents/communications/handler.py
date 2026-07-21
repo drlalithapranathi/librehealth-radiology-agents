@@ -34,6 +34,7 @@ from radagent_common.fhir_client import Fhir2Client
 from radagent_common.tracing import now_iso
 
 from classifier import ACRCategory, classify, escalation_ack_minutes
+from composer import compose_notification
 from routing import derive_specialty, out_of_specialty_fallback
 from tools import (
     ack_state,
@@ -143,13 +144,22 @@ async def _dispatch(payload: dict) -> dict:
             dispatchedAt=now_iso(),
         )
 
+    # Optional LLM prose (composer.py): upgrades ONLY the message text. Category, recipient and
+    # deadline are already decided above; None (the default) keeps the deterministic one-liner.
+    message = await compose_notification(
+        acr_category=result.category.value, finding=result.finding,
+        ack_minutes=result.ack_minutes,
+    ) or result.finding
     comm = await dispatch_communication(
         _ledger(),
         patient_ref=patient_ref,
         service_request_ref=order_ref,
         recipient_ref=recipient,
         acr_category=result.category.value,
-        finding=result.finding,
+        # The composed prose (or the deterministic label) is what the physician reads; the chart
+        # write below deliberately keeps result.finding -- the LABEL -- so the Observation stays
+        # minimal-content whatever the composer produced.
+        finding=message,
         out_of_specialty=out_of_specialty,
     )
     task, deadline = await open_ack_task(

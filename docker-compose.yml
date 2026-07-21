@@ -444,6 +444,13 @@ services:
       # fhir2 would also need FHIR2_ALLOW_INSECURE_WRITE=1; a real deployment rides the https
       # route (#75) instead.
       FHIR2_CRITICAL_NOTIFICATION_CONCEPT: ea215431-5e85-5040-adf0-1da297c154c3
+      # Optional Gemini-composed notification prose (composer.py): pass-throughs only, all
+      # defaulting to empty (= off) -- the flag is the only switch, and the key NEVER lives in
+      # this file (operator environment only; it rides the x-goog-api-key header, no URL/log).
+      COMMS_LLM_COMPOSER: ${COMMS_LLM_COMPOSER:-}
+      COMMS_LLM_MODEL: ${COMMS_LLM_MODEL:-}
+      COMMS_LLM_TIMEOUT_SECONDS: ${COMMS_LLM_TIMEOUT_SECONDS:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     depends_on:
       comms-ledger:
         # service_started, NOT service_healthy: the distroless HAPI image cannot host a probe
