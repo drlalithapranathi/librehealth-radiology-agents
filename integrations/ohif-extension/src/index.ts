@@ -19,15 +19,21 @@
  *   * getLayoutTemplateModule â€" kept for future use if we want to substitute
  *     the WorkList into a mode's layout template.
  */
-import * as React from 'react';
-
 import { WorkList } from './components/WorkList';
-import { ReportActionsPanel } from './components/ReportActionsPanel';
 import { cxrTwoViewHangingProtocol } from './hangingProtocols/cxrTwoView';
-// PriorsPanel intentionally not registered right now — the backing /priors-api/context/<ref>
-// endpoint is not wired, so registering the panel would produce an idle-empty right column
-// that reads as broken. Hidden here until priors resolution matures; the component itself
-// stays in the tree for the follow-up. See #73 item 3 discussion + docs/ohif-integration-approach.md.
+import { openReportForStudy } from './commands/openReportForStudy';
+import {
+  REPORT_BUTTON_ID,
+  REPORT_COMMAND_ID,
+  registerReportButtonOnPrimary,
+} from './toolbar/reportButton';
+// ReportActionsPanel and PriorsPanel are intentionally NOT registered as panels: OHIF
+// v3.6's default mode does not mount extension panels (right panel bar renders only
+// Segmentation/Measurements per Saptarshi's live browser drill on !95). ReportActionsPanel's
+// functionality is now on the toolbar instead (see getCommandsModule + onModeEnter below).
+// PriorsPanel stays unregistered pending its own backing endpoint. Both components remain
+// in the source tree for tests + any future affordance route (thin lhrad mode, OHIF upgrade
+// past the default-mode-mounts-panels limitation).
 
 const EXTENSION_ID = '@lhrad/extension-worklist';
 
@@ -75,20 +81,81 @@ const extension = {
   },
 
   /**
-   * Panel registered as `<extensionId>.panelModule.lhrad-priors`. Modes
-   * reference this in their layoutTemplate props' rightPanels array to
-   * surface it in the viewer at /viewer/... (post-worklist-click).
+   * No panels registered on the extension. OHIF v3.6's default mode does not mount
+   * extension panels (its ViewerLayout only renders modes-provided panel components in
+   * the fixed Segmentation/Measurements slots), so getPanelModule entries would be
+   * invisible in the deployed viewer. Verified in Saptarshi's !95 browser drill.
+   *
+   * The "Report this study" affordance moved to the toolbar (getCommandsModule +
+   * getToolbarModule + onModeEnter below). Any future affordance we want to add should
+   * follow the same pattern until we ship a thin lhrad mode or OHIF is upgraded past
+   * the default-mode-mounts-panels limitation.
    */
   getPanelModule(_ctx: ExtensionContext) {
+    return [];
+  },
+
+  /**
+   * The "Report this study" command (#73 criterion 1). Invoked by the toolbar button
+   * defined in getToolbarModule below. All state comes from window.location.search
+   * (the accession the WorkList's row click passes through), so the command needs no
+   * OHIF service context beyond the servicesManager reference OHIF injects — the
+   * openReportForStudy helper handles fetch + window.open on its own.
+   *
+   * definitions[commandId] is the OHIF v3 shape: { commandFn, storeContexts?,
+   * options? }. We use commandFn only.
+   */
+  getCommandsModule(_ctx: ExtensionContext) {
+    return {
+      definitions: {
+        [REPORT_COMMAND_ID]: {
+          commandFn: () => openReportForStudy(),
+        },
+      },
+    };
+  },
+
+  /**
+   * Toolbar button definition (#73 criterion 1). Registered here so the OHIF
+   * ExtensionManager knows the button exists; actually PLACING it in the primary
+   * section happens in onModeEnter below (because primary is mode-owned, and merging
+   * happens per-enter rather than at extension init).
+   */
+  getToolbarModule(_ctx: ExtensionContext) {
     return [
       {
-        name: 'lhrad-report-actions',
-        iconName: 'clipboard-list',
-        iconLabel: 'Report',
-        label: 'Report Actions',
-        component: ReportActionsPanel,
+        name: REPORT_BUTTON_ID,
+        defaultComponent: null,
+        // The full definition (uiType, props, commands) lives in reportButton.ts and is
+        // passed to toolbarService.addButtons from onModeEnter. Some OHIF versions
+        // ingest the definition here directly; we defer to the onModeEnter pass to keep
+        // one source of truth and predictable ordering.
       },
     ];
+  },
+
+  /**
+   * Extension-level onModeEnter. OHIF calls this whenever the app enters any mode
+   * (including the default longitudinal), which is exactly what we want for a button
+   * that should surface across every mode a radiologist reads in.
+   *
+   * Adds the report button definition to toolbarService, then merges its id into the
+   * primary section without stomping on the mode's own buttons (MeasurementTools,
+   * Zoom, WindowLevel, etc.). See src/toolbar/reportButton.ts for the merge-safe
+   * append logic and its recovery from a toolbarService without a section getter.
+   */
+  onModeEnter({ servicesManager }: ExtensionContext) {
+    try {
+      const { toolbarService } = servicesManager.services;
+      if (!toolbarService) return;
+      registerReportButtonOnPrimary(toolbarService);
+    } catch (err) {
+      // Never crash a mode enter on a toolbar-registration failure — the study still
+      // opens; the button just won't appear. Logs help debugging without failing the
+      // radiologist's read.
+      // eslint-disable-next-line no-console
+      console.warn('lhrad: report button registration failed on mode enter:', err);
+    }
   },
 
   /**

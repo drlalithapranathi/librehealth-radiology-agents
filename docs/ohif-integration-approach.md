@@ -432,28 +432,60 @@ Best-effort by design end-to-end: producer returns `false` on any non-2xx and
 never blocks navigation; consumer accepts anything schema-valid and does
 nothing safety-critical with it.
 
-### Item 2 — viewer → RIS handoff
+### Item 2 — viewer → RIS handoff (toolbar button; !95 follow-up)
 
-A new right-side panel `ReportActionsPanel` renders a **"Report this study"**
-button that opens the RIS report authoring page in a new tab, accession-
-parameterized. The URL is built from a template constant that can be overridden
-per-deployment via a global on `window.LHRAD_RIS_REPORT_URL_TEMPLATE`
-(configured in the OHIF `app-config.js`) so a deployment can point at whichever
-UI its OpenMRS serves without a code deploy.
+Live-verified in Saptarshi's !95 browser drill: OHIF v3.6's default mode does NOT
+mount extension panels. The right-panel bar in the deployed viewer renders only
+Segmentation and Measurements, both provided by OHIF's own modes; extension-registered
+panels via `getPanelModule` are silently dropped. So the affordance moved from a
+right-side panel (`ReportActionsPanel`) to a **toolbar button** in the primary section,
+using OHIF v3.6's `getCommandsModule` + `getToolbarModule` + extension-level `onModeEnter`
+pattern (per the longitudinal mode's own toolbar-button setup, per Saptarshi's guidance).
 
-Accession propagation: the WorkList row click passes both StudyInstanceUID
-and AccessionNumber to `buildViewerUrl`, which now emits
-`?StudyInstanceUIDs=<uid>&accession=<acc>`. The panel reads `?accession=`
-from `window.location.search` and substitutes it into the template.
+Flow:
 
-**Default URL template pending confirmation.** The default in the code is
-`/openmrs/owa/radiologyapp/index.html#/studies?accession={accession}` which
-follows the LibreHealth Radiology OWA convention documented at
-[forums.librehealth.io](https://forums.librehealth.io/t/project-implementing-reporting-workflow-for-radiology-as-an-open-web-app-and-integrating-voice-dictation-for-radiology/2343);
-however, the current dev-stack o3 image may serve reporting via a different
-route. A deployment overrides via the global; a code change swaps the default.
-See MR description for coordination.
+1. **Command.** `getCommandsModule` registers `lhrad.openReportForStudy`. The command
+   invokes `commands/openReportForStudy.ts`, which:
+   - Reads the accession from `window.location.search` (`?accession=...`, set by the
+     WorkList row click via `buildViewerUrl` — unchanged from the panel days).
+   - If the operator override template carries `{accession}`, substitutes directly.
+   - Otherwise resolves accession → order UUID via
+     `/openmrs/ws/rest/v1/radiologyorder?accessionNumber=<acc>`, same-origin under the
+     RIS session cookie (nginx `/openmrs/` proxy landed in !95).
+   - Substitutes `{orderUuid}` into the URL template
+     (default `/openmrs/module/radiology/radiologyOrder.form?orderId={orderUuid}`,
+     confirmed against the live o3 stack in !95).
+   - Opens in a new tab. Any failure → the RIS orders dashboard fallback,
+     `/openmrs/module/radiology/radiologyDashboardOrdersTab.htm`, so a click is never
+     dead.
 
+2. **Toolbar button definition.** `getToolbarModule` registers the button id;
+   the full definition (`uiType: 'ohif.action'`, icon, label, tooltip, `commands: [...]`)
+   lives in `toolbar/reportButton.ts` and is passed to `toolbarService.addButtons`
+   from `onModeEnter`.
+
+3. **Section placement.** The extension's own `onModeEnter` (yes — OHIF extensions
+   can have this hook, called once per mode enter across every mode a radiologist
+   uses) calls `registerReportButtonOnPrimary(toolbarService)`. That helper reads the
+   current primary-section button list (via `getButtonSection` or
+   `getButtonPropsInSection`, whichever the running toolbarService exposes) and
+   `createButtonSection('primary', […existing, 'lhrad.report'])`. If neither getter
+   exists (a 3.6 minor without a section-inspection API), it falls back to the
+   canonical longitudinal-mode primary list + our button — a known-good superset
+   that won't hide the mode's own tools.
+
+Retained but unregistered: `ReportActionsPanel` and `PriorsPanel`. Both stay in the
+source tree because (a) their tests already pin the resolver-and-open logic that the
+toolbar command now reuses via a shared module, and (b) if a future affordance route
+lands (thin lhrad mode, OHIF upgrade past the default-mode-mounts-panels limitation),
+the components are ready to be re-registered by adding one line to `getPanelModule`
+and one to the mode's `rightPanels` list.
+
+Deployment override: a deployment can still redirect the button to a different RIS UI
+via a global on `app-config.js` — `window.LHRAD_RIS_REPORT_URL_TEMPLATE`. A template
+carrying `{accession}` skips the resolver entirely and substitutes directly (for
+future o3 SPA routes that accept accession-parameterized deep links, if the RIS
+grows one).
 ### Item 3 — PriorsPanel
 
 `PriorsPanel` is **unregistered from `getPanelModule`** in this MR. The
