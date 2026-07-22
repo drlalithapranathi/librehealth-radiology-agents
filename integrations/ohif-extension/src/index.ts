@@ -20,6 +20,8 @@
  *     the WorkList into a mode's layout template.
  */
 import { WorkList } from './components/WorkList';
+import { ReportActionsPanel } from './components/ReportActionsPanel';
+import { FindingsBannerPanel } from './components/FindingsBannerPanel';
 import { cxrTwoViewHangingProtocol } from './hangingProtocols/cxrTwoView';
 import { openReportForStudy } from './commands/openReportForStudy';
 import { showFindings } from './commands/showFindings';
@@ -87,18 +89,31 @@ const extension = {
   },
 
   /**
-   * No panels registered on the extension. OHIF v3.6's default mode does not mount
-   * extension panels (its ViewerLayout only renders modes-provided panel components in
-   * the fixed Segmentation/Measurements slots), so getPanelModule entries would be
-   * invisible in the deployed viewer. Verified in Saptarshi's !95 browser drill.
-   *
-   * The "Report this study" affordance moved to the toolbar (getCommandsModule +
-   * getToolbarModule + onModeEnter below). Any future affordance we want to add should
-   * follow the same pattern until we ship a thin lhrad mode or OHIF is upgraded past
-   * the default-mode-mounts-panels limitation.
+   * Panels are mounted by OUR mode, not the default one: OHIF v3.6's default
+   * mode never mounts extension panels (verified in the !95 browser drill),
+   * which is exactly why `@lhrad/mode-reading` exists (../mode/index.js). The
+   * mode lists these two by their `<extensionId>.panelModule.<name>` ids in
+   * its rightPanels, so the names here are load-bearing.
    */
   getPanelModule(_ctx: ExtensionContext) {
-    return [];
+    return [
+      {
+        // icon name checked against the BUILT bundle's icon set ('tab-studies'
+        // is absent in this OHIF pin and renders a "Missing Icon" tile)
+        name: 'lhrad-findings-banner',
+        iconName: 'tab-patient-info',
+        iconLabel: 'AI',
+        label: 'AI Findings',
+        component: FindingsBannerPanel,
+      },
+      {
+        name: 'lhrad-report-actions',
+        iconName: 'tab-linear',
+        iconLabel: 'Report',
+        label: 'Report Actions',
+        component: ReportActionsPanel,
+      },
+    ];
   },
 
   /**

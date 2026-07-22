@@ -111,7 +111,9 @@ export function buildViewerUrl(
   if (study && isChestRadiograph(study.modality, study.studyDescription)) {
     params.set('hangingProtocolId', CXR_HANGING_PROTOCOL_ID);
   }
-  return `/viewer?${params.toString()}`;
+  // /read is @lhrad/mode-reading's route (mode/index.js): the LH mode mounts the
+  // findings + report panels, which the stock /viewer mode never does.
+  return `/read?${params.toString()}`;
 }
 
 /** Must match the id registered by hangingProtocols/cxrTwoView.ts. */
