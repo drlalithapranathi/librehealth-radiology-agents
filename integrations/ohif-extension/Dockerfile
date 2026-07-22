@@ -71,10 +71,8 @@ COPY integrations/ohif-extension/src               /tmp/lhrad-src/src
 # Extension package -- everything except test files. tsconfig comes along so
 # OHIF's TypeScript build picks up our compiler options.
 RUN mkdir -p extensions/lhrad-extension-worklist/src \
-    && cp -r /tmp/lhrad-src/src/api extensions/lhrad-extension-worklist/src/ \
-    && cp -r /tmp/lhrad-src/src/components extensions/lhrad-extension-worklist/src/ \
-    && cp /tmp/lhrad-src/src/types.ts extensions/lhrad-extension-worklist/src/ \
-    && cp /tmp/lhrad-src/src/index.ts extensions/lhrad-extension-worklist/src/ \
+    && cp -r /tmp/lhrad-src/src/. extensions/lhrad-extension-worklist/src/ \
+    && rm -rf extensions/lhrad-extension-worklist/src/__tests__ \
     && cp /tmp/lhrad-src/tsconfig.json extensions/lhrad-extension-worklist/
 
 # package.json for the workspace extension. Generated here rather than
