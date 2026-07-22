@@ -102,10 +102,49 @@ export async function emitStudyOpenedEvent(
 export function buildViewerUrl(
   studyInstanceUID: string,
   accessionNumber?: string,
+  study?: { modality?: string; studyDescription?: string },
 ): string {
   const params = new URLSearchParams({ StudyInstanceUIDs: studyInstanceUID });
   if (accessionNumber) {
     params.set('accession', accessionNumber);
   }
+  if (study && isChestRadiograph(study.modality, study.studyDescription)) {
+    params.set('hangingProtocolId', CXR_HANGING_PROTOCOL_ID);
+  }
   return `/viewer?${params.toString()}`;
+}
+
+/** Must match the id registered by hangingProtocols/cxrTwoView.ts. */
+export const CXR_HANGING_PROTOCOL_ID = 'lhrad.cxr.two-view';
+
+const CXR_MODALITIES = new Set(['CR', 'DX', 'CX']);
+
+/**
+ * Should this study open under the CXR two-view hanging protocol?
+ *
+ * The viewer's default mode pins its hanging-protocol set to `['default']`
+ * (live-verified on the built viewer: `hangingProtocolService.activeProtocolIds`
+ * is `["default"]` on /viewer, so a registered protocol's own matching rules are
+ * never consulted). The mode DOES honor `?hangingProtocolId=` on the URL, and
+ * the worklist is the one place that already knows what kind of study it is
+ * sending — so the decision rides here.
+ *
+ * Modality is authoritative when present (CR/DX both carry chest radiographs;
+ * CX is this stack's CXR convention). When the worklist row carries no
+ * modality, fall back to the description, requiring a radiograph-shaped prefix
+ * so "CT CHEST" or "MR CHEST" never two-view-hangs.
+ */
+export function isChestRadiograph(
+  modality?: string,
+  studyDescription?: string,
+): boolean {
+  const mod = (modality || '').trim().toUpperCase();
+  if (mod) {
+    return CXR_MODALITIES.has(mod);
+  }
+  const desc = (studyDescription || '').trim().toUpperCase();
+  if (!desc) return false;
+  const chest = /\bCHEST\b/.test(desc) || /\bCXR\b/.test(desc);
+  const radiograph = /^(XR|X-RAY|CXR)\b/.test(desc) || /RADIOGRAPH/.test(desc);
+  return chest && radiograph;
 }

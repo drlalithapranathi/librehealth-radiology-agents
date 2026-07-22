@@ -4,6 +4,7 @@ import {
   buildViewerUrl,
   emitStudyOpenedEvent,
   EVENT_PATH,
+  isChestRadiograph,
 } from '../api/eventClient';
 
 // --- buildViewerUrl ---------------------------------------------------------
@@ -96,5 +97,34 @@ describe('emitStudyOpenedEvent', () => {
       const ok = await emitStudyOpenedEvent('1.2.3', { fetchImpl });
       expect(ok).toBe(true);
     }
+  });
+});
+
+describe('buildViewerUrl hanging protocol selection (#73 item 4)', () => {
+  it('appends hangingProtocolId for a CR chest radiograph', () => {
+    const url = buildViewerUrl('1.2.3', 'ACC1', {
+      modality: 'CR',
+      studyDescription: 'XR CHEST PA AND LATERAL',
+    });
+    expect(url).toContain('hangingProtocolId=lhrad.cxr.two-view');
+  });
+
+  it('modality is authoritative: DX and CX hang, CT never does even with CHEST in the name', () => {
+    expect(isChestRadiograph('DX', 'CHEST 2 VIEWS')).toBe(true);
+    expect(isChestRadiograph('CX', '')).toBe(true);
+    expect(isChestRadiograph('CT', 'CT CHEST WITH CONTRAST')).toBe(false);
+  });
+
+  it('with no modality, only a radiograph-shaped chest description hangs', () => {
+    expect(isChestRadiograph('', 'XR CHEST PA AND LATERAL')).toBe(true);
+    expect(isChestRadiograph(undefined, 'CXR PORTABLE')).toBe(true);
+    expect(isChestRadiograph('', 'CT CHEST WITH CONTRAST')).toBe(false);
+    expect(isChestRadiograph('', '')).toBe(false);
+  });
+
+  it('no study info leaves the URL untouched (backwards compatible)', () => {
+    expect(buildViewerUrl('1.2.3', 'ACC1')).toBe(
+      '/viewer?StudyInstanceUIDs=1.2.3&accession=ACC1',
+    );
   });
 });

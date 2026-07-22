@@ -100,7 +100,7 @@ export const WorkList: React.FC<WorkListProps> = ({
   }, [load]);
 
   const openStudy = useCallback(
-    (uid: string, accession: string) => {
+    (uid: string, accession: string, study?: WorklistItem) => {
       // Fire-and-forget event, then navigate. Never await â€" a slow event POST
       // should not delay the viewer opening.
       void emitStudyOpenedEvent(uid, { radiologistId });
@@ -109,8 +109,10 @@ export const WorkList: React.FC<WorkListProps> = ({
       } else {
         // Client-side navigation via react-router: single history entry,
         // Back returns to /reading (see file header comment). Accession rides in the
-        // URL so ReportActionsPanel can build the RIS deep link (#73 item 2).
-        navigate(buildViewerUrl(uid, accession));
+        // URL so ReportActionsPanel can build the RIS deep link (#73 item 2);
+        // modality/description let buildViewerUrl pick the CXR two-view hanging
+        // protocol for chest radiographs (#73 item 4).
+        navigate(buildViewerUrl(uid, accession, study));
       }
     },
     [radiologistId, onOpenStudy, navigate],
@@ -181,17 +183,17 @@ export const WorkList: React.FC<WorkListProps> = ({
 
 const WorklistRow: React.FC<{
   item: WorklistItem;
-  onOpen: (uid: string, accession: string) => void;
+  onOpen: (uid: string, accession: string, study?: WorklistItem) => void;
 }> = ({ item, onOpen }) => {
   return (
     <tr
       data-testid={`lhrad-row-${item.studyInstanceUID}`}
       data-priority-tier={item.priorityTier}
-      onClick={() => onOpen(item.studyInstanceUID, item.accessionNumber)}
+      onClick={() => onOpen(item.studyInstanceUID, item.accessionNumber, item)}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          onOpen(item.studyInstanceUID, item.accessionNumber);
+          onOpen(item.studyInstanceUID, item.accessionNumber, item);
         }
       }}
       tabIndex={0}
