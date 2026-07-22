@@ -62,8 +62,8 @@ export const ReportActionsPanel: React.FC<ReportActionsPanelProps> = ({
     accession !== undefined ? accession : readAccessionFromLocation();
   const effectiveTemplate =
     urlTemplate ??
-    (typeof window !== 'undefined' && window.LHRAD_RIS_REPORT_URL_TEMPLATE) ||
-    DEFAULT_RIS_REPORT_URL_TEMPLATE;
+    ((typeof window !== 'undefined' && window.LHRAD_RIS_REPORT_URL_TEMPLATE) ||
+      DEFAULT_RIS_REPORT_URL_TEMPLATE);
   const effectiveOpen =
     openImpl ??
     ((url: string, target: string) => {
