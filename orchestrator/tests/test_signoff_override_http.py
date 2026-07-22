@@ -113,6 +113,7 @@ def _activities(spy: _Spy):
     return [
         call_agent_skill_activity,
         publish_priority_activity,
+        publish_findings_activity,
         escalate_activity,
         load_escalation_policy_activity,
         record_signoff_abandoned_activity,
