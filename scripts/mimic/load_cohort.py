@@ -101,7 +101,8 @@ def main(argv=None) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"FAILED {s.study_id}: {e}")
     c.close()
-    print(f"\n{ok}/{len(studies)} studies loaded (FHIR side). Now push DICOM: dicom_fixup + Orthanc.")
+    print(f"\n{ok}/{len(studies)} studies loaded (FHIR side). Now push DICOM (dicom_fixup + "
+          f"Orthanc), then run link_radiology_studies.py so the RIS report surface exists.")
     return 0 if ok == len(studies) else 1
 
 

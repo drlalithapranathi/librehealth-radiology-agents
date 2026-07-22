@@ -169,3 +169,59 @@ def test_drug_uuids_normalise_name():
     import bootstrap_radiology_concept as B
     assert B.drug_uuid(" Warfarin ") == B.drug_uuid("warfarin")
     assert B.drug_concept_uuid("warfarin") != B.drug_uuid("warfarin")
+
+
+# --- link_radiology_studies: the third ETL phase (#76 A.2) -----------------
+class _FakeLinkClient:
+    def __init__(self, known_accessions=()):
+        self.calls = []
+        self.known = set(known_accessions)
+
+    def ensure_radiology_study(self, accession, uid, performed_status="COMPLETED"):
+        self.calls.append(("study", accession, uid, performed_status))
+        return f"study-{accession}" if accession in self.known else None
+
+
+def _uid_lookup(mapping):
+    def find_uid(accession, base_url, http):
+        return mapping.get(accession)
+    return find_uid
+
+
+def test_link_studies_writes_real_uids_from_orthanc():
+    import link_radiology_studies as L
+    studies = list(M.load_manifest(SAMPLE))
+    accs = [x.study_id for x in studies]  # study_id verbatim is the accession
+    c = _FakeLinkClient(known_accessions=accs)
+    uids = {a: f"1.2.3.{i}" for i, a in enumerate(accs)}
+    r = L.link_studies(studies, c, "http://orthanc:8042", http=None,
+                       find_uid=_uid_lookup(uids))
+    assert r["linked"] == len(studies)
+    assert r["warnings"] == []
+    # every row carries the REAL Orthanc uid and COMPLETED status
+    assert all(("study", a, uids[a], "COMPLETED") in c.calls for a in accs)
+
+
+def test_link_studies_missing_dicom_is_a_warning_not_a_failure():
+    import link_radiology_studies as L
+    studies = list(M.load_manifest(SAMPLE))
+    accs = [x.study_id for x in studies]
+    c = _FakeLinkClient(known_accessions=accs)
+    uids = {a: f"1.2.3.{i}" for i, a in enumerate(accs[1:], 1)}  # first study not pushed
+    r = L.link_studies(studies, c, "http://orthanc:8042", http=None,
+                       find_uid=_uid_lookup(uids))
+    assert r["linked"] == len(studies) - 1
+    assert len(r["warnings"]) == 1 and "not pushed" in r["warnings"][0]
+    # the unpushed study never reaches the DB layer: no fabricated uid, ever
+    assert not any(call[1] == accs[0] for call in c.calls)
+
+
+def test_link_studies_missing_order_is_a_warning():
+    import link_radiology_studies as L
+    studies = list(M.load_manifest(SAMPLE))
+    accs = [x.study_id for x in studies]
+    c = _FakeLinkClient(known_accessions=accs[1:])  # first study has no order
+    r = L.link_studies(studies, c, "http://orthanc:8042", http=None,
+                       find_uid=_uid_lookup({a: "1.2.3" for a in accs}))
+    assert r["linked"] == len(studies) - 1
+    assert len(r["warnings"]) == 1 and "load_cohort" in r["warnings"][0]

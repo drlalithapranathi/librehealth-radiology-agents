@@ -351,6 +351,48 @@ class OmrsClient:
             cur.execute("select uuid from orders where order_id=%s", (oid,))
             return cur.fetchone()[0]
 
+    def ensure_radiology_study(self, accession: str, study_instance_uid: str,
+                               performed_status: str = "COMPLETED") -> Optional[str]:
+        """Upsert the radiology_study row that makes the RIS report surface exist (#76 A.2).
+
+        The radiology module gates its Report segment (Claim Report ->
+        radiologyReport.form) on the order's study having performed_status
+        COMPLETED -- live-verified 2026-07-22: without the row the order page
+        renders with NO report action at all. A modality would normally create
+        it via MPPS; the MIMIC replay has no modality, so the ETL writes it
+        after the DICOM push, carrying the REAL StudyInstanceUID from the
+        shipped study (never a fabricated one: the RIS's View Study link joins
+        on it).
+
+        Direct SQL like insert_radiology_order (no REST surface for it).
+        Idempotent by order: re-runs refresh the UID + status in place.
+        Returns the radiology_study uuid, or None when no order exists for the
+        accession (the FHIR-side load has not run) -- caller decides whether
+        that is a warning or a failure.
+        """
+        db = self._db()
+        with db.cursor() as c:
+            c.execute("select o.order_id from orders o join radiology_order r "
+                      "on r.order_id=o.order_id where o.accession_number=%s and o.voided=0 "
+                      "limit 1", (accession,))
+            row = c.fetchone()
+            if not row:
+                return None
+            order_id = row[0]
+            c.execute("select study_id, uuid from radiology_study where order_id=%s", (order_id,))
+            row = c.fetchone()
+            if row:
+                c.execute("update radiology_study set study_instance_uid=%s, performed_status=%s, "
+                          "changed_by=1, date_changed=NOW() where study_id=%s",
+                          (study_instance_uid, performed_status, row[0]))
+                return row[1]
+            c.execute("insert into radiology_study (study_instance_uid, order_id, "
+                      "performed_status, creator, date_created, uuid) values "
+                      "(%s, %s, %s, 1, NOW(), UUID())",
+                      (study_instance_uid, order_id, performed_status))
+            c.execute("select uuid from radiology_study where order_id=%s", (order_id,))
+            return c.fetchone()[0]
+
     def create_observation(self, patient_uuid: str, concept_uuid: str, value: float,
                            unit: str, when_iso: str) -> str:
         body = {"resourceType": "Observation", "status": "final",

@@ -133,6 +133,17 @@ _CONCEPTS = [
 ]
 
 
+# The radiology module refuses to render any order/report page until
+# `radiology.radiologyConceptClasses` names the concept classes orderable as
+# radiology procedures (IllegalStateException "Configuration required",
+# live-verified 2026-07-22 on a fresh boot). The module registers the global
+# property but ships it EMPTY, so every fresh stack needs this one-time set.
+# Resolved by class NAME, not a hardcoded uuid, so it holds even if a future
+# o3 image regenerates class uuids.
+RADIOLOGY_CONCEPT_CLASSES_GP = "radiology.radiologyConceptClasses"
+RADIOLOGY_PROCEDURE_CLASS_NAME = "Radiology/Imaging Procedure"
+
+
 log = logging.getLogger("bootstrap_presign_concept")
 
 
@@ -257,6 +268,55 @@ def _provision_concept(cursor, spec: dict, admin_user_id: int) -> Optional[int]:
     return concept_id
 
 
+def _configure_radiology_concept_classes(cursor) -> bool:
+    """Point `radiology.radiologyConceptClasses` at the Radiology/Imaging
+    Procedure concept class. Returns False only on the loud-failure case.
+
+    Idempotent and non-clobbering:
+      * GP row absent -> radiology module not installed; nothing to configure
+        (info, success).
+      * GP already set -> an operator's choice; never overwritten (info, success).
+      * GP present but empty, class found -> set it (the fresh-boot fix).
+      * GP present but empty, class MISSING -> the module is installed but its
+        seed is off; order pages will 500. Loud failure so CI/ops sees it.
+    """
+    cursor.execute(
+        "SELECT property_value FROM global_property WHERE property = %s",
+        (RADIOLOGY_CONCEPT_CLASSES_GP,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        log.info("%s not registered (radiology module absent); skipping.",
+                 RADIOLOGY_CONCEPT_CLASSES_GP)
+        return True
+    if row[0]:
+        log.info("%s already set (%r); leaving the operator's value untouched.",
+                 RADIOLOGY_CONCEPT_CLASSES_GP, row[0])
+        return True
+
+    cursor.execute(
+        "SELECT uuid FROM concept_class WHERE name = %s AND retired = 0 LIMIT 1",
+        (RADIOLOGY_PROCEDURE_CLASS_NAME,),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        log.error(
+            "%s is empty and the %r concept class is missing: the radiology "
+            "module is installed but its seed data is not loaded, and every "
+            "order/report page will fail with 'Configuration required'.",
+            RADIOLOGY_CONCEPT_CLASSES_GP, RADIOLOGY_PROCEDURE_CLASS_NAME,
+        )
+        return False
+
+    cursor.execute(
+        "UPDATE global_property SET property_value = %s WHERE property = %s",
+        (row[0], RADIOLOGY_CONCEPT_CLASSES_GP),
+    )
+    log.info("Set %s = %s (%r).", RADIOLOGY_CONCEPT_CLASSES_GP, row[0],
+             RADIOLOGY_PROCEDURE_CLASS_NAME)
+    return True
+
+
 def bootstrap(
     host: str, database: str, user: str, password: str,
 ) -> int:
@@ -274,6 +334,10 @@ def bootstrap(
                 if _provision_concept(cursor, spec, admin_user_id) is None:
                     conn.rollback()
                     return 2
+
+            if not _configure_radiology_concept_classes(cursor):
+                conn.rollback()
+                return 2
 
             conn.commit()
             return 0
