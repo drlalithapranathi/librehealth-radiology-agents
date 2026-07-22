@@ -112,7 +112,9 @@ const extension = {
    * matching rules inside the protocol scope it to CXR two-view studies.
    */
   getHangingProtocolModule(_ctx: ExtensionContext) {
-    return [cxrTwoViewHangingProtocol];
+    // OHIF's ExtensionManager expects { name, protocol } entries; a bare
+    // protocol object registers as undefined and is silently dropped.
+    return [{ name: cxrTwoViewHangingProtocol.id, protocol: cxrTwoViewHangingProtocol }];
   },
 };
 

@@ -68,20 +68,15 @@ export const cxrTwoViewHangingProtocol = {
       },
       viewports: [
         // Viewport 0: LEFT — PA (posteroanterior).
+        // No hardcoded VOI on either viewport: window/level comes from the
+        // image (a fixed 3000/1500 window renders an 8-bit CR nearly black).
         {
           viewportOptions: {
             viewportId: 'lhrad-cxr-pa',
             toolGroupId: 'default',
             allowUnmatchedView: true,
           },
-          displaySets: [
-            {
-              id: 'paDisplaySet',
-              options: {
-                voi: { windowWidth: 3000, windowCenter: 1500 },
-              },
-            },
-          ],
+          displaySets: [{ id: 'paDisplaySet' }],
         },
         // Viewport 1: RIGHT — LAT (lateral).
         {
@@ -90,49 +85,61 @@ export const cxrTwoViewHangingProtocol = {
             toolGroupId: 'default',
             allowUnmatchedView: true,
           },
-          displaySets: [
-            {
-              id: 'latDisplaySet',
-              options: {
-                voi: { windowWidth: 3000, windowCenter: 1500 },
-              },
-            },
-          ],
+          displaySets: [{ id: 'latDisplaySet' }],
         },
       ],
     },
   ],
 
   // Display-set selection rules. When ViewPosition tags are present, use them;
-  // otherwise fall back to positional (first series -> PA slot, second -> LAT slot).
+  // otherwise fall back to SeriesNumber order (first series -> PA slot, second
+  // -> LAT slot). Two live-verified corrections to the first cut (#73 drill,
+  // 2026-07-22): lateral chest views carry ViewPosition LL or RL far more often
+  // than a literal LAT, and `displaySetIndex` is not an OHIF matching attribute
+  // (its rule never fires), so the positional fallback rides SeriesNumber.
   displaySetSelectors: {
     paDisplaySet: {
       seriesMatchingRules: [
         {
-          weight: 5,
+          weight: 10,
           attribute: 'ViewPosition',
-          constraint: { contains: 'PA' },
+          constraint: { equals: 'PA' },
+        },
+        {
+          weight: 8,
+          attribute: 'ViewPosition',
+          constraint: { equals: 'AP' },
         },
         // Fallback: first series in acquisition order.
         {
           weight: 1,
-          attribute: 'displaySetIndex',
-          constraint: { equals: 0 },
+          attribute: 'SeriesNumber',
+          constraint: { equals: 1 },
         },
       ],
     },
     latDisplaySet: {
       seriesMatchingRules: [
         {
-          weight: 5,
+          weight: 10,
+          attribute: 'ViewPosition',
+          constraint: { equals: 'LL' },
+        },
+        {
+          weight: 10,
+          attribute: 'ViewPosition',
+          constraint: { equals: 'RL' },
+        },
+        {
+          weight: 8,
           attribute: 'ViewPosition',
           constraint: { contains: 'LAT' },
         },
         // Fallback: second series in acquisition order.
         {
           weight: 1,
-          attribute: 'displaySetIndex',
-          constraint: { equals: 1 },
+          attribute: 'SeriesNumber',
+          constraint: { equals: 2 },
         },
       ],
     },

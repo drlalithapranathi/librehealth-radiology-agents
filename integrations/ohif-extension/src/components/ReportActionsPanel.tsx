@@ -2,18 +2,23 @@
  * ReportActionsPanel — right-side viewer panel offering actions on the study
  * the radiologist is currently reading.
  *
- * Today: one action — "Report this study" — opens the RIS report authoring page
- * in a new tab, accession-parameterized so the radiologist lands directly on
- * the report for the study they were reading. Closes #73 item 2.
+ * Today: one action — "Report this study" — opens the RIS order page (which
+ * carries the Claim Report action into radiologyReport.form) in a new tab, so
+ * the radiologist lands directly on the order they were reading. #73 item 2.
  *
- * PLACEHOLDER URL: the exact URL pattern for the LibreHealth Radiology o3
- * module's report authoring page is not confirmed at MR-open time; it is
- * flagged for Pranathi's confirmation in the MR description. The template
- * below is intentionally the shape most likely to be correct against the
- * running dev stack, but a deployment CAN override via a global set on the
- * OHIF window shim (`window.LHRAD_RIS_REPORT_URL_TEMPLATE`) so the URL is a
- * config concern, not a code concern. When Pranathi confirms the real
- * pattern, the default here is a one-line change.
+ * URL, live-verified against the running o3 stack (2026-07-22): report
+ * authoring hangs off the order page,
+ * `/openmrs/module/radiology/radiologyOrder.form?orderId={orderUuid}`, and the
+ * form accepts the order UUID. There is no accession-parameterized RIS page,
+ * so the accession the viewer URL carries is first resolved to the order UUID
+ * through the radiology module's REST index
+ * (`/ws/rest/v1/radiologyorder?accessionNumber=`), same-origin through the
+ * nginx `/openmrs/` proxy so the radiologist's existing RIS session
+ * authenticates the lookup. If the lookup fails (not logged in, unknown
+ * accession, RIS down), the button falls back to the RIS orders dashboard —
+ * never a dead click. A deployment can still override the target via
+ * `window.LHRAD_RIS_REPORT_URL_TEMPLATE`; a template carrying `{accession}`
+ * skips resolution entirely and substitutes directly.
  *
  * Why a global rather than an env var: the OHIF viewer is a static SPA served
  * by nginx; there is no build-time env pipe from the compose file into the
@@ -29,12 +34,24 @@
  */
 import * as React from 'react';
 
-/** Overridable at runtime via `window.LHRAD_RIS_REPORT_URL_TEMPLATE`. The
- *  `{accession}` token is substituted; anything else stays as-is. When no
- *  accession is present in the URL (unusual — the WorkList row click passes
- *  it explicitly), the button is disabled so we never open a broken link. */
+/** Overridable at runtime via `window.LHRAD_RIS_REPORT_URL_TEMPLATE`. A
+ *  `{orderUuid}` token triggers accession→order resolution first; an
+ *  `{accession}` token substitutes directly with no lookup. When no accession
+ *  is present in the URL (unusual — the WorkList row click passes it
+ *  explicitly), the button is disabled so we never open a broken link. */
 const DEFAULT_RIS_REPORT_URL_TEMPLATE =
-  '/openmrs/owa/radiologyapp/index.html#/studies?accession={accession}';
+  '/openmrs/module/radiology/radiologyOrder.form?orderId={orderUuid}';
+
+/** The radiology module's accession index (same lookup the orchestrator's
+ *  ingest resolver uses server-side). Same-origin via the nginx /openmrs/
+ *  proxy; the RIS session cookie authenticates it. */
+const RESOLVE_ORDER_PATH =
+  '/openmrs/ws/rest/v1/radiologyorder?v=custom:(uuid)&accessionNumber=';
+
+/** Where the button lands when resolution fails: the RIS orders dashboard.
+ *  OpenMRS itself bounces an unauthenticated hit through login and back. */
+const RIS_FALLBACK_URL =
+  '/openmrs/module/radiology/radiologyDashboardOrdersTab.htm';
 
 const ACCESSION_URL_PARAM = 'accession';
 
@@ -51,12 +68,15 @@ export interface ReportActionsPanelProps {
   urlTemplate?: string;
   /** Overridable for tests — normally window.open. */
   openImpl?: (url: string, target: string) => void;
+  /** Overridable for tests — normally global fetch. */
+  fetchImpl?: typeof fetch;
 }
 
 export const ReportActionsPanel: React.FC<ReportActionsPanelProps> = ({
   accession,
   urlTemplate,
   openImpl,
+  fetchImpl,
 }) => {
   const effectiveAccession =
     accession !== undefined ? accession : readAccessionFromLocation();
@@ -71,20 +91,47 @@ export const ReportActionsPanel: React.FC<ReportActionsPanelProps> = ({
         window.open(url, target);
       }
     });
+  const effectiveFetch =
+    fetchImpl ?? (typeof fetch !== 'undefined' ? fetch : undefined);
 
   const disabled = !effectiveAccession;
-  const targetUrl = effectiveAccession
-    ? effectiveTemplate.replace(
-        /\{accession\}/g,
-        encodeURIComponent(effectiveAccession),
-      )
-    : '';
 
-  const onReport = () => {
-    if (!disabled) {
-      // new tab: cross-origin, do not lose the OHIF SPA state
-      effectiveOpen(targetUrl, '_blank');
+  const onReport = async () => {
+    if (disabled || !effectiveAccession) return;
+    // Operator override carrying {accession}: substitute directly, no lookup.
+    if (effectiveTemplate.includes('{accession}')) {
+      effectiveOpen(
+        effectiveTemplate.replace(
+          /\{accession\}/g,
+          encodeURIComponent(effectiveAccession),
+        ),
+        '_blank',
+      );
+      return;
     }
+    // Default path: resolve accession -> order uuid, then open the order page.
+    let target = RIS_FALLBACK_URL;
+    if (effectiveFetch) {
+      try {
+        const res = await effectiveFetch(
+          RESOLVE_ORDER_PATH + encodeURIComponent(effectiveAccession),
+          { credentials: 'include' },
+        );
+        if (res.ok) {
+          const body = await res.json();
+          const uuid = body?.results?.[0]?.uuid;
+          if (uuid) {
+            target = effectiveTemplate.replace(
+              /\{orderUuid\}/g,
+              encodeURIComponent(uuid),
+            );
+          }
+        }
+      } catch {
+        // fall through to the dashboard — never a dead click
+      }
+    }
+    effectiveOpen(target, '_blank');
   };
 
   return (
