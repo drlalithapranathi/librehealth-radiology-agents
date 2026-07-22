@@ -149,6 +149,82 @@ async def publish_priority(
     return False
 
 
+async def publish_findings(
+    base_url: str,
+    study_instance_uid: str,
+    workflow_id: str,
+    findings: list[dict],
+    overall_status: str,
+    generated_at: str,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> bool:
+    """POST the study's interpretation.runTools output to the Worklist API (#89, client-side
+    CAD evidence rendering).
+
+    Same never-raises / bounded-retry contract as publish_priority: a failed publish is a
+    visibility loss, NOT a correctness bug. The workflow still interprets, reports, signs;
+    the study just won't show the AI evidence banner in OHIF. Returns True on 2xx, False
+    after bounded retries.
+
+    Payload shape matches integrations/worklist-api/findings.py's FindingsPublish model.
+    """
+    url = base_url.rstrip("/") + "/findings"
+    payload = {
+        "studyInstanceUID": study_instance_uid,
+        "workflowId": workflow_id,
+        "findings": findings,
+        "overallStatus": overall_status,
+        "generatedAt": generated_at,
+    }
+    last_reason: Optional[str] = None
+    for attempt in range(1, _PUBLISH_MAX_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                resp = await c.post(url, json=payload)
+        except (httpx.InvalidURL, httpx.UnsupportedProtocol) as e:
+            _log.warning(
+                "findings publish skipped wf=%s study=%s: unusable WORKLIST_API_URL %r (%s, no retry)",
+                workflow_id, study_instance_uid, base_url, e,
+            )
+            return False
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            last_reason = f"network ({e.__class__.__name__}: {e})"
+            if attempt < _PUBLISH_MAX_ATTEMPTS:
+                await _sleep_backoff(attempt)
+                continue
+            _log.warning(
+                "findings publish failed after %s attempts wf=%s study=%s: %s",
+                _PUBLISH_MAX_ATTEMPTS, workflow_id, study_instance_uid, last_reason,
+            )
+            return False
+        except Exception as e:  # noqa: BLE001 (never-raises backstop)
+            _log.warning(
+                "findings publish skipped wf=%s study=%s: unexpected %s: %s (no retry)",
+                workflow_id, study_instance_uid, e.__class__.__name__, e,
+            )
+            return False
+
+        if 200 <= resp.status_code < 300:
+            return True
+        if 400 <= resp.status_code < 500:
+            _log.warning(
+                "findings publish rejected wf=%s study=%s: HTTP %s %s (no retry, caller bug)",
+                workflow_id, study_instance_uid, resp.status_code, _brief(resp),
+            )
+            return False
+        last_reason = f"HTTP {resp.status_code} {_brief(resp)}"
+        if attempt < _PUBLISH_MAX_ATTEMPTS:
+            await _sleep_backoff(attempt)
+            continue
+        _log.warning(
+            "findings publish failed after %s attempts wf=%s study=%s: %s",
+            _PUBLISH_MAX_ATTEMPTS, workflow_id, study_instance_uid, last_reason,
+        )
+        return False
+
+    return False
+
+
 async def _sleep_backoff(attempt: int) -> None:
     """Exponential backoff with jitter — 0.25s / 0.5s / 1s in the base case,
     ± up to 50% jitter to spread reconnect storms when the Worklist API

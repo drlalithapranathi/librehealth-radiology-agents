@@ -12,6 +12,7 @@ from .workflow import StudyWorkflow
 from .activities import (
     call_agent_skill_activity,
     start_agent_skill_activity,
+    publish_findings_activity,
     publish_priority_activity,
     write_presign_impression_activity,
     escalate_activity,
@@ -45,6 +46,7 @@ async def _connect_with_retry(target: str, attempts: int = 60, delay: float = 2.
 ACTIVITIES = [
     call_agent_skill_activity,
     start_agent_skill_activity,
+    publish_findings_activity,
     publish_priority_activity,
     write_presign_impression_activity,
     escalate_activity,

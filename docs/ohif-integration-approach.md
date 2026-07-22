@@ -432,28 +432,60 @@ Best-effort by design end-to-end: producer returns `false` on any non-2xx and
 never blocks navigation; consumer accepts anything schema-valid and does
 nothing safety-critical with it.
 
-### Item 2 — viewer → RIS handoff
+### Item 2 — viewer → RIS handoff (toolbar button; !95 follow-up)
 
-A new right-side panel `ReportActionsPanel` renders a **"Report this study"**
-button that opens the RIS report authoring page in a new tab, accession-
-parameterized. The URL is built from a template constant that can be overridden
-per-deployment via a global on `window.LHRAD_RIS_REPORT_URL_TEMPLATE`
-(configured in the OHIF `app-config.js`) so a deployment can point at whichever
-UI its OpenMRS serves without a code deploy.
+Live-verified in Saptarshi's !95 browser drill: OHIF v3.6's default mode does NOT
+mount extension panels. The right-panel bar in the deployed viewer renders only
+Segmentation and Measurements, both provided by OHIF's own modes; extension-registered
+panels via `getPanelModule` are silently dropped. So the affordance moved from a
+right-side panel (`ReportActionsPanel`) to a **toolbar button** in the primary section,
+using OHIF v3.6's `getCommandsModule` + `getToolbarModule` + extension-level `onModeEnter`
+pattern (per the longitudinal mode's own toolbar-button setup, per Saptarshi's guidance).
 
-Accession propagation: the WorkList row click passes both StudyInstanceUID
-and AccessionNumber to `buildViewerUrl`, which now emits
-`?StudyInstanceUIDs=<uid>&accession=<acc>`. The panel reads `?accession=`
-from `window.location.search` and substitutes it into the template.
+Flow:
 
-**Default URL template pending confirmation.** The default in the code is
-`/openmrs/owa/radiologyapp/index.html#/studies?accession={accession}` which
-follows the LibreHealth Radiology OWA convention documented at
-[forums.librehealth.io](https://forums.librehealth.io/t/project-implementing-reporting-workflow-for-radiology-as-an-open-web-app-and-integrating-voice-dictation-for-radiology/2343);
-however, the current dev-stack o3 image may serve reporting via a different
-route. A deployment overrides via the global; a code change swaps the default.
-See MR description for coordination.
+1. **Command.** `getCommandsModule` registers `lhrad.openReportForStudy`. The command
+   invokes `commands/openReportForStudy.ts`, which:
+   - Reads the accession from `window.location.search` (`?accession=...`, set by the
+     WorkList row click via `buildViewerUrl` — unchanged from the panel days).
+   - If the operator override template carries `{accession}`, substitutes directly.
+   - Otherwise resolves accession → order UUID via
+     `/openmrs/ws/rest/v1/radiologyorder?accessionNumber=<acc>`, same-origin under the
+     RIS session cookie (nginx `/openmrs/` proxy landed in !95).
+   - Substitutes `{orderUuid}` into the URL template
+     (default `/openmrs/module/radiology/radiologyOrder.form?orderId={orderUuid}`,
+     confirmed against the live o3 stack in !95).
+   - Opens in a new tab. Any failure → the RIS orders dashboard fallback,
+     `/openmrs/module/radiology/radiologyDashboardOrdersTab.htm`, so a click is never
+     dead.
 
+2. **Toolbar button definition.** `getToolbarModule` registers the button id;
+   the full definition (`uiType: 'ohif.action'`, icon, label, tooltip, `commands: [...]`)
+   lives in `toolbar/reportButton.ts` and is passed to `toolbarService.addButtons`
+   from `onModeEnter`.
+
+3. **Section placement.** The extension's own `onModeEnter` (yes — OHIF extensions
+   can have this hook, called once per mode enter across every mode a radiologist
+   uses) calls `registerReportButtonOnPrimary(toolbarService)`. That helper reads the
+   current primary-section button list (via `getButtonSection` or
+   `getButtonPropsInSection`, whichever the running toolbarService exposes) and
+   `createButtonSection('primary', […existing, 'lhrad.report'])`. If neither getter
+   exists (a 3.6 minor without a section-inspection API), it falls back to the
+   canonical longitudinal-mode primary list + our button — a known-good superset
+   that won't hide the mode's own tools.
+
+Retained but unregistered: `ReportActionsPanel` and `PriorsPanel`. Both stay in the
+source tree because (a) their tests already pin the resolver-and-open logic that the
+toolbar command now reuses via a shared module, and (b) if a future affordance route
+lands (thin lhrad mode, OHIF upgrade past the default-mode-mounts-panels limitation),
+the components are ready to be re-registered by adding one line to `getPanelModule`
+and one to the mode's `rightPanels` list.
+
+Deployment override: a deployment can still redirect the button to a different RIS UI
+via a global on `app-config.js` — `window.LHRAD_RIS_REPORT_URL_TEMPLATE`. A template
+carrying `{accession}` skips the resolver entirely and substitutes directly (for
+future o3 SPA routes that accept accession-parameterized deep links, if the RIS
+grows one).
 ### Item 3 — PriorsPanel
 
 `PriorsPanel` is **unregistered from `getPanelModule`** in this MR. The
@@ -487,3 +519,83 @@ display is at least side-by-side even if the specific-side call is uncertain.
 Registered via a new `getHangingProtocolModule` on the extension. A
 single-view CXR (only PA) falls through to OHIF's default 1-up, which is
 correct for one view.
+
+## Client-side CAD evidence rendering (#74)
+
+The showcase-safe alternative to #59 (DICOM SC/overlay write path into the archive):
+render AI evidence in the OHIF viewer client-side, from a small read endpoint on the
+Worklist API, without any archive write. #59 remains the durable long-term answer;
+this is the demo-safe path when PI sign-off for the archive-write class of change is
+still pending.
+
+### Where the finding data flows
+
+Same producer/consumer pattern as `/priority` — the orchestrator publishes, the
+Worklist API stores, the OHIF extension reads:
+
+1. **Producer.** After the pre-read fan-out (triage ‖ ehr ‖ ai parallel gather), the
+   workflow calls `publish_findings_activity` guarded by
+   `workflow.patched(PATCH_PUBLISH_FINDINGS)` so in-flight studies do not fail replay
+   with `NondeterminismError`. The activity POSTs to `/findings` via
+   `radagent_common.worklist_client.publish_findings` — bounded internal retry, never
+   raises. Per Saptarshi's !94 review, the workflow-side call also carries
+   `retry_policy=BOUNDED_ACTIVITY_RETRY` so best-effort is enforced at the workflow
+   layer too, not just at the never-raises client contract.
+
+2. **Store.** `integrations/worklist-api/findings_store.py` — SQLite parallel to
+   `PriorityStore`. Separate DB file (`WORKLIST_FINDINGS_STORE_PATH`, default
+   `/var/lib/lhrad/findings.sqlite`). Findings JSON stored as one column so schema
+   evolution on the interpretation contract is a no-op here.
+
+3. **Endpoint.** `GET /findings/{studyInstanceUID}` returns the stored payload; 404
+   signals "not yet published" (distinct from 200 with `overallStatus == "STUBBED"`,
+   which is "published, but no positive findings").
+
+4. **Consumer.** Path `/reading-api/findings/{...}` proxies through the existing
+   `/reading-api/` nginx block — no new proxy line needed. The OHIF extension does
+   NOT register the panel — see the toolbar affordance below.
+
+### Toolbar affordance (per Saptarshi's !95 finding)
+
+OHIF v3.6's default mode does not mount extension panels. `getPanelModule` entries
+are silently dropped by the default `ViewerLayout`, so `FindingsBannerPanel`
+registered via that route is invisible in the deployed viewer. Same conclusion as
+Item 2's Report affordance: use a toolbar button.
+
+The button lives at `lhrad.findings` in the primary toolbar section, alongside
+`lhrad.report`. Both registered via the extension's `onModeEnter` + shared
+merge-safe primary-section append logic. The click opens OHIF's `UIModalService`
+with `FindingsBannerPanel` as the modal content — the same component that would
+have lived in the panel slot, unchanged in rendering policy, just with modal-fit
+styling.
+
+The button also carries **ambient visibility**: its `evaluate()` reflects a
+per-study icon tint (colored when a COMPLETE finding is present, gray on ERROR,
+muted when no findings / 404). The tint is cached in `toolbar/findingsButton.ts`
+module-local state and refreshed lazily; explicit refresh via
+`setFindingsIconState(uid, tint)` after showFindings opens the modal keeps the icon
+in sync without polling the endpoint on every toolbar tick.
+
+### Rendering policy (unchanged from earlier draft)
+
+Encoded in `FindingsBannerPanel.tsx`, not the endpoint:
+
+- `COMPLETE`: tool id + label + confidence, on a colored banner. The label carries
+  the "screening signal only, not a read" caveat that
+  `interpretation-assistant/handler.py`'s `_pneumothorax_finding` constructs — no
+  re-authoring viewer-side.
+- `ERROR`: subdued gray banner reading "AI scan incomplete for this study." Model
+  reached the instance but threw; surface the attempt without claiming a positive.
+- `STUBBED`: rendered as nothing. "Tool ran, no finding at threshold" (a negative
+  screen) and "tool couldn't look, fell back to referral rule" (a degrade) both look
+  the same — neither is a positive claim.
+- Fetch returns null (404 or error): "AI analysis in progress or unavailable for
+  this study." Neutral hint; not a claim.
+
+### Component retention posture
+
+`FindingsBannerPanel` stays in the source tree and is used both as modal content
+(this MR) and as a potential future right-side panel if a thin `lhrad` mode ships or
+OHIF is upgraded past the default-mode-mounts-panels limitation. Same posture as
+`ReportActionsPanel` and `PriorsPanel` — components stay ready for re-registration;
+the extension registers `getPanelModule` as `[]` for now.

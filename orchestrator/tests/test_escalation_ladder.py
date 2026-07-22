@@ -243,6 +243,11 @@ async def _mock_call(agent: str, skill_id: str, payload: dict) -> dict:
 async def _mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
     return None
 
+@activity.defn(name="publish_findings_activity")
+async def _mock_publish_findings(workflow_id: str, study_instance_uid: str, ai_result: dict) -> None:
+    """Mock for #74 publish_findings_activity — never-raises like the production version."""
+    return None
+
 
 @activity.defn(name="escalate_activity")
 async def _mock_escalate(workflow_id: str, reason: str, escalation: dict | None = None) -> None:
@@ -294,7 +299,7 @@ def test_ack_before_first_rung_pages_nobody():
         _reset()
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[_mock_call, _mock_publish, _mock_escalate,
+                              activities=[_mock_call, _mock_publish, _mock_publish_findings, _mock_escalate,
                                           _mock_load_policy]):
                 handle = await env.client.start_workflow(
                     StudyWorkflow.run, STUDY_CONTEXT, id="wf-ladder-ack", task_queue=TASK_QUEUE
@@ -328,7 +333,7 @@ def test_policy_load_failure_falls_back_to_legacy_gate():
         _reset()
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[_mock_call, _mock_publish, _mock_escalate,
+                              activities=[_mock_call, _mock_publish, _mock_publish_findings, _mock_escalate,
                                           _boom_load_policy, _mock_record_policy_failure,
                                           _mock_record_signoff_abandoned]):
                 handle = await env.client.start_workflow(
@@ -367,7 +372,7 @@ def test_policy_dead_letter_failure_never_costs_the_page():
         _reset()
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[_mock_call, _mock_publish, _mock_escalate,
+                              activities=[_mock_call, _mock_publish, _mock_publish_findings, _mock_escalate,
                                           _boom_load_policy, _boom_record_policy_failure,
                                           _mock_record_signoff_abandoned]):
                 handle = await env.client.start_workflow(

@@ -72,6 +72,11 @@ async def _mock_call(agent: str, skill_id: str, payload: dict) -> dict:
 async def _mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
     return None
 
+@activity.defn(name="publish_findings_activity")
+async def _mock_publish_findings(workflow_id: str, study_instance_uid: str, ai_result: dict) -> None:
+    """Mock for #74 publish_findings_activity — never-raises like the production version."""
+    return None
+
 
 @activity.defn(name="escalate_activity")
 async def _mock_escalate(workflow_id: str, reason: str, escalation: dict | None = None) -> None:
@@ -117,7 +122,7 @@ def test_stat_study_pages_rung1_at_the_tier_hour_and_ack_releases_the_gate():
         _ESCALATIONS.clear()
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[_mock_call, _mock_publish, _mock_escalate,
+                              activities=[_mock_call, _mock_publish, _mock_publish_findings, _mock_escalate,
                                           load_escalation_policy_activity]):
                 handle = await env.client.start_workflow(
                     StudyWorkflow.run, STUDY_CONTEXT, id="wf-tier-stat", task_queue=TASK_QUEUE
@@ -163,7 +168,7 @@ def test_escalation_failure_does_not_strand_the_gate():
         _FAILED_ESCALATE_ATTEMPTS.clear()
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[_mock_call, _mock_publish, _boom_escalate,
+                              activities=[_mock_call, _mock_publish, _mock_publish_findings, _boom_escalate,
                                           load_escalation_policy_activity]):
                 handle = await env.client.start_workflow(
                     StudyWorkflow.run, STUDY_CONTEXT, id="wf-tier-boom", task_queue=TASK_QUEUE

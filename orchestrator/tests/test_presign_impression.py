@@ -82,6 +82,11 @@ async def mock_call_agent(agent: str, skill_id: str, payload: dict) -> dict:
 async def mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
     return None
 
+@activity.defn(name="publish_findings_activity")
+async def mock_publish_findings(workflow_id: str, study_instance_uid: str, ai_result: dict) -> None:
+    """Mock for #74 publish_findings_activity — never-raises like the production version."""
+    return None
+
 
 @activity.defn(name="write_presign_impression_activity")
 async def mock_write_presign(service_request_ref: str, patient_ref: str, impression_text: str) -> str:
@@ -104,7 +109,7 @@ def _worker(env: WorkflowEnvironment) -> Worker:
         env.client,
         task_queue=TASK_QUEUE,
         workflows=[StudyWorkflow],
-        activities=[mock_call_agent, mock_publish, mock_write_presign, mock_escalate],
+        activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_write_presign, mock_escalate],
         max_cached_workflows=0,
     )
 

@@ -47,6 +47,11 @@ async def mock_call_agent(agent: str, skill_id: str, payload: dict) -> dict:
 async def mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
     return None
 
+@activity.defn(name="publish_findings_activity")
+async def mock_publish_findings(workflow_id: str, study_instance_uid: str, ai_result: dict) -> None:
+    """Mock for #74 publish_findings_activity — never-raises like the production version."""
+    return None
+
 
 @activity.defn(name="escalate_activity")
 async def mock_escalate(workflow_id: str, reason: str) -> None:
@@ -152,7 +157,7 @@ def test_gate_releases_after_ingress_restart(tmp_path):
     async def scenario():
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[mock_call_agent, mock_publish, mock_escalate]):
+                              activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_escalate]):
                 # ingress process #1: index the study, start its workflow, let it park at the gate.
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._index_workflow(STUDY_CONTEXT)  # persists ACC-6 -> wf_restart_6
@@ -195,7 +200,7 @@ def test_reconcile_evicts_completed_keeps_running(tmp_path):
     async def scenario():
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[mock_call_agent, mock_publish, mock_escalate]):
+                              activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
 
                 # workflow that runs to completion (ARCHIVED). Reconciliation is the only eviction

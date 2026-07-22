@@ -11,12 +11,12 @@ import {
 
 describe('buildViewerUrl', () => {
   it('constructs same-origin /viewer URL with StudyInstanceUIDs param', () => {
-    expect(buildViewerUrl('1.2.3.4')).toBe('/viewer?StudyInstanceUIDs=1.2.3.4');
+    expect(buildViewerUrl('1.2.3.4')).toBe('/read?StudyInstanceUIDs=1.2.3.4');
   });
 
   it('URL-encodes exotic UIDs (defense-in-depth even though DICOM UIDs are ASCII)', () => {
     // Real DICOM UIDs won't have these, but the encoding contract must be honored.
-    expect(buildViewerUrl('1.2 3')).toBe('/viewer?StudyInstanceUIDs=1.2+3');
+    expect(buildViewerUrl('1.2 3')).toBe('/read?StudyInstanceUIDs=1.2+3');
   });
 });
 
@@ -124,7 +124,7 @@ describe('buildViewerUrl hanging protocol selection (#73 item 4)', () => {
 
   it('no study info leaves the URL untouched (backwards compatible)', () => {
     expect(buildViewerUrl('1.2.3', 'ACC1')).toBe(
-      '/viewer?StudyInstanceUIDs=1.2.3&accession=ACC1',
+      '/read?StudyInstanceUIDs=1.2.3&accession=ACC1',
     );
   });
 });

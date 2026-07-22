@@ -11,7 +11,10 @@ import yaml
 
 from radagent_common.client import call_agent_skill, start_agent_skill
 from radagent_common.fhir_client import Fhir2Client
-from radagent_common.worklist_client import publish_priority as publish_priority_to_worklist
+from radagent_common.worklist_client import (
+    publish_findings as publish_findings_to_worklist,
+    publish_priority as publish_priority_to_worklist,
+)
 from radagent_common.tracing import now_iso
 from . import state
 from .ingress_store import IngressStore, default_store_path
@@ -76,6 +79,39 @@ async def publish_priority_activity(workflow_id: str, study_instance_uid: str, t
         workflow_id=workflow_id,
         priority_tier=tier,
         priority_score=score,
+    )
+
+
+@activity.defn(name=state.ACT_PUBLISH_FINDINGS)
+async def publish_findings_activity(
+    workflow_id: str, study_instance_uid: str, ai_result: dict,
+) -> None:
+    """Publish interpretation.runTools output to the Worklist API for client-side CAD evidence
+    rendering in OHIF (#89, the showcase-safe alternative to #59's archive-write path).
+
+    Best-effort visibility publish: a failed publish means the OHIF extension does not render
+    the AI banner for that study; the workflow's interpretation, reporting, and sign-off paths
+    are unaffected. worklist_client.publish_findings never raises (bounded internal retry,
+    logs on give-up); this activity swallows the return value into an info log line.
+
+    No PHI beyond what interpretation.runTools already emits (tool id + label + confidence +
+    evidenceRef pointer). The rendering-side extension applies its own policy (COMPLETE
+    prominent, STUBBED silent, ERROR subdued) — this activity is dumb transport.
+    """
+    findings = ai_result.get("findings") or []
+    overall_status = ai_result.get("overallStatus", "STUBBED")
+    generated_at = ai_result.get("ranAt", "")
+    activity.logger.info(
+        "publish findings wf=%s study=%s n=%d status=%s",
+        workflow_id, study_instance_uid, len(findings), overall_status,
+    )
+    await publish_findings_to_worklist(
+        state.worklist_api_base_url(),
+        study_instance_uid=study_instance_uid,
+        workflow_id=workflow_id,
+        findings=findings,
+        overall_status=overall_status,
+        generated_at=generated_at,
     )
 
 

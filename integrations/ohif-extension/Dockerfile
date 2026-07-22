@@ -93,13 +93,33 @@ RUN cat > extensions/lhrad-extension-worklist/package.json <<'JSON'
 }
 JSON
 
-# Register our extension in pluginConfig.json. We rewrite the file with node
-# rather than sed so we survive any whitespace variations in the upstream OHIF
-# file. If OHIF changes the plugin config shape in a future release, this is
-# where debugging starts.
+# The thin LH reading mode (#73/#74): wraps @ohif/mode-longitudinal and mounts
+# the findings/report panels the default mode never does. Same drop-in pattern
+# as the extension above; the mode is one file, the package.json is generated.
+COPY integrations/ohif-extension/mode /tmp/lhrad-mode
+RUN mkdir -p modes/lhrad-mode-reading/src \
+    && cp /tmp/lhrad-mode/index.js modes/lhrad-mode-reading/src/index.js
+
+RUN cat > modes/lhrad-mode-reading/package.json <<'JSON'
+{
+  "name": "@lhrad/mode-reading",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.js",
+  "peerDependencies": {
+    "@ohif/core": "*",
+    "@ohif/mode-longitudinal": "*"
+  }
+}
+JSON
+
+# Register our extension AND mode in pluginConfig.json. We rewrite the file
+# with node rather than sed so we survive any whitespace variations in the
+# upstream OHIF file. If OHIF changes the plugin config shape in a future
+# release, this is where debugging starts.
 #
-# NOTE: we do NOT push anything into cfg.modes -- the reading worklist is a
-# customizationService route, not a mode (see architecture note above).
+# The /reading WORKLIST route stays a customizationService route (not a mode:
+# mode routes gate on StudyInstanceUIDs). The /read VIEWER route is the mode.
 RUN node -e ' \
   const fs = require("fs"); \
   const path = "platform/app/pluginConfig.json"; \
@@ -108,8 +128,13 @@ RUN node -e ' \
   if (!cfg.extensions.some(e => (e.packageName||e) === "@lhrad/extension-worklist")) { \
     cfg.extensions.push({ packageName: "@lhrad/extension-worklist", version: "0.1.0" }); \
   } \
+  cfg.modes = cfg.modes || []; \
+  if (!cfg.modes.some(m => (m.packageName||m) === "@lhrad/mode-reading")) { \
+    cfg.modes.push({ packageName: "@lhrad/mode-reading", version: "0.1.0" }); \
+  } \
   fs.writeFileSync(path, JSON.stringify(cfg, null, 2)); \
   console.log("registered extensions:", cfg.extensions.map(e => e.packageName||e)); \
+  console.log("registered modes:", cfg.modes.map(m => m.packageName||m)); \
 '
 
 # Install workspace deps. --frozen-lockfile is the OHIF-documented flag for

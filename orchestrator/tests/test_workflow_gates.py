@@ -74,6 +74,11 @@ async def mock_call_agent(agent: str, skill_id: str, payload: dict) -> dict:
 async def mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
     return None
 
+@activity.defn(name="publish_findings_activity")
+async def mock_publish_findings(workflow_id: str, study_instance_uid: str, ai_result: dict) -> None:
+    """Mock for #74 publish_findings_activity — never-raises like the production version."""
+    return None
+
 
 @activity.defn(name="escalate_activity")
 async def mock_escalate(workflow_id: str, reason: str, escalation: dict | None = None) -> None:
@@ -98,7 +103,7 @@ def _worker(env: WorkflowEnvironment) -> Worker:
         env.client,
         task_queue=TASK_QUEUE,
         workflows=[StudyWorkflow],
-        activities=[mock_call_agent, mock_publish, mock_escalate, mock_load_policy],
+        activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_escalate, mock_load_policy],
         max_cached_workflows=0,
     )
 
@@ -226,7 +231,7 @@ def test_repeating_rung_stops_at_the_cap_and_then_RELEASES_the_study():
         _reset([("FAIL", True), ("PASS", False)])
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[mock_call_agent, mock_publish, mock_escalate,
+                              activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_escalate,
                                           mock_load_repeat_policy, mock_record_signoff_abandoned],
                               max_cached_workflows=0):
                 handle = await env.client.start_workflow(
@@ -281,7 +286,7 @@ def test_the_last_page_gets_a_window_to_be_answered_before_the_study_is_abandone
         _reset([("FAIL", True), ("PASS", False)])
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[mock_call_agent, mock_publish, mock_escalate,
+                              activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_escalate,
                                           mock_load_single_rung_policy,
                                           mock_record_signoff_abandoned],
                               max_cached_workflows=0):
