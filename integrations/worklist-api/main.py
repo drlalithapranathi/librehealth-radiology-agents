@@ -50,6 +50,8 @@ from radagent_common.orthanc_client import OrthancClient
 from radagent_common.tracing import now_iso
 
 from ack import OpenmrsIdentity, create_ack_router
+from findings import create_findings_router
+from findings_store import FindingsStore
 from assignment import AssignmentReader, NullAssignmentReader
 from store import PriorityStore
 
@@ -95,6 +97,14 @@ def create_app(
     # unsigned links are never minted producer-side and the verifier here fails closed.
     app.include_router(create_ack_router(
         ledger or CommsLedgerClient(), identity or OpenmrsIdentity()))
+
+    # The #89 findings surface (see findings.py). Orchestrator publishes interpretation.runTools
+    # output here after the pre-read fan-out; the OHIF extension reads back for client-side
+    # AI-evidence rendering. Separate DB file from PriorityStore so the two lifecycles are
+    # independent (e.g., wiping findings during dev doesn't drop worklist priority).
+    app.state.findings_store = FindingsStore(
+        os.environ.get("WORKLIST_FINDINGS_STORE_PATH", "/var/lib/lhrad/findings.sqlite"))
+    app.include_router(create_findings_router(app.state.findings_store))
 
     @app.get("/healthz")
     async def healthz() -> dict:

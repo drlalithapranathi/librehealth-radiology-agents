@@ -41,6 +41,11 @@ async def mock_call_agent(agent: str, skill_id: str, payload: dict) -> dict:
 async def mock_publish(workflow_id: str, study_instance_uid: str, triage: dict) -> None:
     return None
 
+@activity.defn(name="publish_findings_activity")
+async def mock_publish_findings(workflow_id: str, study_instance_uid: str, ai_result: dict) -> None:
+    """Mock for #74 publish_findings_activity — never-raises like the production version."""
+    return None
+
 
 @activity.defn(name="escalate_activity")
 async def mock_escalate(workflow_id: str, reason: str) -> None:
@@ -118,7 +123,7 @@ def test_duplicate_stable_event_is_idempotent(tmp_path):
     async def scenario():
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[mock_call_agent, mock_publish, mock_escalate]):
+                              activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client  # so _temporal() returns the test client, no real connect
                 ingress._OPENMRS_REST = _FakeResolver(result=None)  # unresolved: keep this test purely about idempotency
@@ -147,7 +152,7 @@ def test_duplicate_after_completion_starts_fresh(tmp_path):
     async def scenario():
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                              activities=[mock_call_agent, mock_publish, mock_escalate]):
+                              activities=[mock_call_agent, mock_publish, mock_publish_findings, mock_escalate]):
                 ingress._STORE = ingress.IngressStore(db)
                 ingress._client = env.client
                 ingress._OPENMRS_REST = _FakeResolver(result=None)

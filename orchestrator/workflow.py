@@ -24,6 +24,7 @@ from .state import (
     State,
     ACT_CALL_AGENT,
     ACT_START_AGENT,
+    ACT_PUBLISH_FINDINGS,
     ACT_PUBLISH_PRIORITY,
     ACT_ESCALATE,
     ACT_LOAD_ESCALATION_POLICY,
@@ -62,6 +63,7 @@ PUSH_RESULT_CAP = 32
 # own history deterministically, so inserting activity calls mid-path is a breaking change for
 # every study already past that point. See the call site in run().
 PATCH_PRESIGN_IMPRESSION = "presign-impression-v1"
+PATCH_PUBLISH_FINDINGS = "publish-findings-v1"
 # Temporal patch marker for the escalation-policy dead-letter write (#54). Same hazard as the
 # presign marker: this inserts a new activity command into the sign-off-gate fallback branch, a
 # path that studies parked at the gate have ALREADY walked. Without the guard, replaying such a
@@ -619,6 +621,25 @@ class StudyWorkflow:
             args=[wf_id, study_uid, self._triage],
             start_to_close_timeout=PRE_READ_TIMEOUT,
         )
+
+        # --- Publish AI findings for client-side CAD evidence rendering (#89) ------
+        # Guarded by workflow.patched(): inserting an activity command into a path in-flight
+        # studies have already walked would fail replay with NondeterminismError. Same shape
+        # as PATCH_PRESIGN_IMPRESSION below. Best-effort -- a failed publish is a visibility
+        # loss in OHIF only; the workflow's read path is unaffected.
+        if workflow.patched(PATCH_PUBLISH_FINDINGS):
+            await workflow.execute_activity(
+                ACT_PUBLISH_FINDINGS,
+                args=[wf_id, study_uid, self._ai or {}],
+                start_to_close_timeout=PRE_READ_TIMEOUT,
+                # Bounded retry per Saptarshi's !94 review: publish_findings inherits the
+                # never-raises contract from worklist_client.publish_findings, but the workflow
+                # layer's default is UNBOUNDED retry. If a future exception class ever escaped
+                # the never-raises contract, an unbounded retry would wedge the study pre-read.
+                # A bounded 3-attempt policy makes "best-effort" true at the workflow layer too.
+                # (Symmetric follow-up welcome on publish_priority, which shares the trap.)
+                retry_policy=BOUNDED_ACTIVITY_RETRY,
+            )
 
         # --- PRESIGN IMPRESSION (#26): offer an aiFindings-only draft ahead of the read -----
         # Guarded by workflow.patched(): this block inserts activity commands into the middle of a

@@ -519,3 +519,83 @@ display is at least side-by-side even if the specific-side call is uncertain.
 Registered via a new `getHangingProtocolModule` on the extension. A
 single-view CXR (only PA) falls through to OHIF's default 1-up, which is
 correct for one view.
+
+## Client-side CAD evidence rendering (#74)
+
+The showcase-safe alternative to #59 (DICOM SC/overlay write path into the archive):
+render AI evidence in the OHIF viewer client-side, from a small read endpoint on the
+Worklist API, without any archive write. #59 remains the durable long-term answer;
+this is the demo-safe path when PI sign-off for the archive-write class of change is
+still pending.
+
+### Where the finding data flows
+
+Same producer/consumer pattern as `/priority` — the orchestrator publishes, the
+Worklist API stores, the OHIF extension reads:
+
+1. **Producer.** After the pre-read fan-out (triage ‖ ehr ‖ ai parallel gather), the
+   workflow calls `publish_findings_activity` guarded by
+   `workflow.patched(PATCH_PUBLISH_FINDINGS)` so in-flight studies do not fail replay
+   with `NondeterminismError`. The activity POSTs to `/findings` via
+   `radagent_common.worklist_client.publish_findings` — bounded internal retry, never
+   raises. Per Saptarshi's !94 review, the workflow-side call also carries
+   `retry_policy=BOUNDED_ACTIVITY_RETRY` so best-effort is enforced at the workflow
+   layer too, not just at the never-raises client contract.
+
+2. **Store.** `integrations/worklist-api/findings_store.py` — SQLite parallel to
+   `PriorityStore`. Separate DB file (`WORKLIST_FINDINGS_STORE_PATH`, default
+   `/var/lib/lhrad/findings.sqlite`). Findings JSON stored as one column so schema
+   evolution on the interpretation contract is a no-op here.
+
+3. **Endpoint.** `GET /findings/{studyInstanceUID}` returns the stored payload; 404
+   signals "not yet published" (distinct from 200 with `overallStatus == "STUBBED"`,
+   which is "published, but no positive findings").
+
+4. **Consumer.** Path `/reading-api/findings/{...}` proxies through the existing
+   `/reading-api/` nginx block — no new proxy line needed. The OHIF extension does
+   NOT register the panel — see the toolbar affordance below.
+
+### Toolbar affordance (per Saptarshi's !95 finding)
+
+OHIF v3.6's default mode does not mount extension panels. `getPanelModule` entries
+are silently dropped by the default `ViewerLayout`, so `FindingsBannerPanel`
+registered via that route is invisible in the deployed viewer. Same conclusion as
+Item 2's Report affordance: use a toolbar button.
+
+The button lives at `lhrad.findings` in the primary toolbar section, alongside
+`lhrad.report`. Both registered via the extension's `onModeEnter` + shared
+merge-safe primary-section append logic. The click opens OHIF's `UIModalService`
+with `FindingsBannerPanel` as the modal content — the same component that would
+have lived in the panel slot, unchanged in rendering policy, just with modal-fit
+styling.
+
+The button also carries **ambient visibility**: its `evaluate()` reflects a
+per-study icon tint (colored when a COMPLETE finding is present, gray on ERROR,
+muted when no findings / 404). The tint is cached in `toolbar/findingsButton.ts`
+module-local state and refreshed lazily; explicit refresh via
+`setFindingsIconState(uid, tint)` after showFindings opens the modal keeps the icon
+in sync without polling the endpoint on every toolbar tick.
+
+### Rendering policy (unchanged from earlier draft)
+
+Encoded in `FindingsBannerPanel.tsx`, not the endpoint:
+
+- `COMPLETE`: tool id + label + confidence, on a colored banner. The label carries
+  the "screening signal only, not a read" caveat that
+  `interpretation-assistant/handler.py`'s `_pneumothorax_finding` constructs — no
+  re-authoring viewer-side.
+- `ERROR`: subdued gray banner reading "AI scan incomplete for this study." Model
+  reached the instance but threw; surface the attempt without claiming a positive.
+- `STUBBED`: rendered as nothing. "Tool ran, no finding at threshold" (a negative
+  screen) and "tool couldn't look, fell back to referral rule" (a degrade) both look
+  the same — neither is a positive claim.
+- Fetch returns null (404 or error): "AI analysis in progress or unavailable for
+  this study." Neutral hint; not a claim.
+
+### Component retention posture
+
+`FindingsBannerPanel` stays in the source tree and is used both as modal content
+(this MR) and as a potential future right-side panel if a thin `lhrad` mode ships or
+OHIF is upgraded past the default-mode-mounts-panels limitation. Same posture as
+`ReportActionsPanel` and `PriorsPanel` — components stay ready for re-registration;
+the extension registers `getPanelModule` as `[]` for now.

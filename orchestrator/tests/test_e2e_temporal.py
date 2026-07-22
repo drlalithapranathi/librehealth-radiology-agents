@@ -46,6 +46,7 @@ from orchestrator.state import TASK_QUEUE, State  # noqa: E402
 from orchestrator.workflow import StudyWorkflow  # noqa: E402
 from orchestrator.activities import (  # noqa: E402
     call_agent_skill_activity,
+    publish_findings_activity,
     publish_priority_activity,
     escalate_activity,
     load_escalation_policy_activity,
@@ -143,7 +144,7 @@ def test_orchestrator_end_to_end_on_temporal(mock_agent_fleet):
         async with await WorkflowEnvironment.start_time_skipping() as env:
             async with Worker(
                 env.client, task_queue=TASK_QUEUE, workflows=[StudyWorkflow],
-                activities=[call_agent_skill_activity, publish_priority_activity,
+                activities=[call_agent_skill_activity, publish_priority_activity, publish_findings_activity,
                             escalate_activity, load_escalation_policy_activity],
             ):
                 handle = await env.client.start_workflow(

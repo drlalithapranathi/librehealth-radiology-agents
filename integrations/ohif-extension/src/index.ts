@@ -22,11 +22,17 @@
 import { WorkList } from './components/WorkList';
 import { cxrTwoViewHangingProtocol } from './hangingProtocols/cxrTwoView';
 import { openReportForStudy } from './commands/openReportForStudy';
+import { showFindings } from './commands/showFindings';
 import {
   REPORT_BUTTON_ID,
   REPORT_COMMAND_ID,
   registerReportButtonOnPrimary,
 } from './toolbar/reportButton';
+import {
+  FINDINGS_BUTTON_ID,
+  FINDINGS_COMMAND_ID,
+  registerFindingsButtonOnPrimary,
+} from './toolbar/findingsButton';
 // ReportActionsPanel and PriorsPanel are intentionally NOT registered as panels: OHIF
 // v3.6's default mode does not mount extension panels (right panel bar renders only
 // Segmentation/Measurements per Saptarshi's live browser drill on !95). ReportActionsPanel's
@@ -105,11 +111,18 @@ const extension = {
    * definitions[commandId] is the OHIF v3 shape: { commandFn, storeContexts?,
    * options? }. We use commandFn only.
    */
-  getCommandsModule(_ctx: ExtensionContext) {
+  getCommandsModule({ servicesManager }: ExtensionContext) {
     return {
       definitions: {
         [REPORT_COMMAND_ID]: {
           commandFn: () => openReportForStudy(),
+        },
+        // #74: opens the AI Findings modal via OHIF UIModalService. servicesManager is
+        // captured at extension registration so the command has access to
+        // uiModalService (or UIModalService — the older PascalCase key on some 3.6
+        // minors; showFindings probes both).
+        [FINDINGS_COMMAND_ID]: {
+          commandFn: () => showFindings({ servicesManager }),
         },
       },
     };
@@ -126,10 +139,14 @@ const extension = {
       {
         name: REPORT_BUTTON_ID,
         defaultComponent: null,
-        // The full definition (uiType, props, commands) lives in reportButton.ts and is
-        // passed to toolbarService.addButtons from onModeEnter. Some OHIF versions
-        // ingest the definition here directly; we defer to the onModeEnter pass to keep
-        // one source of truth and predictable ordering.
+        // Full definitions live in the toolbar/*.ts modules and are passed to
+        // toolbarService.addButtons from onModeEnter. Some OHIF versions ingest the
+        // definition here directly; we defer to the onModeEnter pass to keep one
+        // source of truth and predictable ordering.
+      },
+      {
+        name: FINDINGS_BUTTON_ID,
+        defaultComponent: null,
       },
     ];
   },
@@ -148,13 +165,17 @@ const extension = {
     try {
       const { toolbarService } = servicesManager.services;
       if (!toolbarService) return;
+      // #73 criterion 1 — Report toolbar button.
       registerReportButtonOnPrimary(toolbarService);
+      // #74 — AI Findings toolbar button (modal-based, per !95's finding that panels
+      // don't mount in the default mode).
+      registerFindingsButtonOnPrimary(toolbarService);
     } catch (err) {
       // Never crash a mode enter on a toolbar-registration failure — the study still
-      // opens; the button just won't appear. Logs help debugging without failing the
+      // opens; the buttons just won't appear. Logs help debugging without failing the
       // radiologist's read.
       // eslint-disable-next-line no-console
-      console.warn('lhrad: report button registration failed on mode enter:', err);
+      console.warn('lhrad: toolbar button registration failed on mode enter:', err);
     }
   },
 
