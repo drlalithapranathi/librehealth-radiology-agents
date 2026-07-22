@@ -20,18 +20,34 @@ from manifest import load_manifest, CohortStudy
 from dicom_fixup import study_id_to_accession
 from omrs_client import OmrsClient, ORDER_CONCEPT_UUID
 from bootstrap_radiology_concept import LAB_LOINC_TO_CONCEPT
+import referrers
 
 # A FHIR-valid instant (fhir2 rejects the +0000 offset form). Real loads should stamp the MIMIC
 # study date; the manifest can carry it later.
 DEFAULT_WHEN = os.environ.get("MIMIC_DEFAULT_WHEN", "2026-01-01T09:00:00+00:00")
 
 
-def load_study(c: OmrsClient, s: CohortStudy, concept_uuid: str, when_iso: str = DEFAULT_WHEN) -> dict:
+def load_study(c: OmrsClient, s: CohortStudy, concept_uuid: str, when_iso: str = DEFAULT_WHEN,
+               seed_referrer: bool = True) -> dict:
     accession = study_id_to_accession(s.study_id)
     summary = {"study_id": s.study_id, "accession": accession, "ehr": {"labs": 0, "problems": 0, "meds": 0}}
 
     patient = c.create_patient(s.subject_id, gender=s.labels.get("gender", "U"))
     encounter = c.create_encounter(patient, when_iso)
+    # Referring physician (#76 build item 1): the study's ORDERER is a real demo Provider, so fhir2
+    # surfaces ServiceRequest.requester and the critical-result notification names/reaches the
+    # ordering physician (comms.resolve_ordering_provider). Deterministic per subject_id so a
+    # patient's studies share one referrer. Best-effort: a seeding failure degrades to the ETL's
+    # default orderer (admin) with a warning -- the study still loads and still workflows.
+    orderer_uuid = None
+    if seed_referrer:
+        ref = referrers.assign(s.subject_id)
+        try:
+            orderer_uuid = c.ensure_referring_provider(
+                ref["username"], ref["given"], ref["family"], gender=ref.get("gender", "U"))
+            summary["referrer"] = ref["username"]
+        except Exception as e:  # noqa: BLE001
+            summary.setdefault("warnings", []).append(f"referrer {ref['username']}: {e}")
     # Order reason (#68 gap 4): an ICD-10-mapped Concept, read back by the #81 resolver into
     # StudyContext order.reasonCode. Best-effort like the resolver itself: a reason failure
     # degrades to a reason-less order and must never cost the order or the join.
@@ -43,7 +59,8 @@ def load_study(c: OmrsClient, s: CohortStudy, concept_uuid: str, when_iso: str =
         except Exception as e:  # noqa: BLE001
             summary.setdefault("warnings", []).append(f"order reason {s.reason_codes}: {e}")
     order = c.insert_radiology_order(patient, encounter, accession, concept_uuid,
-                                     priority=s.priority, reason_concept_uuid=reason_uuid)
+                                     priority=s.priority, reason_concept_uuid=reason_uuid,
+                                     orderer_provider_uuid=orderer_uuid)
     summary.update(patient=patient, encounter=encounter, order=order)
 
     # EHR packet -- best-effort: a missing concept mapping must not strand the study.
@@ -97,6 +114,7 @@ def main(argv=None) -> int:
             r = load_study(c, s, args.concept)
             ok += 1
             print(f"loaded {r['study_id']} acc={r['accession']} order={r['order']} "
+                  f"req={r.get('referrer', '-')} "
                   f"labs={r['ehr']['labs']} problems={r['ehr']['problems']}")
         except Exception as e:  # noqa: BLE001
             print(f"FAILED {s.study_id}: {e}")

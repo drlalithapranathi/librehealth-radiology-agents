@@ -17,12 +17,15 @@ container beside the stack; override to localhost for host-run tooling:
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
+import logging
 import os
 import re
 from urllib.parse import urlparse
 import httpx
 
 import bootstrap_radiology_concept as dictionary  # stable UUIDs + reference-row constants
+
+_log = logging.getLogger("mimic.omrs_client")
 
 
 def fhir_instant(s: str) -> str:
@@ -46,6 +49,15 @@ ENCOUNTER_ROLE_UUID = os.environ.get("MIMIC_ENCOUNTER_ROLE_UUID", "13fc9b4a-49ed
 # The order/report concept. The demo dictionary has no CXR procedure, so the ETL provisions one
 # (bootstrap_radiology_concept.py) and points this at it. No default: a wrong concept 500s fhir2.
 ORDER_CONCEPT_UUID = os.environ.get("MIMIC_ORDER_CONCEPT_UUID", "")
+
+# Referring-physician seeding (#76 build item 1). The login the demo physician signs in with at the
+# ack surface (#86) needs a password that clears the OpenMRS default policy (>=8, upper+lower+digit);
+# this DEMO default is overridable per deployment and is never a real secret. Roles gate what that
+# login can do -- "Provider" by default; override to a role that grants patient-chart view on a given
+# image if the notification must be visible to the physician after login.
+REFERRER_PASSWORD = os.environ.get("MIMIC_REFERRER_PASSWORD", "Referring1!")
+REFERRER_ROLES = [r.strip() for r in os.environ.get("MIMIC_REFERRER_ROLES", "Provider").split(",")
+                  if r.strip()]
 
 _URGENCY = {"routine": "ROUTINE", "stat": "STAT", "urgent": "STAT", "asap": "STAT"}
 
@@ -79,6 +91,7 @@ class OmrsClient:
         self._http = httpx.Client(auth=self.cfg.basic, timeout=60.0)
         self._conn = None
         self._provider_uuid = admin_provider_uuid
+        self._referrers: dict[str, str] = {}  # username -> provider uuid (per-instance seed cache, #76)
 
     # --- transports ---------------------------------------------------------
     def _fget(self, path, params=None):
@@ -114,6 +127,73 @@ class OmrsClient:
         if not self._provider_uuid:
             self._provider_uuid = self._rget("provider", {"v": "custom:(uuid)", "limit": 1})["results"][0]["uuid"]
         return self._provider_uuid
+
+    # --- referring-physician seeding (#76 build item 1) ----------------------
+    def _find_provider_by_identifier(self, identifier: str) -> tuple[Optional[str], Optional[str]]:
+        """(provider uuid, its person uuid) for the Provider whose identifier == `identifier`, or
+        (None, None). The identifier is the stable idempotency key: get-or-create keys on it, not on
+        a name, so a re-run reuses the same Provider (and thus the same fhir2 requester reference)."""
+        res = self._rget("provider", {"q": identifier, "v": "custom:(uuid,identifier,person:(uuid))"})
+        for p in res.get("results", []):
+            if p.get("identifier") == identifier:
+                return p.get("uuid"), (p.get("person") or {}).get("uuid")
+        return None, None
+
+    def _ensure_referrer_user(self, username: str, person_uuid: str, password: Optional[str]) -> None:
+        """Best-effort get-or-create of the login User on the referrer's Person, so the physician can
+        sign into OpenMRS and acknowledge (#86). BEST-EFFORT by design: a User-creation failure (a
+        role/privilege quirk on a given image, a stricter password policy) must NOT cost the requester
+        seeding -- the Provider already exists and the order will still carry a real requester, only
+        the in-EHR login degrades. The failure is logged, never raised."""
+        try:
+            res = self._rget("user", {"q": username, "v": "custom:(uuid,username)"})
+            if any(u.get("username") == username for u in res.get("results", [])):
+                return
+            self._rpost("user", {"username": username, "password": password or REFERRER_PASSWORD,
+                                 "person": person_uuid, "roles": REFERRER_ROLES})
+            _log.info("referring-physician login %s provisioned", username)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("referring-physician login %s NOT provisioned (%s); the order still carries "
+                         "a real requester, only in-EHR login/ack for this physician degrades",
+                         username, e)
+
+    def ensure_referring_provider(self, username: str, given: str, family: str,
+                                  gender: str = "U", password: Optional[str] = None) -> str:
+        """Get-or-create the OpenMRS Provider (and a login User) for a demo referring physician, and
+        return its uuid -- the value `insert_radiology_order` stamps as the order's `orderer`, which
+        fhir2 surfaces as `ServiceRequest.requester` and `resolve_ordering_provider` reads verbatim
+        (#76 build item 1). Idempotent by `username` (the Provider identifier and the User's username
+        are the stable keys), so a re-run of the ETL (#68) reuses the same Provider rather than
+        duplicating it. Cached per client instance so a cohort's many studies seed each referrer once.
+
+        Note on alignment (#76): the referrer is NOT written into the comms ledger. The ledger holds
+        the on-call directory (docker/comms-ledger/seed_oncall.py); the ordering physician's reference
+        is carried VERBATIM from fhir2 onto Communication.recipient / Task.owner, so a Provider in
+        fhir2 is all resolve_ordering_provider needs -- no second write to keep in sync."""
+        username = username.strip()
+        if not username:
+            raise ValueError("ensure_referring_provider needs a username")
+        if username in self._referrers:
+            return self._referrers[username]
+
+        prov_uuid, person_uuid = self._find_provider_by_identifier(username)
+        if not prov_uuid:
+            # ONE atomic write: the Person is inlined on the Provider create (same pattern as
+            # create_patient), so a failure here leaves NO orphan Person -- there is no window
+            # between a person POST and a provider POST for a crash to strand a person on.
+            created = self._rpost("provider", {
+                "person": {"names": [{"givenName": given, "familyName": family}],
+                           "gender": (gender or "U")[:1].upper()},
+                "identifier": username,
+            })
+            prov_uuid = created["uuid"]
+            person_uuid = (created.get("person") or {}).get("uuid")
+            if not person_uuid:  # some representations omit the nested uuid; recover it for the login
+                _, person_uuid = self._find_provider_by_identifier(username)
+        if person_uuid:
+            self._ensure_referrer_user(username, person_uuid, password)
+        self._referrers[username] = prov_uuid
+        return prov_uuid
 
     # --- creates ------------------------------------------------------------
     def _generate_openmrs_id(self) -> str:
@@ -158,21 +238,43 @@ class OmrsClient:
     def insert_radiology_order(self, patient_uuid: str, encounter_uuid: str, accession: str,
                                concept_uuid: str, priority: str = "routine",
                                order_number: Optional[str] = None,
-                               reason_concept_uuid: Optional[str] = None) -> str:
+                               reason_concept_uuid: Optional[str] = None,
+                               orderer_provider_uuid: Optional[str] = None) -> str:
         """Insert the three rows that make a RadiologyOrder (orders + test_order + radiology_order),
         the path proven in the #70 E2E. Returns the order uuid == the fhir2 ServiceRequest id the
         signed report's basedOn must point at. Idempotent by accession: returns the existing order.
 
         `reason_concept_uuid` (#68 gap 4) sets orders.order_reason to an ICD-10-mapped Concept
         (ensure_order_reason). The #81 resolver reads that Concept's ICD-10 mappings into
-        StudyContext order.reasonCode, which fires the pneumothorax-detect reason-code slice."""
+        StudyContext order.reasonCode, which fires the pneumothorax-detect reason-code slice.
+
+        `orderer_provider_uuid` (#76 build item 1) sets orders.orderer to a specific referring
+        physician's Provider; fhir2 then surfaces it as ServiceRequest.requester and the critical-
+        result notification reaches that physician. Defaults to the ETL admin provider (unchanged
+        pre-#76 behaviour) when None. On an EXISTING order the orderer is backfilled (see below) so a
+        re-run repairs a study that was first loaded with the admin orderer -- pre-#76, seed-disabled,
+        or after a swallowed best-effort seed failure -- keeping the #68 re-runnability guarantee for
+        the requester, not just the fresh-insert path."""
         db = self._db()
         with db.cursor() as c:
-            c.execute("select o.uuid from orders o join radiology_order r on r.order_id=o.order_id "
+            c.execute("select o.uuid, o.orderer, o.order_id from orders o "
+                      "join radiology_order r on r.order_id=o.order_id "
                       "where o.accession_number=%s and o.voided=0 limit 1", (accession,))
             row = c.fetchone()
-            if row:
-                return row[0]
+        if row:
+            existing_uuid, existing_orderer, existing_oid = row
+            # Re-run repair: if a real referring-physician orderer is now supplied and the stored
+            # order still carries a different one (an admin orderer from an earlier load), UPDATE just
+            # the orderer in place. Idempotency-by-accession otherwise stands -- nothing else about the
+            # existing order is touched, and a matching orderer is a no-op.
+            if orderer_provider_uuid:
+                want = self._id_by_uuid("provider", "provider_id", orderer_provider_uuid)
+                if want and want != existing_orderer:
+                    with db.cursor() as u:
+                        u.execute("update orders set orderer=%s where order_id=%s", (want, existing_oid))
+                    _log.info("order %s orderer backfilled to provider %s on re-run",
+                              existing_uuid, orderer_provider_uuid)
+            return existing_uuid
         # NB: the `patient` table has no uuid column -- a Patient IS-A Person and the uuid lives on
         # `person`, where person_id == patient_id.
         pid = self._id_by_uuid("person", "person_id", patient_uuid)
@@ -180,7 +282,7 @@ class OmrsClient:
         cid = self._id_by_uuid("concept", "concept_id", concept_uuid)
         otid = self._id_by_uuid("order_type", "order_type_id", RADIOLOGY_ORDER_TYPE_UUID)
         csid = self._id_by_uuid("care_setting", "care_setting_id", RADIOLOGY_CARE_SETTING_UUID)
-        prov = self._id_by_uuid("provider", "provider_id", self.provider_uuid())
+        prov = self._id_by_uuid("provider", "provider_id", orderer_provider_uuid or self.provider_uuid())
         missing = [n for n, v in [("patient", pid), ("encounter", eid), ("concept", cid),
                                   ("order_type", otid), ("care_setting", csid), ("provider", prov)] if not v]
         if missing:
