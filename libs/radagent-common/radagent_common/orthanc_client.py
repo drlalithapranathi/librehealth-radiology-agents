@@ -57,12 +57,6 @@ class InsecureWriteTransportError(RuntimeError):
     """
 
 
-class EvidenceCaptureDisabled(RuntimeError):
-    """Held behind ORTHANC_PRESIGN_WRITE_ENABLED. The env var defaults False, so the write path is
-    inert on first boot even for callers that would otherwise fire it. Flipped to True only after
-    the PI/lead sign-off documented in docs/dicom-evidence-writeback.md."""
-
-
 _log = logging.getLogger(__name__)
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -77,7 +71,7 @@ def _write_transport_is_secure(base_url: str) -> bool:
     """Is it safe to send an Orthanc WRITE to this base URL? Mirrors fhir2 (#30)."""
     if not _is_plaintext_remote(base_url):
         return True
-    return os.environ.get("ORTHANC_ALLOW_INSECURE_WRITE", "").strip() in {"1", "true", "TRUE", "yes"}
+    return os.environ.get("ORTHANC_ALLOW_INSECURE_WRITE", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _guard_write_transport(base_url: str) -> None:
@@ -104,7 +98,7 @@ def _evidence_capture_enabled() -> bool:
     Kept as an env var rather than a config file so a deployment can flip it without a rebuild,
     and so a test can flip it in-process without patching config-loading code paths.
     """
-    return os.environ.get("ORTHANC_PRESIGN_WRITE_ENABLED", "").strip() in {"1", "true", "TRUE", "yes"}
+    return os.environ.get("ORTHANC_PRESIGN_WRITE_ENABLED", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _deterministic_uid(*parts: str) -> str:
@@ -403,6 +397,12 @@ def _build_evidence_capture_dcm(
     ds.SOPClassUID = SecondaryCaptureImageStorage
     ds.SOPInstanceUID = new_sop_instance_uid
 
+    # UTF-8 default so non-ASCII patient names (e.g., diacritics, non-Latin scripts) round-trip
+    # through DICOM readers correctly. Without this tag, readers default to ISO_IR 6 (7-bit ASCII)
+    # and can garble characters on read-back. ISO_IR 192 is the ISO-registered name for UTF-8 in
+    # DICOM (PS3.3 Table C.12-2). Round-2 restoration of !73 review item 4b.
+    ds.SpecificCharacterSet = "ISO_IR 192"
+
     # ---- Patient (copied from the target instance) -------------------------
     # PHI: identifiers copied from the source study so the SC joins the same patient. Copy
     # exactly what the source has; do not derive or invent.
@@ -466,13 +466,35 @@ def _build_evidence_capture_dcm(
     return buf, new_sop_instance_uid
 
 
+# DICOM VR "LO" (Long String) is limited to 64 characters. Strict validators reject longer
+# values outright; lenient ones truncate silently. Clamp explicitly so a long label degrades
+# predictably rather than corrupting the SeriesDescription tag. Round-2 restoration of !73
+# review item 4a.
+_SERIES_DESCRIPTION_MAX_LEN = 64
+
+
 def _series_description_with_label(label: str, confidence: Optional[float]) -> str:
     """Format the SeriesDescription so a radiologist scanning the OHIF study panel sees the
-    authorship stamp AND the finding, without having to open the series to inspect the pixels."""
+    authorship stamp AND the finding, without having to open the series to inspect the pixels.
+    Clamped to DICOM VR-LO's 64-character limit; the authorship prefix always stays visible
+    (it's the readback safety anchor), and the label tail is truncated with an ellipsis when
+    the whole string would overflow."""
     core = AI_EVIDENCE_SERIES_DESCRIPTION
     if confidence is not None:
-        return f"{core}: {label} p={confidence:.2f}"
-    return f"{core}: {label}"
+        full = f"{core}: {label} p={confidence:.2f}"
+    else:
+        full = f"{core}: {label}"
+    if len(full) <= _SERIES_DESCRIPTION_MAX_LEN:
+        return full
+    # Truncate label, keep authorship prefix + confidence tail (if any) intact.
+    if confidence is not None:
+        tail = f" p={confidence:.2f}"
+        head = f"{core}: "
+        available = _SERIES_DESCRIPTION_MAX_LEN - len(head) - len(tail) - 1  # 1 for ellipsis
+        return f"{head}{label[:max(available, 0)]}…{tail}"
+    head = f"{core}: "
+    available = _SERIES_DESCRIPTION_MAX_LEN - len(head) - 1
+    return f"{head}{label[:max(available, 0)]}…"
 
 
 def _image_comment_with_label(label: str, tool_id: str, confidence: Optional[float]) -> str:

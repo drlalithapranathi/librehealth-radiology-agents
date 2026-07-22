@@ -18,6 +18,16 @@ levels of reality, and the level is visible in the output rather than implied:
 A tool that cannot run degrades to STUBBED (or ERROR) and NEVER invents a negative: "nothing found"
 from a tool that never looked is the automation-bias trap the #26 COMPLETE-gate exists to prevent.
 
+DICOM evidence capture (#59, item 2 of the "Then" list). After the tool loop completes, every
+COMPLETE finding whose evidenceRef starts with "orthanc:instance/" gets handed to
+`radagent_common.orthanc_client.write_ai_evidence_capture`, which writes a DICOM Secondary Capture
+into Orthanc so OHIF picks it up as an AI evidence series alongside the source imaging. Held behind
+the same feature-flag killswitch (ORTHANC_PRESIGN_WRITE_ENABLED, default False) that the write path
+itself uses, so the wiring is inert on any deployment that hasn't opted in after the PI/lead
+sign-off. Best-effort: any failure (Orthanc down, instance not found, disabled) logs and continues;
+the human read is the safety net, and a failed evidence-capture write must never strand it. See
+`docs/dicom-evidence-writeback.md`.
+
 Input  : { studyContext }
 Output : contracts/skills/interpretation.schema.json
 """
@@ -279,6 +289,87 @@ async def _pixel_finding(tool_id: str, ctx: dict) -> Optional[dict]:
         }
 
 
+# -----------------------------------------------------------------------------
+# DICOM evidence capture wiring (#59 item 2)
+# -----------------------------------------------------------------------------
+
+# Prefix contract with the pixel-tool producer (#71): a COMPLETE finding from a pixel tool emits
+# an evidenceRef starting with this exact string, and the substring after it is Orthanc's INTERNAL
+# instance id (not the DICOM SOPInstanceUID -- the pixel walk uses Orthanc's own ids). If this
+# prefix ever rotates, the wiring stops matching and the SC write silently no-ops -- safe default,
+# but _tool_version's check uses the same string, so they must rotate together.
+_ORTHANC_INSTANCE_PREFIX = "orthanc:instance/"
+
+
+async def _maybe_write_evidence_capture(finding: dict, orthanc_study_id: str, client) -> None:
+    """When a tool emits COMPLETE with an ``orthanc:instance/<id>`` evidenceRef, write an
+    authorship-stamped Secondary Capture into Orthanc so OHIF picks it up as an AI evidence series
+    alongside the source imaging (#59, item 2 of the "Then" list).
+
+    Best-effort by contract: any failure -- disabled by the deployment flag, target not found,
+    Orthanc down, DICOM build error -- logs and returns. The pre-sign impression text (#26 fhir2
+    write) still carries the finding. The human read is the safety net. A failed evidence-capture
+    write must never strand it.
+
+    Held behind two gates by the write client itself (see radagent_common.orthanc_client and
+    docs/dicom-evidence-writeback.md): the ORTHANC_PRESIGN_WRITE_ENABLED deployment flag and the
+    plaintext-transport refusal. This helper adds the caller-level guards on top: a status gate
+    (only COMPLETE findings) and an evidenceRef-shape gate (only "orthanc:instance/" refs). A
+    finding that fails either of the caller-level guards is skipped silently -- STUBBED / ERROR /
+    referral-rule findings are not evidence-capture-eligible.
+    """
+    if finding.get("status") != "COMPLETE":
+        return
+    ev = finding.get("evidenceRef") or ""
+    if not ev.startswith(_ORTHANC_INSTANCE_PREFIX):
+        return
+    orthanc_instance_id = ev[len(_ORTHANC_INSTANCE_PREFIX):]
+    if not orthanc_instance_id or not orthanc_study_id:
+        return
+
+    # The write client wants the DICOM SOPInstanceUID (which it stamps into the SC's
+    # SourceImageSequence); the pixel producer gave us Orthanc's internal instance id. Resolve
+    # via /simplified-tags on the same client.
+    try:
+        tags = await client.get_instance_tags(orthanc_instance_id)
+    except Exception as e:  # noqa: BLE001 -- best-effort, outage or 404 both land here
+        log.warning(
+            "evidence-capture skip for %s: could not read tags for instance %s: %s",
+            finding.get("toolId"), orthanc_instance_id, e,
+        )
+        return
+    sop_instance_uid = tags.get("SOPInstanceUID")
+    if not sop_instance_uid:
+        log.warning(
+            "evidence-capture skip for %s: instance %s has no SOPInstanceUID tag",
+            finding.get("toolId"), orthanc_instance_id,
+        )
+        return
+
+    try:
+        new_sc_uid = await client.write_ai_evidence_capture(
+            target_sop_instance_uid=sop_instance_uid,
+            orthanc_study_id=orthanc_study_id,
+            tool_id=finding.get("toolId") or "unknown",
+            label=finding.get("label") or "",
+            confidence=finding.get("confidence"),
+        )
+    except Exception as e:  # noqa: BLE001 -- best-effort, including the transport refusal re-raise
+        log.warning(
+            "evidence-capture write raised for %s (target %s): %s",
+            finding.get("toolId"), sop_instance_uid, e,
+        )
+        return
+
+    if new_sc_uid:
+        log.info(
+            "evidence-capture wrote SC %s for %s (target %s)",
+            new_sc_uid, finding.get("toolId"), sop_instance_uid,
+        )
+    # new_sc_uid is None when the write no-op'd (flag off, target missing, best-effort failure).
+    # Silence intentional -- the write client already logged the specific reason.
+
+
 async def handle(skill_id: str, payload: dict) -> dict:
     if skill_id != "interpretation.runTools":
         raise ValueError(f"unexpected skill {skill_id}")
@@ -298,6 +389,21 @@ async def handle(skill_id: str, payload: dict) -> dict:
         findings.append(real or {
             "toolId": tool, "label": "", "confidence": None, "evidenceRef": None, "status": "STUBBED",
         })
+
+    # #59 item 2: for each COMPLETE finding whose evidenceRef names an Orthanc instance, write an
+    # authorship-stamped DICOM Secondary Capture into that study. Best-effort per finding: one
+    # failure never stops the next. Held behind ORTHANC_PRESIGN_WRITE_ENABLED on the write client
+    # (default False), so this is inert on any deployment that hasn't opted in.
+    #
+    # The OrthancClient-is-None branch matters when the [imaging] extra is not installed (agent-tests
+    # CI lane, dev-stack without pydicom). In that case the pixel tools already stayed STUBBED and
+    # nothing would have produced an "orthanc:instance/" evidenceRef anyway -- so skipping the whole
+    # write block is correct AND avoids an AttributeError on the None module-level import.
+    orthanc_study_id = ctx.get("study", {}).get("orthancStudyId") or ""
+    if orthanc_study_id and OrthancClient is not None:
+        orthanc = OrthancClient()
+        for f in findings:
+            await _maybe_write_evidence_capture(f, orthanc_study_id, orthanc)
 
     tools_selected = [
         {"toolId": f["toolId"], "version": _tool_version(f), "status": f["status"]}

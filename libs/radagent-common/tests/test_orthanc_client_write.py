@@ -19,7 +19,6 @@ import pytest
 
 from radagent_common.orthanc_client import (
     AI_EVIDENCE_SERIES_DESCRIPTION,
-    EvidenceCaptureDisabled,
     InsecureWriteTransportError,
     OrthancClient,
     _build_evidence_capture_dcm,

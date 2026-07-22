@@ -20,9 +20,15 @@ into the study so OHIF picks it up when the radiologist opens the
 viewer.
 
 This MR opens the write capability. It does not turn the write on. The
-capability is held behind three deployment-level gates (see below), and
-no caller wires it yet — the first caller will be the pneumothorax
-classifier (#68) or a follow-up MR once #68 lands.
+capability is held behind three deployment-level gates (see below).
+
+The caller lives in `agents/interpretation-assistant/handler.py`: after
+the tool loop runs, each COMPLETE finding whose evidenceRef begins
+`"orthanc:instance/"` is fed to `_maybe_write_evidence_capture`, which
+resolves the SOPInstanceUID via Orthanc's `/simplified-tags` and calls
+`write_ai_evidence_capture`. Details in "How it is wired" below. The
+wiring is inert on any deployment where `ORTHANC_PRESIGN_WRITE_ENABLED`
+is unset, which is the default.
 
 ## Identity of the object we write
 
@@ -107,12 +113,10 @@ We keep the contract as-is. Two reasons:
 
 The MR description flags this diff so reviewers can push back.
 
-## Guard conditions
+## Deployment controls
 
-The write is inert until every guard passes. This mirrors the #26 fhir2
-write path — the same three-gate pattern (feature flag, transport
-guard, authorship stamp) that gates writing a preliminary
-DiagnosticReport into the RIS before a radiologist reads:
+**Two** things this write client itself enforces at runtime, honestly
+named. Both must pass, or the write no-ops:
 
 1. **`ORTHANC_PRESIGN_WRITE_ENABLED`** deployment feature flag,
    default False. Flipped to `1` / `true` only after PI/lead sign-off.
@@ -124,24 +128,97 @@ DiagnosticReport into the RIS before a radiologist reads:
    network. Mirrors `FHIR2_ALLOW_INSECURE_WRITE` from #30 / MR !57 —
    same environment-variable semantics, same audit-log warning on
    proceed under opt-in.
-3. **Authorship stamp** via SeriesDescription + our own UID root. An
-   idempotent re-run of the write derives the same SOPInstanceUID for
-   the same `(study, target, tool)` tuple, so Orthanc de-duplicates on
-   ingest and we never accidentally accumulate duplicate captures.
-   Never touches an object we did not author.
 
-Beyond these three, the write is **best-effort**: any failure returns
+Beyond these two, the write is **best-effort**: any failure returns
 `None` and logs a warning. The pre-sign impression text (the #26 fhir2
 write) carries the finding regardless. The radiologist's own read is
 the safety net. A failed evidence-capture write must never strand the
 human read.
 
-The **COMPLETE gate** on the tool's finding is the caller's
-responsibility — same shape as the fhir2 write, where
-`workflow._presign_impression` checks `_has_complete_finding()` before
-invoking. When the caller wires (follow-up MR), it walks the findings
-and calls the write only for `status="COMPLETE"` entries whose
-`evidenceRef` is a resolvable SOPInstanceUID.
+## Idempotency property (not a gate, a property)
+
+The **authorship stamp** — SeriesDescription + our own UID root — is a
+property of what we write, not a gate that prevents writes. An
+idempotent re-run of the write derives the same SOPInstanceUID for the
+same `(study, target, tool)` tuple, so Orthanc de-duplicates on
+ingest and we never accidentally accumulate duplicate captures.
+Never touches an object we did not author. This is safety on the
+receiving side (Orthanc), not on the sending side (this client).
+
+## What we do not enforce
+
+The write client does not check any of these. Callers must handle them:
+
+- **A caller-level COMPLETE gate.** `write_ai_evidence_capture` does
+  not check the finding's status. It writes whatever the caller passes
+  in as `(target_sop_instance_uid, orthanc_study_id, tool_id, label,
+  confidence)`. Enforcing a `status == "COMPLETE"` precondition is the
+  caller's responsibility, mirroring how `workflow._presign_impression`
+  enforces the same precondition on the fhir2 side.
+
+  The **COMPLETE gate** on the tool's finding is the caller's
+  responsibility — same shape as the fhir2 write, where
+  `workflow._presign_impression` checks `_has_complete_finding()` before
+  invoking. The interpretation-assistant caller
+  (`_maybe_write_evidence_capture` in `handler.py`) enforces this: it
+  skips silently on any finding whose `status` is not `"COMPLETE"` and on
+  any `evidenceRef` that does not begin `"orthanc:instance/"`.
+
+- **The identity of the target SOPInstance.** The caller must pass a
+  UID that actually exists in the study being written to. A wrong UID
+  produces an SC that references a phantom source instance — the write
+  succeeds but the DICOM is misleading. Callers with only a display-set
+  or study id should resolve the SOPInstanceUID before calling.
+
+## Coordination note (`_get_bytes` auth)
+
+`OrthancClient._get_bytes` — the read-path helper that fetches raw
+instance bytes for the pixel classifier — takes the same
+`self._auth` credential that the write path uses. This is a shared-code
+touchpoint between the read path (#68's pixel classifier) and the
+write path (#59's evidence capture). Whichever of !73 or !68 rebased
+second was responsible for verifying `_get_bytes` uses
+`auth=self._auth`; that check is landed on merged main
+(`libs/radagent-common/radagent_common/orthanc_client.py`,
+`_get_bytes` line ~185). Any future MR that touches read/write auth
+must preserve this coordination.
+
+## How it is wired
+
+`agents/interpretation-assistant/handler.py` owns the caller. After
+its tool loop populates `findings`, it walks the list and passes each
+one to `_maybe_write_evidence_capture(finding, orthanc_study_id, client)`
+along with a shared `OrthancClient` instance. The helper applies two
+caller-side guards:
+
+1. **Status gate.** Skip unless `finding["status"] == "COMPLETE"`.
+   STUBBED / ERROR / referral-rule findings are not
+   evidence-capture-eligible.
+2. **evidenceRef-shape gate.** Skip unless the string begins
+   `"orthanc:instance/"`. Anything else — a `"order.reasonCode=..."`
+   referral locator, a null, or a differently-shaped ref — is skipped
+   silently. This is a contract with #68's `_pneumothorax_finding`,
+   which emits exactly this prefix.
+
+If both gates pass, the helper resolves the DICOM SOPInstanceUID from
+Orthanc's internal instance id via `get_instance_tags`, then calls
+`write_ai_evidence_capture` with the resolved UID + `orthanc_study_id`
+from ctx + tool_id / label / confidence from the finding.
+
+Best-effort at every step: a tag-resolve failure logs and returns; a
+write failure (including a re-raised `InsecureWriteTransportError`
+from a misconfigured transport) is caught and logged; one finding's
+failure never blocks the next. The `handle()` output is unchanged
+whether the write fired or not — the SC lands in Orthanc as a side
+effect, and OHIF picks it up when the radiologist opens the study.
+
+Wiring itself has a third guard: when the interpretation-assistant is
+built without the `[imaging]` extra (agent-tests CI lane), the
+module-level `OrthancClient` import degrades to `None`. The wiring
+block short-circuits on `OrthancClient is not None`, so the whole
+block is skipped in extras-less lanes — which is correct, because
+pixel tools stay STUBBED in those lanes and nothing would have
+produced an `orthanc:instance/` evidenceRef anyway.
 
 ## API shape
 
@@ -195,9 +272,10 @@ sign-off block. Until then, the capability is present but inert.
 1. **PI + lead sign-off on the class of change** — writing
    AI-authored DICOM into the archive pre-read. Same review shape as
    the fhir2 write (#26 → #30 → !57).
-2. **A caller exists.** Nothing calls the write today. When #68 lands
-   with its pneumothorax classifier, it (or a companion MR) wires the
-   caller.
+2. **A caller exists.** ✅ Landed in
+   `agents/interpretation-assistant/handler.py` — walks COMPLETE
+   findings after the tool loop and calls the write for each finding
+   whose evidenceRef starts with `"orthanc:instance/"`.
 3. **Transport is TLS in production** — same criterion as the fhir2
    write in #30. The transport guard enforces this.
 4. **Live E2E on a past-setup Orthanc + OHIF stack** — walk a real
