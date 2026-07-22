@@ -175,6 +175,9 @@ ris-poller-tests:
     # are the ONLY tests that exercise the real get_study_description, and without them CI would
     # stay green if the method were deleted. (Needs no extra deps: httpx is a core dep and the
     # file drives async via asyncio.run, not pytest-asyncio.)
+    # [imaging] too (#71): test_imaging.py pins the DICOM decode guards (MONOCHROME1 inversion,
+    # rescale, malformed-DS, NotAnImage) that every pixel read rides on. Without the extra the
+    # module importorskips pydicom and CI goes green on exactly the mutations it exists to catch.
     - pip install -e "libs/radagent-common[a2a,otel,imaging]" "temporalio==1.29.0" fastapi pytest
     - >
       python -m pytest
@@ -188,6 +191,7 @@ ris-poller-tests:
       libs/radagent-common/tests/test_comms_ledger.py
       libs/radagent-common/tests/test_orthanc_client.py
       libs/radagent-common/tests/test_orthanc_client_write.py
+      libs/radagent-common/tests/test_imaging.py
       libs/radagent-common/tests/test_tracing.py
       libs/radagent-common/tests/test_presign_concept_drift.py
       orchestrator/tests -q

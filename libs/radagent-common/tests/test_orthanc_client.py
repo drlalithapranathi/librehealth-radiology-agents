@@ -154,3 +154,79 @@ def test_get_study_description_strips_padding():
     # keyword match and is not a description.
     client, _ = _client_returning({"MainDicomTags": {"StudyDescription": "  CHEST AP  "}})
     assert asyncio.run(client.get_study_description("s1")) == "CHEST AP"
+
+
+# --- pixel path (#27/#71): the first real read of image DATA, not just metadata ----------------
+
+def _fake_orthanc(client: OrthancClient, tree: dict) -> list[str]:
+    """Stand in for Orthanc's study -> series -> instance walk. Records the paths fetched so a test
+    can assert the client made the walk rather than guessing ids."""
+    seen: list[str] = []
+
+    async def fake_get(path, params=None):
+        seen.append(path)
+        return tree[path]
+
+    client._get = fake_get  # type: ignore[assignment]
+    return seen
+
+
+def test_list_study_instances_orders_by_series_then_instance_number():
+    """A CXR tool scores "the first instance". If the order is whatever Orthanc happened to return,
+    a two-view study is a coin flip and the demo may silently score the LATERAL. Order is by
+    SeriesNumber then InstanceNumber, so the pick is reproducible.
+
+    The fixture deliberately returns everything backwards.
+    """
+    client = OrthancClient(base_url="http://orthanc:8042")
+    seen = _fake_orthanc(client, {
+        "studies/s1": {"Series": ["ser-B", "ser-A"]},                      # series out of order
+        "series/ser-A": {"MainDicomTags": {"SeriesNumber": "1"}, "Instances": ["i2", "i1"]},
+        "series/ser-B": {"MainDicomTags": {"SeriesNumber": "2"}, "Instances": ["i3"]},
+        "instances/i1": {"MainDicomTags": {"InstanceNumber": "1"}},        # instances out of order
+        "instances/i2": {"MainDicomTags": {"InstanceNumber": "2"}},
+        "instances/i3": {"MainDicomTags": {"InstanceNumber": "1"}},
+    })
+    out = asyncio.run(client.list_study_instances("s1"))
+    assert out == ["i1", "i2", "i3"], "instances must come back in (series, instance) order"
+    # and the ids came from a REAL study -> series -> instance walk, not from guessing
+    assert "studies/s1" in seen and {"series/ser-A", "series/ser-B"} <= set(seen)
+    assert {"instances/i1", "instances/i2", "instances/i3"} <= set(seen)
+
+
+def test_untagged_series_sorts_last_rather_than_winning_the_first_instance_pick():
+    """An untagged SeriesNumber must NOT sort as 0 and steal the first-instance slot from a real
+    series 1. Mutation: make _as_int return 0 on failure and this test fails."""
+    client = OrthancClient(base_url="http://orthanc:8042")
+    _fake_orthanc(client, {
+        "studies/s1": {"Series": ["ser-untagged", "ser-1"]},
+        "series/ser-untagged": {"MainDicomTags": {}, "Instances": ["ix"]},          # no SeriesNumber
+        "series/ser-1": {"MainDicomTags": {"SeriesNumber": "1"}, "Instances": ["i1"]},
+        "instances/ix": {"MainDicomTags": {}},
+        "instances/i1": {"MainDicomTags": {"InstanceNumber": "1"}},
+    })
+    out = asyncio.run(client.list_study_instances("s1"))
+    assert out[0] == "i1", "the tagged series 1 must win the first slot, not the untagged one"
+
+
+def test_list_study_instances_on_a_study_with_no_series_is_empty_not_an_error():
+    client = OrthancClient(base_url="http://orthanc:8042")
+    _fake_orthanc(client, {"studies/empty": {}})
+    assert asyncio.run(client.list_study_instances("empty")) == []
+
+
+def test_get_instance_dicom_fetches_the_raw_file_not_the_preview_png():
+    """/file is the Part-10 original. /preview is 8-bit and pre-windowed -- a model fed that is
+    scoring a picture of the image, not the image."""
+    client = OrthancClient(base_url="http://orthanc:8042")
+    grabbed: list[str] = []
+
+    async def fake_get_bytes(path):
+        grabbed.append(path)
+        return b"DICM-bytes"
+
+    client._get_bytes = fake_get_bytes  # type: ignore[assignment]
+    out = asyncio.run(client.get_instance_dicom("inst-9"))
+    assert out == b"DICM-bytes"
+    assert grabbed == ["instances/inst-9/file"]
+    assert "preview" not in grabbed[0]

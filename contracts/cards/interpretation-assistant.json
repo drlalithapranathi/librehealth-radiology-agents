@@ -1,6 +1,6 @@
 {
   "name": "Interpretation Assistant Agent",
-  "description": "Selects and runs AI/CAD tools for a study (stubbed in v1) and surfaces findings with evidence references.",
+  "description": "Selects and runs AI/CAD tools for a study and surfaces findings with evidence references; each finding reports its level of reality (pixel model, referral-reason rule, or stub).",
   "url": "http://interpretation-assistant:8103/",
   "version": "0.1.0",
   "capabilities": { "streaming": true, "pushNotifications": true },
@@ -10,7 +10,7 @@
     {
       "id": "interpretation.runTools",
       "name": "Run interpretation tools",
-      "description": "Selects tools by study type, runs them (STUBBED v1), returns structured findings.",
+      "description": "Selects tools by study type, runs them (pneumothorax-detect is a real pixel model; the rest are referral-reason rules or stubs), returns structured findings.",
       "tags": ["ai", "cad", "interpretation", "registry"]
     }
   ]
