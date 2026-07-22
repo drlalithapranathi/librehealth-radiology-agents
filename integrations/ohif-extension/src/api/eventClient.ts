@@ -1,5 +1,5 @@
 /**
- * StudyOpenedEvent emitter — POSTs to the orchestrator's ingest surface when the
+ * StudyOpenedEvent emitter â€" POSTs to the orchestrator's ingest surface when the
  * radiologist opens a study. Wire shape matches `contracts/events/ohif-opened.schema.json`.
  *
  * BEST-EFFORT by design, same philosophy as `radagent_common.worklist_client.publish_priority`:
@@ -12,20 +12,20 @@
  * The orchestrator's `orthanc_webhook` ingest surface in `orchestrator/ingress.py` is
  * the model for the sibling endpoint we POST to; wiring that endpoint is flagged as
  * ~10 lines of follow-up in the R2 doc (`docs/ohif-integration-approach.md`).
- * Until it exists, this helper still runs cleanly — the fetch just gets a 404
+ * Until it exists, this helper still runs cleanly â€" the fetch just gets a 404
  * and we log at WARNING level, matching the "publish is visibility, not correctness"
  * pattern the orchestrator side already uses.
  */
 import type { StudyOpenedEvent } from '../types';
 
-/** Same-origin path — nginx routes /orchestrator-api/* to the orchestrator ingress. */
+/** Same-origin path â€" nginx routes /orchestrator-api/* to the orchestrator ingress. */
 export const EVENT_PATH = '/orchestrator-api/events/ohif-opened';
 
 export interface EmitOptions {
   radiologistId?: string;
   /** For tests; defaults to global fetch. */
   fetchImpl?: typeof fetch;
-  /** Same-origin path override — production deployments may proxy events differently. */
+  /** Same-origin path override â€" production deployments may proxy events differently. */
   url?: string;
   /** Short timeout: this call is on the study-open path; a slow ingest should
    *  not stall the viewer from loading. 5 s matches the Worklist API's own
@@ -93,8 +93,19 @@ export async function emitStudyOpenedEvent(
  * The route is `/viewer` per OHIF v3's default mode registration; if a deployer
  * changes routerBasename in `app-config.js`, this helper is the one place to
  * update.
+ *
+ * The optional accession rides in `?accession=<num>` so viewer-side panels can
+ * offer accession-parameterized deep links (e.g., ReportActionsPanel's link
+ * back to the RIS report authoring page, #73 item 2). OHIF ignores the extra
+ * param; it is picked up only by panels that read window.location.search.
  */
-export function buildViewerUrl(studyInstanceUID: string): string {
+export function buildViewerUrl(
+  studyInstanceUID: string,
+  accessionNumber?: string,
+): string {
   const params = new URLSearchParams({ StudyInstanceUIDs: studyInstanceUID });
+  if (accessionNumber) {
+    params.set('accession', accessionNumber);
+  }
   return `/viewer?${params.toString()}`;
 }

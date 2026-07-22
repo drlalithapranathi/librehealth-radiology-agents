@@ -406,3 +406,84 @@ Fixed at merge time:
 - A bad ref now FAILS the build instead of silently falling back.
 - Version bumps stay a one line change: point `OHIF_REF` at a new commit or
   any fetchable ref (tag or branch name both work).
+
+  
+## Post-M2 wiring (#73)
+
+Four click-path gaps closed. Each is inert or fallback-safe by default so the
+change is safe to merge before the demo host is fully turned on.
+
+### Item 1 — study-opened event sink
+
+The extension has been POSTing `ohif.study.opened` to
+`/orchestrator-api/events/ohif-opened` since M2 (see `eventClient.ts:22`), but
+until this MR neither the nginx proxy block nor the receiving endpoint
+existed. Both are wired now:
+
+- `docker/ohif/default.conf` uncommented the `/orchestrator-api/` block so the
+  extension's fetch reaches `http://ingress:8090/` on the compose network.
+- `orchestrator/ingress.py` gained `POST /events/ohif-opened` — schema-validates
+  against `contracts/events/ohif-opened.schema.json`, logs at INFO on the
+  `orchestrator.ingress.ohif` logger, returns 202. The acceptance criterion
+  is "visible in logs/store"; a first cut logs and defers store persistence
+  until a downstream consumer needs durable events.
+
+Best-effort by design end-to-end: producer returns `false` on any non-2xx and
+never blocks navigation; consumer accepts anything schema-valid and does
+nothing safety-critical with it.
+
+### Item 2 — viewer → RIS handoff
+
+A new right-side panel `ReportActionsPanel` renders a **"Report this study"**
+button that opens the RIS report authoring page in a new tab, accession-
+parameterized. The URL is built from a template constant that can be overridden
+per-deployment via a global on `window.LHRAD_RIS_REPORT_URL_TEMPLATE`
+(configured in the OHIF `app-config.js`) so a deployment can point at whichever
+UI its OpenMRS serves without a code deploy.
+
+Accession propagation: the WorkList row click passes both StudyInstanceUID
+and AccessionNumber to `buildViewerUrl`, which now emits
+`?StudyInstanceUIDs=<uid>&accession=<acc>`. The panel reads `?accession=`
+from `window.location.search` and substitutes it into the template.
+
+**Default URL template pending confirmation.** The default in the code is
+`/openmrs/owa/radiologyapp/index.html#/studies?accession={accession}` which
+follows the LibreHealth Radiology OWA convention documented at
+[forums.librehealth.io](https://forums.librehealth.io/t/project-implementing-reporting-workflow-for-radiology-as-an-open-web-app-and-integrating-voice-dictation-for-radiology/2343);
+however, the current dev-stack o3 image may serve reporting via a different
+route. A deployment overrides via the global; a code change swaps the default.
+See MR description for coordination.
+
+### Item 3 — PriorsPanel
+
+`PriorsPanel` is **unregistered from `getPanelModule`** in this MR. The
+component itself stays in the source tree; only the panel-module registration
+is removed. Rationale:
+
+- The panel fetches `/priors-api/context/<ref>` which has no proxy and no
+  backing service, so registering it produces an idle-empty right column that
+  reads as broken.
+- Backing it means adding a `/priors-api/context/<ref>` endpoint on
+  `worklist-api` (natural host, per the issue) that resolves a study reference
+  to a `PriorsPacket`. `fhir_client.list_prior_studies` and `list_active_problems`
+  already return the right shape, but the resolver-and-route work is out of
+  scope for closing #73 — the acceptance criterion is "either shows the current
+  study's priors or is absent; never idle-empty," and absent is the honest
+  answer today.
+- Follow-up: file a separate issue "Back PriorsPanel with a small resolver on
+  worklist-api" once priors data quality is confirmed for the demo cohort.
+  Bringing the panel back is a two-line change: re-add the import and the
+  panel-module entry.
+
+### Item 4 — CXR hanging
+
+New `cxrTwoViewHangingProtocol` in
+`integrations/ohif-extension/src/hangingProtocols/cxrTwoView.ts`. Matches CXR
+studies (Modality in `{CR, DX, CX}`) with 2+ series and lays PA and LAT
+side-by-side in a 2-column grid. Series assignment prefers `ViewPosition` tags
+and falls back to positional (first series → left, second → right) so the
+display is at least side-by-side even if the specific-side call is uncertain.
+
+Registered via a new `getHangingProtocolModule` on the extension. A
+single-view CXR (only PA) falls through to OHIF's default 1-up, which is
+correct for one view.

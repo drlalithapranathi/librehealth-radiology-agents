@@ -40,14 +40,14 @@ import {
 } from '../api/worklistClient';
 import { emitStudyOpenedEvent, buildViewerUrl } from '../api/eventClient';
 
-/** How often to re-fetch the worklist (ms). Fresh data matters — a new stat
+/** How often to re-fetch the worklist (ms). Fresh data matters â€" a new stat
  *  case may have landed while the radiologist was reading the previous study. */
 const REFRESH_MS = 30_000;
 
 export interface WorkListProps {
   /** Radiologist identity if available from OHIF's user context. Passed to the
    *  StudyOpenedEvent so the orchestrator can track who opened what.
-   *  M2 leaves this optional — dev stack has no auth yet. */
+   *  M2 leaves this optional â€" dev stack has no auth yet. */
   radiologistId?: string;
   /** Overridable for tests. */
   onOpenStudy?: (studyInstanceUID: string) => void;
@@ -100,16 +100,17 @@ export const WorkList: React.FC<WorkListProps> = ({
   }, [load]);
 
   const openStudy = useCallback(
-    (uid: string) => {
-      // Fire-and-forget event, then navigate. Never await — a slow event POST
+    (uid: string, accession: string) => {
+      // Fire-and-forget event, then navigate. Never await â€" a slow event POST
       // should not delay the viewer opening.
       void emitStudyOpenedEvent(uid, { radiologistId });
       if (onOpenStudy) {
         onOpenStudy(uid);
       } else {
         // Client-side navigation via react-router: single history entry,
-        // Back returns to /reading (see file header comment).
-        navigate(buildViewerUrl(uid));
+        // Back returns to /reading (see file header comment). Accession rides in the
+        // URL so ReportActionsPanel can build the RIS deep link (#73 item 2).
+        navigate(buildViewerUrl(uid, accession));
       }
     },
     [radiologistId, onOpenStudy, navigate],
@@ -180,17 +181,17 @@ export const WorkList: React.FC<WorkListProps> = ({
 
 const WorklistRow: React.FC<{
   item: WorklistItem;
-  onOpen: (uid: string) => void;
+  onOpen: (uid: string, accession: string) => void;
 }> = ({ item, onOpen }) => {
   return (
     <tr
       data-testid={`lhrad-row-${item.studyInstanceUID}`}
       data-priority-tier={item.priorityTier}
-      onClick={() => onOpen(item.studyInstanceUID)}
+      onClick={() => onOpen(item.studyInstanceUID, item.accessionNumber)}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
-          onOpen(item.studyInstanceUID);
+          onOpen(item.studyInstanceUID, item.accessionNumber);
         }
       }}
       tabIndex={0}
@@ -200,10 +201,10 @@ const WorklistRow: React.FC<{
         {item.priorityTier}
       </td>
       <td style={styles.td}>{item.priorityScore}</td>
-      <td style={styles.td}>{item.modality || '—'}</td>
-      <td style={styles.td}>{item.studyDescription || '—'}</td>
+      <td style={styles.td}>{item.modality || 'â€"'}</td>
+      <td style={styles.td}>{item.studyDescription || 'â€"'}</td>
       <td style={styles.td}>{formatDicomDate(item.studyDate)}</td>
-      <td style={styles.td}>{item.accessionNumber || '—'}</td>
+      <td style={styles.td}>{item.accessionNumber || 'â€"'}</td>
       <td style={styles.td}>
         {item.assignment?.radiologistId ?? <em style={styles.unassigned}>unassigned</em>}
       </td>
@@ -215,7 +216,7 @@ const WorklistRow: React.FC<{
 
 /** DICOM YYYYMMDD -> YYYY-MM-DD for readability. Non-8-char input passes through. */
 export function formatDicomDate(dicomDate: string): string {
-  if (!dicomDate || dicomDate.length !== 8) return dicomDate || '—';
+  if (!dicomDate || dicomDate.length !== 8) return dicomDate || 'â€"';
   return `${dicomDate.slice(0, 4)}-${dicomDate.slice(4, 6)}-${dicomDate.slice(6, 8)}`;
 }
 
@@ -228,7 +229,7 @@ export function formatGeneratedAt(iso: string): string {
 }
 
 // --- inline styles ----------------------------------------------------------
-// Inlined to avoid CSS-loader integration with OHIF's webpack — we're a single
+// Inlined to avoid CSS-loader integration with OHIF's webpack â€" we're a single
 // route with a small surface, and OHIF's webpack config is opinionated about
 // CSS-modules. Trading a lint concern for a build simplicity win.
 const styles: Record<string, React.CSSProperties> = {
