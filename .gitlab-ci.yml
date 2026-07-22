@@ -68,6 +68,24 @@ worklist-api-tests:
     - pip install -e libs/radagent-common pytest pytest-asyncio fastapi httpx
     - cd integrations/worklist-api && python -m pytest -q
 
+mimic-etl-tests:
+  # The MIMIC-CXR ETL tooling (scripts/mimic, #68/#76) ran in NO lane before this: agent-tests loops
+  # agents/*/, the ris-poller lane lists lib files explicitly, and nothing pointed at scripts/mimic.
+  # Same "a guard CI never runs is not a guard" rationale as the worklist-api lane -- the #76
+  # referring-physician orderer-seeding logic (referrers.assign + load_study wiring) and the existing
+  # manifest/curate/dicom-fixup guards had no CI until now.
+  #
+  # Slim deps: boto3 (fetch) and pymysql (omrs_client DB paths) are imported LAZILY inside functions,
+  # so collection + the pure-logic suite need only pydicom (dicom_fixup module + its test) and httpx
+  # (omrs_client import); numpy comes along for pydicom's dataset handling. Tests run from
+  # scripts/mimic because each file inserts that dir on sys.path to import the ETL modules by name.
+  extends: .default-rules
+  stage: test
+  image: python:3.11-slim
+  script:
+    - pip install pytest pydicom numpy httpx
+    - cd scripts/mimic && python -m pytest tests -q
+
 a2a-factory-import:
   # Issue #2 acceptance #3: the app extras install and radagent_common.a2a imports cleanly
   # against the pinned a2a-sdk. (agent-tests deliberately runs WITHOUT this extra to keep

@@ -7,6 +7,7 @@ sys.path.insert(0, str(HERE.parent))
 
 import manifest as M  # noqa: E402
 import fetch  # noqa: E402
+import referrers  # noqa: E402
 from dicom_fixup import PORTABLE_DESCRIPTION  # noqa: E402
 
 SAMPLE = str(HERE.parent / "sample_cohort.json")
@@ -52,9 +53,15 @@ class _FakeClient:
     def create_encounter(self, patient, when):
         self.calls.append(("encounter", patient)); return f"enc-{patient}"
 
+    def ensure_referring_provider(self, username, given, family, gender="U", password=None):
+        self.calls.append(("referrer", username)); return f"prov-{username}"
+
     def insert_radiology_order(self, patient, enc, accession, concept, priority="routine",
-                               reason_concept_uuid=None):
+                               reason_concept_uuid=None, orderer_provider_uuid=None):
+        # Order tuple kept 4-wide (existing assertions); the orderer is a separate record so a study
+        # loaded without referrer seeding still matches the unchanged order tuple.
         self.calls.append(("order", accession, priority, reason_concept_uuid))
+        self.calls.append(("order-orderer", accession, orderer_provider_uuid))
         return f"ord-{accession}"
 
     def ensure_order_reason(self, codes, display=""):
@@ -154,6 +161,62 @@ def test_med_failure_is_best_effort():
     assert r["order"] == "ord-s90000002" and r["report"] == "rep-x"
     assert r["ehr"]["meds"] == 0
     assert any("warfarin" in w for w in r.get("warnings", []))
+
+
+# --- referring-physician seeding (#76 build item 1) ----------------------
+def test_load_study_assigns_and_wires_a_real_orderer():
+    import load_cohort
+    studies = {x.study_id: x for x in M.load_manifest(SAMPLE)}
+    s = studies["s90000002"]
+    expected = referrers.assign(s.subject_id)["username"]
+    c = _FakeClient()
+    r = load_cohort.load_study(c, s, concept_uuid="concept-uuid")
+    # the study's ordering provider is seeded and its uuid reaches insert_radiology_order as orderer
+    assert r["referrer"] == expected
+    assert ("referrer", expected) in c.calls
+    assert ("order-orderer", "s90000002", f"prov-{expected}") in c.calls
+
+
+def test_two_studies_of_one_patient_share_one_ordering_physician():
+    # the clinically honest property: a patient followed by one referrer. Two studies with the SAME
+    # subject_id (the sample has none) must resolve to the same seeded orderer uuid on their orders.
+    import load_cohort
+    a = M.CohortStudy(study_id="s90000010", subject_id="19000010")
+    b = M.CohortStudy(study_id="s90000011", subject_id="19000010")  # same patient, second study
+    c = _FakeClient()
+    ra = load_cohort.load_study(c, a, concept_uuid="concept-uuid")
+    rb = load_cohort.load_study(c, b, concept_uuid="concept-uuid")
+    assert ra["referrer"] == rb["referrer"]
+    orderers = {call[1]: call[2] for call in c.calls if call[0] == "order-orderer"}
+    assert orderers["s90000010"] == orderers["s90000011"]        # same orderer on both orders
+    assert orderers["s90000010"] == f"prov-{ra['referrer']}"
+
+
+def test_referrer_seeding_failure_falls_back_to_default_orderer():
+    import load_cohort
+
+    class _BadReferrer(_FakeClient):
+        def ensure_referring_provider(self, *a, **k):
+            raise RuntimeError("provider create refused")
+
+    studies = {x.study_id: x for x in M.load_manifest(SAMPLE)}
+    c = _BadReferrer()
+    r = load_cohort.load_study(c, studies["s90000001"], concept_uuid="concept-uuid")
+    # the study still loads; the order falls back to the ETL default orderer (None -> admin)
+    assert r["order"] == "ord-s90000001"
+    assert ("order-orderer", "s90000001", None) in c.calls
+    assert "referrer" not in r
+    assert any("referrer" in w for w in r.get("warnings", []))
+
+
+def test_seed_referrer_false_leaves_the_orderer_default():
+    import load_cohort
+    studies = {x.study_id: x for x in M.load_manifest(SAMPLE)}
+    c = _FakeClient()
+    r = load_cohort.load_study(c, studies["s90000001"], concept_uuid="concept-uuid", seed_referrer=False)
+    assert not any(call[0] == "referrer" for call in c.calls)
+    assert ("order-orderer", "s90000001", None) in c.calls
+    assert "referrer" not in r
 
 
 # --- stable dictionary UUIDs (no DB) --------------------------------------

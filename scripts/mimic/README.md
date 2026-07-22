@@ -47,8 +47,9 @@ python fetch.py /secure/cohort/my_cohort.json /secure/mimic-dl
 python share_cohort.py publish --manifest /secure/cohort/my_cohort.json \
     --dicom-root /secure/mimic-dl --share-root $MIMIC_SHARE_ROOT --name v1
 
-# 2. FHIR first: patients, encounters, RadiologyOrders (with ICD-10-mapped order reasons),
-#    EHR packet (labs, problems, presence-only drug orders), seeded preliminary reports
+# 2. FHIR first: patients, encounters, RadiologyOrders (with ICD-10-mapped order reasons + a real
+#    referring-physician orderer, #76), EHR packet (labs, problems, presence-only drug orders),
+#    seeded preliminary reports
 python load_cohort.py my_cohort.json --concept $MIMIC_ORDER_CONCEPT_UUID
 
 # 3. fix up + push DICOM (per study: accession = study_id), which starts each workflow
@@ -60,6 +61,28 @@ python registry_corpus.py --out registry_corpus.json
 # 5. rehearsal sign-off cue (live demo: radiologists sign in the RIS instead)
 python report_seeder.py finalize s56699142
 ```
+
+## Referring physicians (#76)
+
+`load_cohort.py` seeds a small roster of demo referring physicians (`referrers.py`) and stamps each
+study's **order with a real ordering provider** rather than the ETL admin account. fhir2 surfaces
+that as `ServiceRequest.requester`, so `comms.resolve_ordering_provider` names a real physician and
+the critical-result notification (`ehr-inbox` channel, #76) lands on the ordering patient's chart for
+them to acknowledge (`docs/ehr-inbox-notification.md`). Assignment is deterministic per `subject_id`,
+so a patient's studies share one referrer and re-runs stay stable.
+
+Each referrer also gets an OpenMRS login (best-effort) so the physician can sign in at the ack
+surface (#86); a login-provisioning failure never costs the requester seeding — the order still
+carries a real requester, only the in-EHR login for that physician degrades (logged). Config:
+
+- `MIMIC_REFERRER_PASSWORD` — demo login password (default clears the OpenMRS policy; override per
+  deployment; never a real secret).
+- `MIMIC_REFERRER_ROLES` — comma-separated OpenMRS roles for the login (default `Provider`); set to a
+  role that grants patient-chart view if the notification must be visible after the physician logs in.
+
+The referrer is **not** written into the comms ledger — the ledger holds only the on-call directory
+(`docker/comms-ledger/seed_oncall.py`); the ordering physician's reference is carried verbatim from
+fhir2 onto the ledger's `Communication.recipient` / `Task.owner`.
 
 ## Sharing (other devs pull, never re-download)
 
