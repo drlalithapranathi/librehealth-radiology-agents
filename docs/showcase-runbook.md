@@ -1,0 +1,111 @@
+# M4 showcase run-book: the step-by-step demo script (#76)
+
+The day-of script. Every step names the exact location (URL, screen, or command) and the
+expected on-screen result. Arcs and rationale come from the #76 draft; backend beats were
+live-verified in the #72 restart drill, the click path in the #73 browser drill, and the
+viewer arc on the built !100 image.
+
+Throughout, `https://demo.example.org` stands for `https://$DEMO_DOMAIN` — the single public
+origin the #75 Caddy overlay serves. Nothing else is reachable off-box.
+
+## 0. The location map
+
+| What | Exact location | Auth |
+|---|---|---|
+| Reading worklist | `https://demo.example.org/reading` | proxy login (`DEMO_PROXY_USER`) |
+| Viewer (reading mode) | `https://demo.example.org/read?...` — reached ONLY by clicking a worklist row | same origin, same login |
+| RIS / OpenMRS login | `https://demo.example.org/openmrs/login.htm` | radiologist's own OpenMRS account |
+| RIS order page (Claim Report) | `https://demo.example.org/openmrs/module/radiology/radiologyOrder.form?orderId=<uuid>` — reached via the viewer's **Report this study** action | OpenMRS session |
+| Patient chart (referring MD) | `https://demo.example.org/openmrs` → find patient → chart shows the **AI critical result notification** entry | physician's own OpenMRS account |
+| Critical-result ack (phone) | `https://demo.example.org/reading-api/ack/<taskId>?sig=…` — the signed link inside the chart notification | HTTP Basic → physician's OpenMRS account |
+| Sign-off override (phone) | `https://demo.example.org/ingress/signoff/<workflowId>/override` — the link inside the escalation page | `SIGNOFF_OVERRIDE_TOKEN` |
+| Jaeger (choreography visual) | presenter laptop: `ssh -L 16686:127.0.0.1:16686 demo@<host>` → `http://localhost:16686` | SSH only (loopback-bound on the host) |
+| Temporal UI (backstage only) | tunnel `8088` the same way → `http://localhost:8088` | SSH only |
+| Restage/seeder commands | SSH shell on the demo host, repo root | host account |
+
+## 1. Prerequisites (verify the morning of; details in the #76 comment)
+
+1. Stack up under the overlay:
+   `SIGNOFF_OVERRIDE_TOKEN=… A2A_CALLBACK_TOKEN=… docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d`
+   (plus `--profile otel` for the Jaeger visual). Compose refuses dev-default secrets.
+2. #68 cohort loaded (FHIR → DICOM → `link_radiology_studies.py`), referring physicians seeded (!97).
+3. Flags on, each with its recorded sign-off: `ORTHANC_PRESIGN_WRITE_ENABLED=1`,
+   `EHR_INBOX_WRITE_ENABLED=1`, `PATCH_PRESIGN_IMPRESSION`, `CRITCOM_ACK_HMAC_SECRET` set and
+   `CRITCOM_ACK_BASE_URL=https://demo.example.org/reading-api`, LLM keys for impression/comms
+   prose (both degrade to deterministic text if unset).
+4. Accounts: each radiologist has their own OpenMRS user; the referring-physician demo account
+   password is known; the ack/override phone is on wifi that can reach the demo origin.
+5. OpenMRS seed captured once (`scripts/dump_openmrs_seed.sh`) so recovery never costs the
+   16-minute boot.
+6. Smoke: `https://demo.example.org/` → 401 without the proxy login; `/reading` lists the
+   cohort after login; one seeded `report_seeder.py finalize` releases a test study end to end.
+
+## 2. Arc 1 — routine clear CXR (~3 min): the fast path
+
+1. **Restage** (SSH shell, repo root): re-push one normal cohort study (or reset its workflow via
+   the seeder). Say out loud: "nothing below is a typed URL; the pipeline drives the screens."
+2. **Browser →** `https://demo.example.org/reading`. Expected: the study appears within one
+   refresh cycle, tier **ROUTINE**, no AI badge.
+3. **Click the row.** Expected: URL changes to `/read?...&hangingProtocolId=lhrad.cxr.two-view`,
+   PA + lateral hang side by side automatically, right panel open, findings banner shows no
+   COMPLETE finding.
+4. **Report this study** (right panel / toolbar). Expected: popup lands on
+   `/openmrs/module/radiology/radiologyOrder.form?orderId=<uuid>` with **Claim Report** present.
+   Claim, author a normal report (FINDINGS + IMPRESSION sections), sign as the radiologist.
+5. **Narrate the silence:** poller joins the final DiagnosticReport within one cycle,
+   verification runs post-sign and PASSes, **no page goes out** — the alert-fatigue point.
+6. **Jaeger** (`http://localhost:16686` over the tunnel): pick the study's trace, show the
+   ingest → triage → worklist → sign → verify choreography as one waterfall.
+
+## 3. Arc 2 — pneumothorax, the full closed loop (~7 min): the centerpiece
+
+1. **Restage** a pneumothorax-positive cohort study whose order carries the J93*/J95.811 reason
+   code (STAT). Expected on `/reading`: it lands at the **top**, tier STAT.
+2. **Before anyone reads**, RIS window at
+   `/openmrs/module/radiology/radiologyOrder.form?orderId=<uuid>`: the pre-sign **preliminary**
+   DiagnosticReport (authorship-stamped draft impression) is already there. Point at it: the AI
+   drafted before the human opened the study, and it can only ever overwrite its own draft.
+3. **Worklist row click →** `/read?...`: PA + lateral hang, right panel already open, banner
+   reads "Pneumothorax screening signal (not a read): positive at p=…" with zero clicks; show
+   the CAD evidence overlay.
+4. **Report this study → Claim Report** → author (accept or edit the draft impression) → **sign**.
+5. **The page goes out.** Chart of the ordering patient (`/openmrs`, logged in as the referring
+   physician): the **AI critical result notification** entry is on the chart — finding label +
+   accession + the signed ack link, never the narrative.
+6. **Phone on camera:** tap the ack link
+   (`https://demo.example.org/reading-api/ack/<taskId>?sig=…`) → HTTP Basic prompt → the
+   physician's own OpenMRS credentials → "acknowledged" page. Re-tap: idempotent.
+7. **Close the loop verbally:** the ledger Task is COMPLETED with the acknowledger's identity on
+   it, `comms.checkAck` reads COMPLETED, no escalation fires. (Backstage proof if asked:
+   Temporal UI over the tunnel, the workflow's `ackStatus`.)
+
+## 4. Arc 3 — sloppy dictation and the override (~4 min)
+
+1. **Restage** a cohort study; sign a report in the RIS **without an IMPRESSION section**.
+2. Expected: verification **WARN**, the sign-off gate holds the workflow, the tier timer arms.
+3. **Escalation page arrives** (comms channel per the rota) carrying the override link.
+4. **Phone on camera:** open
+   `https://demo.example.org/ingress/signoff/<workflowId>/override`, authenticate with the
+   override token → the study releases. Narrate: authenticated, audited, single-use per gate.
+
+## 5. Arc 4 — pre-read EHR value (~2 min, coda)
+
+1. Pick the cohort patient with real MIMIC-IV labs/meds (creatinine, IV heparin).
+2. Show the assembled context the agents used (the EHR packet for that study: labs, med flags,
+   problems) next to the chart in `/openmrs`.
+3. Land the lean-reference principle: only IDs crossed the agent wire; PHI stayed in fhir2.
+
+## 6. Reset between takes / sessions
+
+- **Never** `docker compose down` the OpenMRS stack mid-day (documented wedge).
+- Restage a study: `python scripts/mimic/report_seeder.py finalize <study_id>` for the
+  flip-to-final rehearsal path; delete probe artifacts per the worked examples in the drills.
+- Full reset (between sessions only): selective `docker volume rm <project>_mariadb-data` +
+  seed reload; ledger and ingress volumes untouched.
+
+## 7. Recording plan
+
+One continuous 1920×1080 capture per arc, browser only, no dev tools; the phone on camera for
+the ack tap (arc 2) and the override (arc 3). Film order: arc 1 condensed (30 s), arc 2 full,
+arc 3, arc 4 as coda — ~12 min raw, cut to ~6 for the public version. Two seeder-driven dry
+runs first, record the third.
