@@ -79,6 +79,13 @@ origin the #75 Caddy overlay serves. Nothing else is reachable off-box.
    it, `comms.checkAck` reads COMPLETED, no escalation fires. (Backstage proof if asked:
    Temporal UI over the tunnel, the workflow's `ackStatus`.)
 
+**Where the AI actually ran** (radiologists will ask): not in the viewer. The banner renders a
+finding computed server-side by the interpretation-assistant agent — TorchXRayVision's
+DenseNet-121, Pneumothorax head, CPU, weights baked into the agent image — the moment the study
+was ingested, before anyone opened it. Say the caveats out loud: it is a screening signal, not a
+diagnosis; it scores anything handed to it (the registry's study selection is the only guard);
+and only a positive screen ever becomes a COMPLETE finding. Full detail: `docs/cad-inference.md`.
+
 ## 4. Arc 3 — sloppy dictation and the override (~4 min)
 
 1. **Restage** a cohort study; sign a report in the RIS **without an IMPRESSION section**.
