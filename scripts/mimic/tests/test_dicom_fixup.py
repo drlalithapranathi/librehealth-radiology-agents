@@ -41,13 +41,29 @@ def test_empty_string_accession_is_treated_as_blank():
     assert ds.StudyDescription == DEFAULT_DESCRIPTION
 
 
-def test_existing_accession_is_kept_and_mismatch_warned():
-    ds = _ds(AccessionNumber="REAL-ACC-9", StudyDescription="CHEST")
+def test_mismatched_accession_is_overwritten_to_canonical_and_warned():
+    # Live MIMIC files carry a numeric deid accession; nothing can key on it, so the canonical
+    # study_id accession is enforced (found live 2026-07-24: keep-if-present broke every join).
+    ds = _ds(AccessionNumber="56699142", StudyDescription="CHEST")
     r = fixup_dataset(ds, "s56699142")
-    assert ds.AccessionNumber == "REAL-ACC-9"  # not clobbered
+    assert ds.AccessionNumber == "s56699142"
     assert ds.StudyDescription == "CHEST"
-    assert r.accession == "REAL-ACC-9"
-    assert any("kept it" in w for w in r.warnings)  # loader must key on the real value
+    assert r.accession == "s56699142"
+    assert any("overwrote" in w for w in r.warnings)
+
+
+def test_description_override_wins_over_shipped_placeholder():
+    ds = _ds(AccessionNumber="s2", StudyDescription="Performed Desc")
+    r = fixup_dataset(ds, "s2", description_override="CHEST (PA AND LAT)")
+    assert ds.StudyDescription == "CHEST (PA AND LAT)"
+    assert r.description == "CHEST (PA AND LAT)"
+
+
+def test_fixup_is_idempotent_once_canonical():
+    ds = _ds(AccessionNumber="s2", StudyDescription="CHEST (PA AND LAT)")
+    r = fixup_dataset(ds, "s2", description_override="CHEST (PA AND LAT)")
+    assert r.changed == []
+    assert r.warnings == []
 
 
 def test_performed_procedure_step_description_used_before_default():

@@ -6,10 +6,16 @@ accession means `Patient/UNRESOLVED` and a study that never gets its EHR context
 sign-off. This tool makes the tag load-bearing.
 
 Rules (build item 2 of #68):
-- AccessionNumber: if blank, inject the MIMIC study_id (e.g. `s56699142`). The SAME value must key
-  the RadiologyOrder the ETL creates, so DICOM and order agree (see study_id_to_accession).
-- StudyDescription: if blank, use PerformedProcedureStepDescription, else a sensible CXR default.
-  The interpretation registry selects tools on this (#62/#64), so it must not be empty.
+- AccessionNumber: ENFORCED to the MIMIC study_id (e.g. `s56699142`), overwriting any shipped
+  value. Live MIMIC-CXR v2.1.0 files carry a numeric de-identified accession (the study_id
+  digits), not a blank -- and an order can only ever be keyed on the canonical form, so keeping
+  the shipped value silently breaks the ingest join for every study (found live, 2026-07-24).
+  A replaced value is recorded in the result's warnings.
+- StudyDescription: an explicit per-study override (the manifest's description) wins; otherwise
+  if blank, use PerformedProcedureStepDescription, else a sensible CXR default. Live MIMIC files
+  ship StudyDescription blank with the deid placeholder "Performed Desc" in PPSD, which the
+  interpretation registry (#62/#64) and the viewer's CXR hanging protocol cannot select on --
+  pass the override for real runs.
 - StudyInstanceUID: NEVER touched -- kept exactly as shipped (it maps to the Orthanc study id).
 
 This mutates de-identified data only; it adds no PHI. No MIMIC data lives in the repo (DUA).
@@ -43,11 +49,12 @@ class FixupResult:
     warnings: list[str] = field(default_factory=list)
 
 
-def fixup_dataset(ds, study_id: str, default_description: str = DEFAULT_DESCRIPTION) -> FixupResult:
+def fixup_dataset(ds, study_id: str, default_description: str = DEFAULT_DESCRIPTION,
+                  description_override: Optional[str] = None) -> FixupResult:
     """Mutate a pydicom Dataset in place per the rules above; return what changed.
 
-    `ds` is a pydicom Dataset. `study_id` is the MIMIC study id for this study. Idempotent: a study
-    already carrying a non-blank AccessionNumber / StudyDescription keeps it.
+    `ds` is a pydicom Dataset. `study_id` is the MIMIC study id for this study. Idempotent:
+    re-running on an already-fixed file changes nothing.
     """
     out = FixupResult()
 
@@ -56,19 +63,21 @@ def fixup_dataset(ds, study_id: str, default_description: str = DEFAULT_DESCRIPT
         out.warnings.append("StudyInstanceUID is blank; refusing to fabricate one (kept as-is)")
 
     want_acc = study_id_to_accession(study_id)
-    have_acc = getattr(ds, "AccessionNumber", None)
-    if _blank(have_acc):
+    have_acc = str(getattr(ds, "AccessionNumber", "") or "").strip()
+    if have_acc != want_acc:
         ds.AccessionNumber = want_acc
         out.changed.append(f"AccessionNumber -> {want_acc}")
-    elif str(have_acc).strip() != want_acc:
-        # Present but different: keep it (do not clobber real data) and flag the mismatch, because
-        # the order loader must then key on THIS value, not the study_id.
-        out.warnings.append(
-            f"AccessionNumber already set to {str(have_acc).strip()!r} (!= study_id {want_acc!r}); "
-            f"kept it -- the order must key on this value")
+        if have_acc:
+            # The shipped value is a de-identified artifact; nothing downstream can key on it,
+            # so enforcing the canonical accession loses no real data. Record the replacement.
+            out.warnings.append(f"AccessionNumber was {have_acc!r}; overwrote with {want_acc!r}")
     out.accession = str(getattr(ds, "AccessionNumber", "")).strip()
 
-    if _blank(getattr(ds, "StudyDescription", None)):
+    have_desc = str(getattr(ds, "StudyDescription", "") or "").strip()
+    if description_override and have_desc != description_override.strip():
+        ds.StudyDescription = description_override.strip()
+        out.changed.append(f"StudyDescription -> {description_override.strip()}")
+    elif _blank(have_desc):
         ppsd = getattr(ds, "PerformedProcedureStepDescription", None)
         desc = str(ppsd).strip() if not _blank(ppsd) else default_description
         ds.StudyDescription = desc
@@ -79,12 +88,17 @@ def fixup_dataset(ds, study_id: str, default_description: str = DEFAULT_DESCRIPT
 
 
 def fixup_file(path: str, study_id: str, default_description: str = DEFAULT_DESCRIPTION,
-               out_path: Optional[str] = None) -> FixupResult:
-    """Read a DICOM file, fix it up, and write it back (in place unless `out_path` is given)."""
+               out_path: Optional[str] = None,
+               description_override: Optional[str] = None) -> FixupResult:
+    """Read a DICOM file, fix it up, and write it back (in place unless `out_path` is given).
+
+    With `out_path` the file is ALWAYS written, changed or not: callers stream the output file
+    onward, and skipping the write would hand them whatever the previous iteration left there.
+    """
     import pydicom  # local import: the ETL tooling depends on pydicom, the rest of the repo does not
     ds = pydicom.dcmread(path)
-    result = fixup_dataset(ds, study_id, default_description)
-    if result.changed:
+    result = fixup_dataset(ds, study_id, default_description, description_override)
+    if result.changed or out_path:
         ds.save_as(out_path or path)
     return result
 
@@ -95,9 +109,11 @@ def _main(argv=None) -> int:
     p.add_argument("path", help="DICOM file to fix up")
     p.add_argument("study_id", help="MIMIC study id, e.g. s56699142")
     p.add_argument("--description", default=DEFAULT_DESCRIPTION, help="fallback StudyDescription")
+    p.add_argument("--set-description", default=None,
+                   help="authoritative StudyDescription (e.g. the manifest's); overwrites")
     p.add_argument("--out", default=None, help="write here instead of in place")
     args = p.parse_args(argv)
-    r = fixup_file(args.path, args.study_id, args.description, args.out)
+    r = fixup_file(args.path, args.study_id, args.description, args.out, args.set_description)
     for c in r.changed:
         print("changed:", c)
     for w in r.warnings:
