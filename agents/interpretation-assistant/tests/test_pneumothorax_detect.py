@@ -39,16 +39,26 @@ CXR_CONTEXT = {
 
 
 class _FakeOrthanc:
-    """Stands in for a PACS. instances=[] models a study Orthanc has metadata for but no images."""
+    """Stands in for a PACS. instances=[] models a study Orthanc has metadata for but no images.
 
-    def __init__(self, instances=("inst-frontal", "inst-lateral")):
+    tags=None models a client/PACS where per-instance tags cannot be fetched -- the frontal-first
+    reorder must then leave acquisition order alone, which is also why every pre-existing test in
+    this file (they never set tags) still describes the old first-scoreable behaviour."""
+
+    def __init__(self, instances=("inst-frontal", "inst-lateral"), tags=None):
         self._instances = list(instances)
+        self._tags = tags
 
     async def list_study_instances(self, study_id):
         return self._instances
 
     async def get_instance_dicom(self, instance_id):
         return instance_id.encode()  # bytes just carry which instance this is
+
+    async def get_instance_tags(self, instance_id):
+        if self._tags is None:
+            raise RuntimeError("simplified-tags unavailable")
+        return self._tags.get(instance_id, {})
 
 
 def _pixels_on(monkeypatch, *, pneumothorax_p):
@@ -129,6 +139,41 @@ async def test_it_scores_the_first_instance_in_order_not_an_arbitrary_one(monkey
     _pixels_on(monkeypatch, pneumothorax_p=0.90)
     out = await handle("interpretation.runTools", {"studyContext": CXR_CONTEXT})
     assert _ptx(out)["evidenceRef"] == "orthanc:instance/inst-frontal"
+
+
+async def test_a_lateral_first_study_scores_the_frontal_view(monkeypatch):
+    """Acquisition order is NOT projection order on real data: 17/100 MIMIC showcase studies lead
+    with the lateral (measured live 2026-07-24), and the model is frontal-trained. ViewPosition
+    must outrank acquisition order."""
+    _pixels_on(monkeypatch, pneumothorax_p=0.90)
+    monkeypatch.setattr(handler, "OrthancClient", lambda: _FakeOrthanc(
+        instances=("inst-lateral", "inst-frontal"),
+        tags={"inst-lateral": {"ViewPosition": "LL"}, "inst-frontal": {"ViewPosition": "PA"}}))
+    out = await handle("interpretation.runTools", {"studyContext": CXR_CONTEXT})
+    assert _ptx(out)["evidenceRef"] == "orthanc:instance/inst-frontal"
+
+
+async def test_an_unlabelled_view_outranks_a_known_lateral(monkeypatch):
+    """A portable AP often ships a blank ViewPosition. Unknown MIGHT be frontal; LL definitely is
+    not -- so blank sorts ahead of a known non-frontal, and a study with no frontal at all still
+    gets scored (never a new degrade path)."""
+    _pixels_on(monkeypatch, pneumothorax_p=0.90)
+    monkeypatch.setattr(handler, "OrthancClient", lambda: _FakeOrthanc(
+        instances=("inst-lateral", "inst-portable"),
+        tags={"inst-lateral": {"ViewPosition": "LATERAL"}, "inst-portable": {}}))
+    out = await handle("interpretation.runTools", {"studyContext": CXR_CONTEXT})
+    assert _ptx(out)["evidenceRef"] == "orthanc:instance/inst-portable"
+
+
+async def test_tag_fetch_failure_keeps_acquisition_order(monkeypatch):
+    """Reordering is best-effort: a PACS that cannot serve per-instance tags costs nothing but the
+    reorder. The default _FakeOrthanc (tags=None) raises on get_instance_tags, so this is also the
+    posture every other test in this file runs under."""
+    _pixels_on(monkeypatch, pneumothorax_p=0.90)
+    monkeypatch.setattr(handler, "OrthancClient", lambda: _FakeOrthanc(
+        instances=("inst-lateral", "inst-frontal")))
+    out = await handle("interpretation.runTools", {"studyContext": CXR_CONTEXT})
+    assert _ptx(out)["evidenceRef"] == "orthanc:instance/inst-lateral"
 
 
 async def test_without_the_model_extras_it_falls_back_to_the_referral_rule(monkeypatch):

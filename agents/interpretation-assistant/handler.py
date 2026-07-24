@@ -162,6 +162,42 @@ def _overall_status(statuses: list[str]) -> str:
 # (above) or is still a stub. pneumothorax-detect is the first real model in the system (#71).
 _PIXEL_TOOLS = frozenset({"pneumothorax-detect"})
 
+# ViewPosition values that mean the projection the model was trained on. Anything else -- LL,
+# LATERAL, obliques -- is a side view the CXR heads were never meant to score.
+_FRONTAL_VIEWS = frozenset({"PA", "AP"})
+
+
+async def _frontal_first(client, instances: list[str]) -> list[str]:
+    """Order candidate instances so a FRONTAL view is scored first.
+
+    (SeriesNumber, InstanceNumber) acquisition order does not put the frontal first on real data:
+    measured live on the 100-study MIMIC showcase cohort (2026-07-24), 17 studies lead with the
+    LATERAL. The model is frontal-trained; scoring a lateral silently returns a confident number
+    about the wrong projection (cxr_model.py's "it scores ANYTHING" warning made real). ViewPosition
+    says which is which: known frontals first, unlabelled views next (a portable AP often ships a
+    blank ViewPosition), known non-frontals last. The sort is stable, so acquisition order still
+    breaks ties, and a study with no frontal at all keeps its old behaviour. Tag-fetch failures
+    leave the instance where it was -- reordering is best-effort and never a new way to degrade.
+    """
+    def _rank(view_position) -> int:
+        vp = str(view_position or "").strip().upper()
+        if vp in _FRONTAL_VIEWS:
+            return 0
+        if not vp:
+            return 1
+        return 2
+
+    ranked: list[tuple[int, int, str]] = []
+    for position, instance_id in enumerate(instances):
+        try:
+            tags = await client.get_instance_tags(instance_id)
+            view_position = (tags or {}).get("ViewPosition")
+        except Exception:  # noqa: BLE001 - tags unavailable -> keep acquisition position
+            view_position = None
+        ranked.append((_rank(view_position), position, instance_id))
+    ranked.sort()
+    return [instance_id for _, _, instance_id in ranked]
+
 
 def _pneumothorax_finding(tool_id: str, probs: dict, instance_id: str) -> dict:
     """Turn the model's Pneumothorax probability into the contract's finding.
@@ -243,9 +279,9 @@ async def _pixel_finding(tool_id: str, ctx: dict) -> Optional[dict]:
     if not instances:
         log.warning("pneumothorax-detect: study %s has no instances", orthanc_study_id)
         return None
+    instances = await _frontal_first(client, instances)
 
-    # Score the FIRST SCOREABLE instance, in (SeriesNumber, InstanceNumber) order -- the frontal
-    # view of a frontal+lateral study (list_study_instances guarantees that order). A study can
+    # Score the FIRST SCOREABLE instance, frontal views first. A study can
     # also carry non-image objects -- a Structured Report, a radiation-dose SR, a presentation
     # state -- that sort AHEAD of the image; skip those and score the first real image rather than
     # letting one of them fail the whole study. That is imaging.NotAnImage's contract: a caller
