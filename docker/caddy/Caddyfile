@@ -4,10 +4,11 @@
 #
 # Knobs (all env, all defaulted for a localhost rehearsal):
 #   DEMO_DOMAIN          public name of the demo host (default: localhost).
-#   DEMO_TLS             "internal" (default) = Caddy's own CA -- used for rehearsals AND for the
-#                        in-cluster https hop the agents ride (they trust the CA via SSL_CERT_FILE,
-#                        see the overlay). On a public FQDN set it to an operator email and Caddy
-#                        switches to ACME/Let's Encrypt automatically.
+#   DEMO_TLS             "internal" (default) = Caddy's own CA -- used for rehearsals. On a
+#                        public FQDN set it to an operator email and Caddy switches to
+#                        ACME/Let's Encrypt automatically. Applies ONLY to the public site
+#                        block below; the in-cluster https://caddy name is always minted by
+#                        the internal CA regardless (see that block's comment).
 #   DEMO_PROXY_USER / DEMO_PROXY_PASS_HASH
 #                        proxy-level login for the viewer/worklist origin (#75 item 3 accepts
 #                        proxy-level auth for the demo). Generate a hash with:
@@ -15,9 +16,7 @@
 #                        The default below is the REHEARSAL password "change-me" -- always
 #                        override it on a reachable host.
 
-https://{$DEMO_DOMAIN:localhost}, https://caddy {
-	tls {$DEMO_TLS:internal}
-
+(showcase_routes) {
 	# RIS + fhir2. Deliberately NOT behind the proxy login: OpenMRS enforces its own accounts
 	# (radiologists sign under their own identity, #75 item 4), and the agents' fhir2 calls on
 	# this same route authenticate with FHIR2_BASIC_* against fhir2 itself. Stacking the proxy
@@ -45,4 +44,21 @@ https://{$DEMO_DOMAIN:localhost}, https://caddy {
 		}
 		reverse_proxy ohif:80
 	}
+}
+
+# Public name: rides DEMO_TLS (internal CA for rehearsals, ACME on a real FQDN).
+https://{$DEMO_DOMAIN:localhost} {
+	tls {$DEMO_TLS:internal}
+	import showcase_routes
+}
+
+# In-cluster name the agents' FHIR2_BASE_URL rides (#30's transport condition). MUST stay a
+# separate site block pinned to the internal CA: a shared block's single tls directive would,
+# with DEMO_TLS set to an ACME email, ask a public CA to certify "caddy" -- an in-cluster-only
+# name no CA can validate (rejectedIdentifier). Caddy is then left with no cert for that SNI
+# and every agent's fhir2 hop dies with TLSV1_ALERT_INTERNAL_ERROR. SSL_CERT_FILE on the
+# agents trusts the internal CA root, so internal is also the only issuer that works here.
+https://caddy {
+	tls internal
+	import showcase_routes
 }

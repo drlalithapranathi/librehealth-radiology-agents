@@ -38,7 +38,10 @@ EHR assistant get `FHIR2_BASE_URL=https://caddy/openmrs/ws/fhir2/R4` and their p
 **withdrawn** (set to empty). Trust for Caddy's internal CA is one env var: `SSL_CERT_FILE`
 pointed at the CA root on the shared `caddy-data` volume — Python's `ssl` honours it, no image
 change. The Caddyfile serves `https://caddy` alongside `https://$DEMO_DOMAIN` exactly so the
-in-cluster hostname has a valid cert.
+in-cluster hostname has a valid cert — as its **own site block pinned to `tls internal`**, never
+sharing the public block's tls directive. `DEMO_TLS` only steers the public name: an ACME CA
+cannot validate the in-cluster-only name `caddy` (rejectedIdentifier), and `SSL_CERT_FILE`
+trusts the internal CA anyway, so `caddy` stays on the internal issuer regardless of `DEMO_TLS`.
 
 ## Live-verified (2026-07-19, against the running dev stack)
 
