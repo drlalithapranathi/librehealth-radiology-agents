@@ -288,3 +288,26 @@ def test_link_studies_missing_order_is_a_warning():
                        find_uid=_uid_lookup({a: "1.2.3" for a in accs}))
     assert r["linked"] == len(studies) - 1
     assert len(r["warnings"]) == 1 and "load_cohort" in r["warnings"][0]
+
+
+# --- conclusion clamp (fhir2 1,024-char column) --------------------------
+def test_clamp_conclusion_short_text_untouched():
+    from load_cohort import clamp_conclusion
+    assert clamp_conclusion("FINDINGS: ok. IMPRESSION: ok.") == "FINDINGS: ok. IMPRESSION: ok."
+
+
+def test_clamp_conclusion_drops_preamble_keeps_findings_and_impression():
+    from load_cohort import clamp_conclusion, FHIR2_CONCLUSION_MAX
+    preamble = "WET READ: " + "x" * 900
+    body = "FINDINGS:\n " + "f" * 500 + "\nIMPRESSION:\n 1. Pneumothorax."
+    out = clamp_conclusion(preamble + "\n" + body)
+    assert out == body
+    assert len(out) <= FHIR2_CONCLUSION_MAX
+
+
+def test_clamp_conclusion_keeps_tail_when_findings_alone_too_long():
+    from load_cohort import clamp_conclusion, FHIR2_CONCLUSION_MAX
+    text = "FINDINGS:\n " + "f" * 2000 + "\nIMPRESSION:\n 1. Effusion."
+    out = clamp_conclusion(text)
+    assert len(out) == FHIR2_CONCLUSION_MAX
+    assert out.endswith("IMPRESSION:\n 1. Effusion.")
